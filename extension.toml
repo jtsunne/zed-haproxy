@@ -8,4 +8,4 @@ repository = "https://github.com/jtsunne/zed-haproxy"
 
 [grammars.haproxy]
 repository = "https://github.com/jtsunne/tree-sitter-haproxy"
-commit = "7bb5a3b6c8e4b596d28030cea97da93a7c431751"
+commit = "7b9819d99f2934bf686549c15d62f33753dfa45b"
