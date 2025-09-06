@@ -1,3 +1,4 @@
 name = "haproxy"
 grammar = "haproxy"
-file_names = ["haproxy.cfg", "haproxy.conf", "haproxy", "haproxy.*"]
+path_suffixes = ["cfg", "conf"]
+file_names = ["haproxy.cfg", "haproxy.conf", "haproxy"]

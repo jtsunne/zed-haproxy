@@ -1,42 +1,43 @@
-; Подсветка комментариев
+; Comments
 (comment) @comment
 
-(global_defaults) @keyword
-(fbl_set) @keyword
-
-((identifier) @function.method
-    (#match? @function.method "^(set-header|add-header)$"))
-
-(identifier) @attribute
-
+; Section names  
 (section_name) @string
 
-((word) @keyword
-    (#match? @keyword "^(enable|disable|ssl|crt)$"))
+; Directive types
+(daemon_directive) @keyword
+(log_directive) @keyword
+(maxconn_directive) @keyword
+(retries_directive) @keyword
+(timeout_directive) @keyword
+(bind_directive) @keyword
+(mode_directive) @keyword
+(balance_directive) @keyword
+(server_directive) @keyword
+(use_backend_directive) @keyword
+(acl_directive) @keyword
+(generic_directive) @function
 
-((word) @constant
-    (#match? @constant "^(if|acl|use_backend)$"))
+; Directive names (for generic directives)
+(directive_name) @function
 
-((word) @constant
-    (#match? @constant "^(http|https|ssl_fc|X-Forwarded-Port|X-Forwarded-Proto|forwardfor)$"))
+; Values
+(number) @number
+(time_value) @number
 
-((word) @number
-    (#match? @number "^(\\d+)(.)?$"))
+; Addresses and targets
+(bind_address) @string.special
+(server_address) @string.special
+(log_target) @string.special
 
-((word) @function
-    (#match? @function "^(\.+)\/(\[^\/\]+)$"))
+; Types and levels
+(log_level) @constant
+(mode_type) @constant
+(timeout_type) @attribute
+(balance_algorithm) @constant
 
-; ((word) @variable
-;     (#match? @variable "^(\\d+)|(\\*:(\\d+))$"))
-
-((word) @function
-    (#match? @function "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$"))
-
-((word) @function
-    (#match? @function "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}:\\d{1,5}$"))
-
-((word) @function
-    (#match? @function "^\\*:\\d{1,5}$"))
-
-((word) @function
-    (#match? @function "^(set-header|add-header|hdr)$"))
+; Names and references
+(server_name) @variable
+(backend_ref) @variable
+(acl_name) @variable
+(acl_criterion) @string
