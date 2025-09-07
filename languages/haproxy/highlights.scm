@@ -1,7 +1,7 @@
 ; Comments
 (comment) @comment
 
-; Section names  
+; Section names
 (section_name) @string
 
 ; Directive types

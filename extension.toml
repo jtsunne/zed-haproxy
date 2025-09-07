@@ -1,6 +1,6 @@
 id = "haproxy"
 name = "haproxy"
-version = "0.0.6"
+version = "0.1.4"
 schema_version = 1
 authors = ["Denys Miasnychenko <jtsunne@gmail.com>"]
 description = "HAproxy support"
@@ -9,3 +9,7 @@ repository = "https://github.com/jtsunne/zed-haproxy"
 [grammars.haproxy]
 repository = "https://github.com/Ziehnert/tree-sitter-haproxy"
 commit = "c20926a1613b1a0f923a114761ace3e9f6be9bd4"
+
+[language_servers.haproxy-lsp]
+name = "haproxy-lsp"
+language = "haproxy"
