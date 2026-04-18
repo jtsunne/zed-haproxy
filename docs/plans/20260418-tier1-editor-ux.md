@@ -125,25 +125,25 @@ Tiers 2–5 (completion/hover/refs/rename, diagnostics + cross-file, code action
 - Modify: `test/lsp_probes.py`
 - Modify: `test/haproxy.conf` (add BEGIN/END pairs for regression coverage)
 
-- [ ] add `FoldingRange` struct to `src/lsp_server.rs` with fields `start_line: u32`, `end_line: u32`, `kind: &'static str`
-- [ ] add to `HaproxyLsp`:
+- [x] add `FoldingRange` struct to `src/lsp_server.rs` with fields `start_line: u32`, `end_line: u32`, `kind: &'static str`
+- [x] add to `HaproxyLsp`:
   - `folds: HashMap<String, Vec<FoldingRange>>`
   - `documents: HashMap<String, String>` — a content cache populated on `didOpen`/`didChange`. Used here for folding/outline consistency, and as a bonus cleanup replaces the disk re-read in `textDocument/definition` (`src/lsp_server.rs:505`). Makes unsaved-buffer navigation correct.
-- [ ] extend `parse_document` with a single O(n) pass producing three fold categories. **Build results into local variables first; only write to `self.folds.insert(uri, …)` at the very end** so a mid-parse panic can't leave caches inconsistent with each other.
+- [x] extend `parse_document` with a single O(n) pass producing three fold categories. **Build results into local variables first; only write to `self.folds.insert(uri, …)` at the very end** so a mid-parse panic can't leave caches inconsistent with each other.
   - **Top-level sections**: regex match on `^(global|defaults|frontend|backend|listen|resolvers|userlist|peers|mailers|cache|program|ring)(\s|$)` (trailing `(\s|$)` prevents false matches on `globals`, `defaults_foo`, etc.). Open region on match, close on the line *before* the next match (or at EOF). Kind `"region"`.
   - **Comment banners**: runs of 2+ consecutive `#`-prefixed lines emit a `"comment"` fold. NOTE: single-line `#---` decorative dividers (most common in the fixture) do **not** qualify — this is intentional, they aren't worth a fold marker.
   - **BEGIN/END markers**: stack of `(marker_name, start_line)` matching `^\s*#\s*BEGIN\s+(.+?)\s*$` → push, `^\s*#\s*END\s+(.+?)\s*$` → pop and emit `"region"`. Unmatched pushes at EOF are dropped silently. Name match is case-sensitive and exact.
-- [ ] add `"foldingRangeProvider": true` to the `initialize` response's `capabilities`
-- [ ] implement `textDocument/foldingRange` handler: read from `self.folds.get(uri)`, return `[]` when absent. Hand-construct the JSON with explicit camelCase field names via `serde_json::json!({"startLine": r.start_line, "endLine": r.end_line, "kind": r.kind})` — do NOT rely on serde field-rename derives. Consistent with the existing handler style in the file.
-- [ ] augment `test/haproxy.conf` with at least two `# BEGIN <name>` / `# END <name>` pairs (and keep existing content working for the definition probes). The current fixture has none; the real `test/haproxy.cfg` has only one pair. Thin fixture coverage otherwise leaves the BEGIN/END logic underspecified.
-- [ ] populate `FOLDING_PROBES` in `test/lsp_probes.py` with concrete assertions. Verify probe line numbers against the actual fixture before committing; the earlier plan cited "comment banner around line 917" but inspection shows that area is single-line `#---` dividers (which won't fold by design). Use these verified probes instead:
-  - Section fold of `defaults` (line 36 → line 50 of `haproxy.cfg`, the line before `frontend http-vportal`)
-  - Section fold of the final `backend nb-haproxy-k8s` (line 1172 → last line of file)
-  - The single BEGIN/END pair in `haproxy.cfg` (search the fixture for `# BEGIN` to get exact line numbers at probe-authoring time; do not hard-code until verified)
+- [x] add `"foldingRangeProvider": true` to the `initialize` response's `capabilities`
+- [x] implement `textDocument/foldingRange` handler: read from `self.folds.get(uri)`, return `[]` when absent. Hand-construct the JSON with explicit camelCase field names via `serde_json::json!({"startLine": r.start_line, "endLine": r.end_line, "kind": r.kind})` — do NOT rely on serde field-rename derives. Consistent with the existing handler style in the file.
+- [x] augment `test/haproxy.conf` with at least two `# BEGIN <name>` / `# END <name>` pairs (and keep existing content working for the definition probes). The current fixture has none; the real `test/haproxy.cfg` has only one pair. Thin fixture coverage otherwise leaves the BEGIN/END logic underspecified.
+- [x] populate `FOLDING_PROBES` in `test/lsp_probes.py` with concrete assertions. Verify probe line numbers against the actual fixture before committing; the earlier plan cited "comment banner around line 917" but inspection shows that area is single-line `#---` dividers (which won't fold by design). Use these verified probes instead:
+  - Section fold of `defaults` in `test/haproxy.prod.cfg` (0-idx 35 → 50, the line before `frontend http-vportal`). NOTE: the real fixture lives at `test/haproxy.prod.cfg`, not `test/haproxy.cfg` as originally cited — plan corrected in-place.
+  - Section fold of the final `backend nb-haproxy-k8s` in `test/haproxy.prod.cfg` (0-idx 1171 → 1189, last line of file)
+  - The `BEGIN Rate limit for login` / `END Rate limit for login` pair in `test/haproxy.prod.cfg` (0-idx 59 → 62)
   - The new BEGIN/END pairs added to `haproxy.conf` in this task
-- [ ] write integration-test probes covering success (fold returned with correct kind) and edge cases: URI never opened returns `[]`, EOF-final section still emits a fold with `end_line == last_line_of_file`
-- [ ] **commit** after this task with message `Tier 1/B: folding` (separate from Section A's commit)
-- [ ] run `python3 test/lsp_probes.py` — all probes (definition + folding) must PASS before Task 4
+- [x] write integration-test probes covering success (fold returned with correct kind) and edge cases: URI never opened returns `[]`, EOF-final section still emits a fold with `end_line == last_line_of_file`
+- [x] **commit** after this task with message `Tier 1/B: folding` (separate from Section A's commit)
+- [x] run `python3 test/lsp_probes.py` — all probes (definition + folding) must PASS before Task 4
 
 ### Task 4: Verify folding works in Zed before advancing
 

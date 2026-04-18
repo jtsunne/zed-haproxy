@@ -25,7 +25,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BINARY = REPO_ROOT / "bin" / "haproxy-lsp"
 HAPROXY_CONF = REPO_ROOT / "test" / "haproxy.conf"
-HAPROXY_CFG = REPO_ROOT / "test" / "haproxy.cfg"
+HAPROXY_CFG = REPO_ROOT / "test" / "haproxy.prod.cfg"
 
 
 def path_to_uri(path: Path) -> str:
@@ -186,8 +186,70 @@ DEFINITION_PROBES = [
     },
 ]
 
-# Populated in Task 3.
-FOLDING_PROBES: list[dict] = []
+# Folding probes verify `textDocument/foldingRange` output against fixture files.
+# Each probe supplies the fixture path, an expected fold (startLine/endLine/kind),
+# and how to match: `contains` asserts the exact fold is in the result,
+# `absent` asserts the URI has no folds cached (not opened).
+# Line numbers are 0-indexed (LSP convention).
+FOLDING_PROBES: list[dict] = [
+    # --- haproxy.conf: augmented with BEGIN/END pairs for this task ---
+    {
+        "desc": "conf: section fold of `backend accountCreationService_10000`",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 50, "endLine": 57, "kind": "region"},
+    },
+    {
+        "desc": "conf: final section fold extends to EOF",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 58, "endLine": 74, "kind": "region"},
+    },
+    {
+        "desc": "conf: BEGIN/END `ssl_options` region",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 66, "endLine": 69, "kind": "region"},
+    },
+    {
+        "desc": "conf: BEGIN/END `notes` region",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 71, "endLine": 74, "kind": "region"},
+    },
+    {
+        "desc": "conf: comment banner over `notes` block",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 71, "endLine": 74, "kind": "comment"},
+    },
+    # --- haproxy.prod.cfg: the real 1190-line fixture ---
+    {
+        "desc": "prod.cfg: section fold of `defaults`",
+        "fixture": "cfg",
+        "match": "contains",
+        "expected": {"startLine": 35, "endLine": 50, "kind": "region"},
+    },
+    {
+        "desc": "prod.cfg: final section fold reaches last line",
+        "fixture": "cfg",
+        "match": "contains",
+        "expected": {"startLine": 1171, "endLine": 1189, "kind": "region"},
+    },
+    {
+        "desc": "prod.cfg: BEGIN/END `Rate limit for login` region",
+        "fixture": "cfg",
+        "match": "contains",
+        "expected": {"startLine": 59, "endLine": 62, "kind": "region"},
+    },
+    # --- edge case: URI never opened returns [] ---
+    {
+        "desc": "unopened URI returns empty fold list",
+        "fixture": "unopened",
+        "match": "absent",
+        "expected": None,
+    },
+]
 
 # Populated in Task 5.
 DOCUMENT_SYMBOL_PROBES: list[dict] = []
@@ -274,11 +336,82 @@ def run_definition_probes(client: LspClient, results: Results):
 
 
 def run_folding_probes(client: LspClient, results: Results):
-    # Populated in Task 3. No-op for Task 1.
     if not FOLDING_PROBES:
         return
-    # Placeholder: real implementation lands with Task 3.
-    raise NotImplementedError("FOLDING_PROBES runner not yet implemented")
+
+    # Open each fixture that probes reference so the LSP caches folds for it.
+    opened_uris: dict[str, str] = {}
+    fixtures = {
+        "conf": HAPROXY_CONF,
+        "cfg": HAPROXY_CFG,
+    }
+    for key, path in fixtures.items():
+        if not any(p["fixture"] == key for p in FOLDING_PROBES):
+            continue
+        if not path.exists():
+            results.record("folding", f"fixture present: {key}", False, f"missing: {path}")
+            continue
+        uri = path_to_uri(path)
+        client.did_open(uri, path.read_text())
+        opened_uris[key] = uri
+
+    for probe in FOLDING_PROBES:
+        fixture_key = probe["fixture"]
+        if fixture_key == "unopened":
+            # Use a URI we never sent didOpen for.
+            uri = "file:///tmp/haproxy-lsp-never-opened.cfg"
+        else:
+            uri = opened_uris.get(fixture_key)
+            if uri is None:
+                results.record("folding", probe["desc"], False, "fixture not opened")
+                continue
+
+        try:
+            resp = client.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": uri}},
+            )
+        except TimeoutError as exc:
+            results.record("folding", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if not isinstance(result, list):
+            results.record(
+                "folding",
+                probe["desc"],
+                False,
+                f"expected list, got {type(result).__name__}: {result!r}",
+            )
+            continue
+
+        match = probe["match"]
+        if match == "absent":
+            ok = result == []
+            detail = f"got {len(result)} folds" if not ok else "empty as expected"
+            results.record("folding", probe["desc"], ok, detail)
+        elif match == "contains":
+            expected = probe["expected"]
+            found = any(
+                r.get("startLine") == expected["startLine"]
+                and r.get("endLine") == expected["endLine"]
+                and r.get("kind") == expected["kind"]
+                for r in result
+            )
+            if found:
+                results.record("folding", probe["desc"], True, f"fold present ({len(result)} total)")
+            else:
+                preview = ", ".join(
+                    f"[{r.get('startLine')}-{r.get('endLine')} {r.get('kind')}]" for r in result[:8]
+                )
+                results.record(
+                    "folding",
+                    probe["desc"],
+                    False,
+                    f"expected {expected}, not in {len(result)} folds: {preview}",
+                )
+        else:
+            results.record("folding", probe["desc"], False, f"unknown match type: {match}")
 
 
 def run_document_symbol_probes(client: LspClient, results: Results):

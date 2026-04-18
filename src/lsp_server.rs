@@ -49,19 +49,141 @@ struct Position {
     character: u32,
 }
 
+#[derive(Debug, Clone)]
+struct FoldingRange {
+    start_line: u32,
+    end_line: u32,
+    kind: &'static str,
+}
+
 struct HaproxyLsp {
     parser: Parser,
     symbols: HashMap<String, Vec<Symbol>>,
+    folds: HashMap<String, Vec<FoldingRange>>,
+    documents: HashMap<String, String>,
+}
+
+const SECTION_KEYWORDS: &[&str] = &[
+    "global", "defaults", "frontend", "backend", "listen", "resolvers",
+    "userlist", "peers", "mailers", "cache", "program", "ring",
+];
+
+fn is_section_header(line: &str) -> bool {
+    // Section headers live at column 0; any leading whitespace disqualifies.
+    if line.starts_with(|c: char| c.is_whitespace()) {
+        return false;
+    }
+    for kw in SECTION_KEYWORDS {
+        if let Some(rest) = line.strip_prefix(*kw) {
+            if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_marker(line: &str, keyword: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let after_hash = trimmed.strip_prefix('#')?.trim_start();
+    let rest = after_hash.strip_prefix(keyword)?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let name = rest.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn compute_folds(content: &str) -> Vec<FoldingRange> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut section_folds: Vec<FoldingRange> = Vec::new();
+    let mut comment_folds: Vec<FoldingRange> = Vec::new();
+    let mut region_folds: Vec<FoldingRange> = Vec::new();
+
+    // Section folds: open on header, close on line before next header or at EOF.
+    let mut open_section_start: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if is_section_header(line) {
+            if let Some(start) = open_section_start {
+                let end = (i as u32).saturating_sub(1);
+                if end > start {
+                    section_folds.push(FoldingRange { start_line: start, end_line: end, kind: "region" });
+                }
+            }
+            open_section_start = Some(i as u32);
+        }
+    }
+    if let Some(start) = open_section_start {
+        if line_count > 0 {
+            let end = (line_count - 1) as u32;
+            if end > start {
+                section_folds.push(FoldingRange { start_line: start, end_line: end, kind: "region" });
+            }
+        }
+    }
+
+    // Comment banner folds: runs of 2+ consecutive `#`-prefixed lines.
+    let mut banner_start: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let is_comment = line.trim_start().starts_with('#');
+        if is_comment {
+            if banner_start.is_none() {
+                banner_start = Some(i as u32);
+            }
+        } else if let Some(start) = banner_start {
+            let end = (i as u32).saturating_sub(1);
+            if end > start {
+                comment_folds.push(FoldingRange { start_line: start, end_line: end, kind: "comment" });
+            }
+            banner_start = None;
+        }
+    }
+    if let Some(start) = banner_start {
+        if line_count > 0 {
+            let end = (line_count - 1) as u32;
+            if end > start {
+                comment_folds.push(FoldingRange { start_line: start, end_line: end, kind: "comment" });
+            }
+        }
+    }
+
+    // BEGIN/END region folds: case-sensitive, exact-name match via stack.
+    let mut stack: Vec<(String, u32)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(name) = parse_marker(line, "BEGIN") {
+            stack.push((name, i as u32));
+        } else if let Some(name) = parse_marker(line, "END") {
+            if let Some(pos) = stack.iter().rposition(|(n, _)| n == &name) {
+                let (_, start) = stack.remove(pos);
+                let end = i as u32;
+                if end > start {
+                    region_folds.push(FoldingRange { start_line: start, end_line: end, kind: "region" });
+                }
+            }
+        }
+    }
+
+    let mut out = section_folds;
+    out.extend(comment_folds);
+    out.extend(region_folds);
+    out
 }
 
 impl HaproxyLsp {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let parser = Parser::new();
         // TODO: Set up the HAProxy language when tree-sitter integration is ready
-        
+
         Ok(HaproxyLsp {
             parser,
             symbols: HashMap::new(),
+            folds: HashMap::new(),
+            documents: HashMap::new(),
         })
     }
 
@@ -224,7 +346,13 @@ impl HaproxyLsp {
             }
         }
         
+        // Build fold data into locals before any self.* write so a mid-parse
+        // panic cannot leave caches out of sync.
+        let folds = compute_folds(content);
+
         self.symbols.insert(uri.to_string(), updated_symbols);
+        self.folds.insert(uri.to_string(), folds);
+        self.documents.insert(uri.to_string(), content.to_string());
         Ok(())
     }
 
@@ -479,6 +607,7 @@ impl HaproxyLsp {
                         "capabilities": {
                             "definitionProvider": true,
                             "declarationProvider": true,
+                            "foldingRangeProvider": true,
                             "textDocumentSync": {
                                 "openClose": true,
                                 "change": 1
@@ -521,9 +650,9 @@ impl HaproxyLsp {
                     character: params["position"]["character"].as_u64()? as u32,
                 };
 
-                // For this basic implementation, we'll need to re-read the file content
-                // In production, we'd cache the content from didOpen/didChange events
-                if let Ok(content) = std::fs::read_to_string(uri.strip_prefix("file://").unwrap_or(uri)) {
+                // Serve from the in-memory document cache populated on didOpen/didChange.
+                // Keeps unsaved-buffer navigation correct.
+                if let Some(content) = self.documents.get(uri).cloned() {
                     if let Some(symbol) = self.find_definition(uri, &position, &content) {
                         Some(json!({
                             "jsonrpc": "2.0",
@@ -557,6 +686,30 @@ impl HaproxyLsp {
                     }))
                 }
             }
+            "textDocument/foldingRange" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let ranges: Vec<Value> = self
+                    .folds
+                    .get(uri)
+                    .map(|v| {
+                        v.iter()
+                            .map(|r| {
+                                json!({
+                                    "startLine": r.start_line,
+                                    "endLine": r.end_line,
+                                    "kind": r.kind,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": ranges,
+                }))
+            }
             "textDocument/declaration" => {
                 let params = &request["params"];
                 let uri = params["textDocument"]["uri"].as_str()?;
@@ -565,8 +718,8 @@ impl HaproxyLsp {
                     character: params["position"]["character"].as_u64()? as u32,
                 };
 
-                // For this basic implementation, we'll need to re-read the file content
-                if let Ok(content) = std::fs::read_to_string(uri.strip_prefix("file://").unwrap_or(uri)) {
+                // Serve from the in-memory document cache populated on didOpen/didChange.
+                if let Some(content) = self.documents.get(uri).cloned() {
                     if let Some(references) = self.find_declaration(uri, &position, &content) {
                         // Return array of locations for multiple references
                         let locations: Vec<Value> = references.into_iter().map(|reference| {
