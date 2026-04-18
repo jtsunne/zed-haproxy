@@ -1,7 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
-use tree_sitter::{Parser};
 
 #[derive(Debug, Clone)]
 struct Symbol {
@@ -76,7 +75,6 @@ struct DocumentSymbol {
 }
 
 struct HaproxyLsp {
-    parser: Parser,
     symbols: HashMap<String, Vec<Symbol>>,
     folds: HashMap<String, Vec<FoldingRange>>,
     outline: HashMap<String, Vec<DocumentSymbol>>,
@@ -472,11 +470,7 @@ fn serialize_document_symbol(sym: &DocumentSymbol) -> Value {
 
 impl HaproxyLsp {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let parser = Parser::new();
-        // TODO: Set up the HAProxy language when tree-sitter integration is ready
-
         Ok(HaproxyLsp {
-            parser,
             symbols: HashMap::new(),
             folds: HashMap::new(),
             outline: HashMap::new(),
@@ -1078,49 +1072,71 @@ impl HaproxyLsp {
 }
 
 
+// Cap per-message size to avoid unbounded allocation on malicious/malformed
+// Content-Length. 64 MiB is far larger than any reasonable HAProxy config.
+const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lsp = HaproxyLsp::new()?;
-    let mut stdin = io::stdin();
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
 
     loop {
-        // Read LSP message with Content-Length header
-        let mut header_line = String::new();
-        let bytes_read = stdin.read_line(&mut header_line)?;
-        
-        if bytes_read == 0 {
-            break; // EOF
+        // Read LSP message headers until blank line. Per LSP spec, multiple
+        // headers (e.g. Content-Type in addition to Content-Length) may
+        // precede the body; header names are case-insensitive.
+        let mut content_length: Option<usize> = None;
+        let mut eof = false;
+        loop {
+            let mut header_line = String::new();
+            let bytes_read = stdin.read_line(&mut header_line)?;
+            if bytes_read == 0 {
+                eof = true;
+                break;
+            }
+            let trimmed = header_line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break; // end of headers
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().ok();
+                }
+            }
         }
-        
-        // Parse Content-Length header
-        let content_length = if header_line.starts_with("Content-Length: ") {
-            header_line
-                .strip_prefix("Content-Length: ")
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .unwrap_or(0)
-        } else {
-            continue;
+        if eof {
+            break;
+        }
+
+        let content_length = match content_length {
+            Some(n) if n > 0 && n <= MAX_CONTENT_LENGTH => n,
+            Some(n) if n > MAX_CONTENT_LENGTH => {
+                eprintln!("Content-Length {} exceeds cap {}; dropping frame", n, MAX_CONTENT_LENGTH);
+                continue;
+            }
+            _ => continue, // missing/zero/invalid length: resync on next header block
         };
-        
-        if content_length == 0 {
-            continue;
-        }
-        
-        // Read empty line separator
-        let mut empty_line = String::new();
-        stdin.read_line(&mut empty_line)?;
-        
+
         // Read the JSON content
         let mut buffer = vec![0; content_length];
         stdin.read_exact(&mut buffer)?;
-        let content = String::from_utf8(buffer)?;
-        
+        let content = match String::from_utf8(buffer) {
+            Ok(s) => s,
+            Err(err) => {
+                // Malformed UTF-8: log and continue. Don't kill the server on
+                // one bad message — subsequent frames may be fine.
+                eprintln!("Skipping frame with invalid UTF-8: {}", err);
+                continue;
+            }
+        };
+
         // Parse JSON-RPC request
         if let Ok(request) = serde_json::from_str::<Value>(&content) {
             if let Some(response) = lsp.handle_request(request) {
                 let response_str = serde_json::to_string(&response)?;
                 let response_len = response_str.len();
-                
+
                 // Write LSP response with headers
                 write!(stdout, "Content-Length: {}\r\n\r\n{}", response_len, response_str)?;
                 stdout.flush()?;

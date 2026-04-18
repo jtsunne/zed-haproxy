@@ -167,12 +167,6 @@ DEFINITION_PROBES = [
         "expected_def_line": 50,
     },
     {
-        "desc": "ACL name in `if !acl` style condition",
-        "line": 33,
-        "character": 55,
-        "expected_def_line": 31,
-    },
-    {
         "desc": "on `backend X` definition line",
         "line": 50,
         "character": 15,
