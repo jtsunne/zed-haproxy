@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+LSP integration test harness for haproxy-lsp.
+
+Drives the language server over stdio and asserts responses against fixtures.
+Populated incrementally across Tier 1 tasks:
+  - Task 1: DEFINITION_PROBES
+  - Task 3: FOLDING_PROBES
+  - Task 5: DOCUMENT_SYMBOL_PROBES
+
+Usage:
+    python3 test/lsp_probes.py
+    python3 test/lsp_probes.py --binary ./target/debug/haproxy-lsp
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_BINARY = REPO_ROOT / "bin" / "haproxy-lsp"
+HAPROXY_CONF = REPO_ROOT / "test" / "haproxy.conf"
+HAPROXY_CFG = REPO_ROOT / "test" / "haproxy.cfg"
+
+
+def path_to_uri(path: Path) -> str:
+    return "file://" + str(path.resolve())
+
+
+class LspClient:
+    """Minimal LSP stdio client with Content-Length framing."""
+
+    def __init__(self, binary: Path):
+        self.proc = subprocess.Popen(
+            [str(binary)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._next_id = 1
+        self._responses: dict[int, dict] = {}
+        self._lock = threading.Lock()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _reader_loop(self):
+        stdout = self.proc.stdout
+        assert stdout is not None
+        while True:
+            header = b""
+            while not header.endswith(b"\r\n\r\n"):
+                chunk = stdout.read(1)
+                if not chunk:
+                    return
+                header += chunk
+            content_length = None
+            for line in header.decode("ascii", errors="replace").split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.split(":", 1)[1].strip())
+                    break
+            if content_length is None:
+                continue
+            body = b""
+            while len(body) < content_length:
+                chunk = stdout.read(content_length - len(body))
+                if not chunk:
+                    return
+                body += chunk
+            try:
+                msg = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg and msg.get("id") is not None:
+                with self._lock:
+                    self._responses[int(msg["id"])] = msg
+
+    def _send(self, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(header + body)
+        self.proc.stdin.flush()
+
+    def request(self, method: str, params: dict, timeout: float = 5.0) -> dict:
+        req_id = self._next_id
+        self._next_id += 1
+        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if req_id in self._responses:
+                    return self._responses.pop(req_id)
+            time.sleep(0.01)
+        raise TimeoutError(f"No response for request id={req_id} method={method}")
+
+    def notify(self, method: str, params: dict):
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def initialize(self):
+        return self.request("initialize", {"capabilities": {}})
+
+    def initialized(self):
+        self.notify("initialized", {})
+
+    def did_open(self, uri: str, text: str, language_id: str = "haproxy"):
+        self.notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
+
+    def shutdown(self):
+        try:
+            if self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=2.0)
+        except Exception:
+            self.proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+
+# Definition probes target test/haproxy.conf.
+# All line/col values are 0-indexed, matching LSP Position semantics.
+# Reconstructed from src/lsp_server.rs::find_definition cursor-aware behavior.
+DEFINITION_PROBES = [
+    {
+        "desc": "backend name in `use_backend X if Y`",
+        "line": 33,
+        "character": 20,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "ACL name in `use_backend X if Y`",
+        "line": 33,
+        "character": 55,
+        "expected_def_line": 31,
+    },
+    {
+        "desc": "standalone `use_backend X`",
+        "line": 43,
+        "character": 20,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "end-of-word on backend name",
+        "line": 33,
+        "character": 42,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "ACL name in `if !acl` style condition",
+        "line": 33,
+        "character": 55,
+        "expected_def_line": 31,
+    },
+    {
+        "desc": "on `backend X` definition line",
+        "line": 50,
+        "character": 15,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "on `acl X ...` definition line",
+        "line": 31,
+        "character": 10,
+        "expected_def_line": 31,
+    },
+]
+
+# Populated in Task 3.
+FOLDING_PROBES: list[dict] = []
+
+# Populated in Task 5.
+DOCUMENT_SYMBOL_PROBES: list[dict] = []
+
+
+# ---------------------------------------------------------------------------
+# Runners
+# ---------------------------------------------------------------------------
+
+class Results:
+    def __init__(self):
+        self.rows: list[tuple[str, str, str, str]] = []  # (section, desc, status, detail)
+        self.failures = 0
+
+    def record(self, section: str, desc: str, ok: bool, detail: str = ""):
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            self.failures += 1
+        self.rows.append((section, desc, status, detail))
+
+    def print(self):
+        if not self.rows:
+            print("(no probes run)")
+            return
+        w_section = max(len(r[0]) for r in self.rows + [("Section", "", "", "")])
+        w_desc = max(len(r[1]) for r in self.rows + [("", "Probe", "", "")])
+        w_status = 4
+        header = f"{'Section':<{w_section}}  {'Probe':<{w_desc}}  {'Stat':<{w_status}}  Detail"
+        print(header)
+        print("-" * len(header))
+        for section, desc, status, detail in self.rows:
+            print(f"{section:<{w_section}}  {desc:<{w_desc}}  {status:<{w_status}}  {detail}")
+        print()
+        total = len(self.rows)
+        passed = total - self.failures
+        print(f"{passed}/{total} probes passed")
+
+
+def run_definition_probes(client: LspClient, results: Results):
+    if not HAPROXY_CONF.exists():
+        results.record("definition", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    text = HAPROXY_CONF.read_text()
+    client.did_open(uri, text)
+
+    for probe in DEFINITION_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("definition", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if result is None:
+            results.record(
+                "definition",
+                probe["desc"],
+                False,
+                f"null result (probe at {probe['line']}:{probe['character']})",
+            )
+            continue
+
+        # Server returns a single Location object, not an array.
+        actual_line = None
+        if isinstance(result, dict) and "range" in result:
+            actual_line = result["range"]["start"]["line"]
+        elif isinstance(result, list) and result:
+            actual_line = result[0]["range"]["start"]["line"]
+
+        expected = probe["expected_def_line"]
+        ok = actual_line == expected
+        detail = f"expected def line {expected}, got {actual_line}"
+        results.record("definition", probe["desc"], ok, detail)
+
+
+def run_folding_probes(client: LspClient, results: Results):
+    # Populated in Task 3. No-op for Task 1.
+    if not FOLDING_PROBES:
+        return
+    # Placeholder: real implementation lands with Task 3.
+    raise NotImplementedError("FOLDING_PROBES runner not yet implemented")
+
+
+def run_document_symbol_probes(client: LspClient, results: Results):
+    # Populated in Task 5. No-op for Task 1.
+    if not DOCUMENT_SYMBOL_PROBES:
+        return
+    # Placeholder: real implementation lands with Task 5.
+    raise NotImplementedError("DOCUMENT_SYMBOL_PROBES runner not yet implemented")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
+    parser.add_argument(
+        "--binary",
+        default=str(DEFAULT_BINARY),
+        help="Path to haproxy-lsp binary (default: ./bin/haproxy-lsp)",
+    )
+    args = parser.parse_args()
+
+    binary = Path(args.binary)
+    if not binary.exists():
+        print(f"error: LSP binary not found at {binary}", file=sys.stderr)
+        print("hint: run ./build.sh first", file=sys.stderr)
+        return 2
+
+    results = Results()
+    client = LspClient(binary)
+    try:
+        client.initialize()
+        client.initialized()
+        run_definition_probes(client, results)
+        run_folding_probes(client, results)
+        run_document_symbol_probes(client, results)
+    finally:
+        client.shutdown()
+
+    results.print()
+    return 0 if results.failures == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

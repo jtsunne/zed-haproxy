@@ -72,9 +72,9 @@ Tiers 2–5 (completion/hover/refs/rename, diagnostics + cross-file, code action
 **Files:**
 - Create: `test/lsp_probes.py`
 
-- [ ] write a permanent LSP-stdio harness with a framer (Content-Length headers), response parser keyed by request id, and a PASS/FAIL table printer
-- [ ] add a `--binary` flag defaulting to `./bin/haproxy-lsp` so the harness can be pointed at alternate builds
-- [ ] inline the 7 **definition probes** below as `DEFINITION_PROBES` — reconstructed from `src/lsp_server.rs::find_definition` behavior, not copied from a tmp file that may not exist:
+- [x] write a permanent LSP-stdio harness with a framer (Content-Length headers), response parser keyed by request id, and a PASS/FAIL table printer
+- [x] add a `--binary` flag defaulting to `./bin/haproxy-lsp` so the harness can be pointed at alternate builds
+- [x] inline the 7 **definition probes** below as `DEFINITION_PROBES` — reconstructed from `src/lsp_server.rs::find_definition` behavior, not copied from a tmp file that may not exist:
 
   | Description | Line (0-idx) | Col | Expected def line |
   |---|---|---|---|
@@ -87,10 +87,10 @@ Tiers 2–5 (completion/hover/refs/rename, diagnostics + cross-file, code action
   | on `acl X ...` definition line | 31 | 10 | 31 |
 
   All probes target `test/haproxy.conf`.
-- [ ] empty placeholders for `FOLDING_PROBES` and `DOCUMENT_SYMBOL_PROBES` (populated in Tasks 3 and 5)
-- [ ] **harness contract**: every probe sends `initialize` → `initialized` → `textDocument/didOpen` before any feature request. `foldingRange`/`documentSymbol` handlers return `[]` for URIs that never received `didOpen` — the harness must not treat `[]` as passing silently; explicit PASS requires a non-empty result where expected.
+- [x] empty placeholders for `FOLDING_PROBES` and `DOCUMENT_SYMBOL_PROBES` (populated in Tasks 3 and 5)
+- [x] **harness contract**: every probe sends `initialize` → `initialized` → `textDocument/didOpen` before any feature request. `foldingRange`/`documentSymbol` handlers return `[]` for URIs that never received `didOpen` — the harness must not treat `[]` as passing silently; explicit PASS requires a non-empty result where expected.
 - [ ] document `python3 test/lsp_probes.py` as the regression check in README (Task 8)
-- [ ] run `python3 test/lsp_probes.py` — all 7 definition probes must PASS before Task 2
+- [x] run `python3 test/lsp_probes.py` — all 7 definition probes must PASS before Task 2
 
 ### Task 2: Rewrite highlights.scm with semantic captures (Section A)
 
