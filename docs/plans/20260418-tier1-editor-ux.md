@@ -89,7 +89,7 @@ Tiers 2–5 (completion/hover/refs/rename, diagnostics + cross-file, code action
   All probes target `test/haproxy.conf`.
 - [x] empty placeholders for `FOLDING_PROBES` and `DOCUMENT_SYMBOL_PROBES` (populated in Tasks 3 and 5)
 - [x] **harness contract**: every probe sends `initialize` → `initialized` → `textDocument/didOpen` before any feature request. `foldingRange`/`documentSymbol` handlers return `[]` for URIs that never received `didOpen` — the harness must not treat `[]` as passing silently; explicit PASS requires a non-empty result where expected.
-- [ ] document `python3 test/lsp_probes.py` as the regression check in README (Task 8)
+- [x] document `python3 test/lsp_probes.py` as the regression check in README (Task 8)
 - [x] run `python3 test/lsp_probes.py` — all 7 definition probes must PASS before Task 2
 
 ### Task 2: Rewrite highlights.scm with semantic captures (Section A)

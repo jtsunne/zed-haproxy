@@ -93,6 +93,10 @@ resulting plain wasm module won't load (Zed needs a wasm component).
 ```bash
 # Test LSP server directly
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}' | ./bin/haproxy-lsp
+
+# Regression check — drives the LSP over stdio and asserts
+# definition/folding/documentSymbol responses against fixtures.
+python3 test/lsp_probes.py
 ```
 
 ### Project Structure
