@@ -21,15 +21,15 @@ cp extension.wasm "$EXTENSION_DIR/"
 cp -r languages "$EXTENSION_DIR/"
 cp -r grammars "$EXTENSION_DIR/" 2>/dev/null || echo "No grammars directory to copy"
 
-# Copy LSP server binary
-mkdir -p "$EXTENSION_DIR/bin"
-cp bin/haproxy-lsp "$EXTENSION_DIR/bin/"
-chmod +x "$EXTENSION_DIR/bin/haproxy-lsp"
+# Copy LSP server binary to extension root (Zed resolves the command name
+# relative to the extension directory when it is not found on PATH).
+cp bin/haproxy-lsp "$EXTENSION_DIR/haproxy-lsp"
+chmod +x "$EXTENSION_DIR/haproxy-lsp"
 
 echo ""
 echo "✅ Extension installed successfully!"
 echo "📁 Location: $EXTENSION_DIR"
-echo "🔧 LSP Server: $EXTENSION_DIR/bin/haproxy-lsp"
+echo "🔧 LSP Server: $EXTENSION_DIR/haproxy-lsp"
 echo ""
 echo "Next steps:"
 echo "1. Restart Zed"

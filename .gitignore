@@ -4,3 +4,5 @@ grammars/
 .claude/
 CLAUDE*
 *test*.*
+.DS_Store
+bin/**
