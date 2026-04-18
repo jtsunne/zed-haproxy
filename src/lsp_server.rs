@@ -225,6 +225,12 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
         name: String,
         name_start_col: u32,
         header_line: u32,
+        // Inline bind address on a `listen NAME addr[:port]` or
+        // `frontend NAME addr[:port]` header. HAProxy's grammar allows the
+        // address to appear on the same line as the section declaration; when
+        // present it is recorded here so the outline `detail` can surface it
+        // even when the body has no `bind` directive.
+        inline_address: Option<String>,
     }
     let mut headers: Vec<HeaderInfo> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -240,6 +246,18 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
             tokens[1].to_string()
         } else {
             String::new()
+        };
+        // Only `listen` permits an inline bind address in the section header
+        // (grammar: `listen NAME [addr]`); `frontend` does not. Also guard
+        // against trailing comments like `listen X # note` leaking `#` as the
+        // address.
+        let inline_address = if keyword == "listen"
+            && tokens.len() >= 3
+            && !tokens[2].starts_with('#')
+        {
+            Some(tokens[2].to_string())
+        } else {
+            None
         };
         let name_start_col = if !name.is_empty() {
             // Search for the name starting *past* the keyword so that
@@ -258,6 +276,7 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
             name,
             name_start_col,
             header_line: i as u32,
+            inline_address,
         });
     }
 
@@ -402,10 +421,20 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
                 Some(parts.join(" · "))
             }
             "frontend" | "listen" => {
-                if binds.is_empty() {
+                // Surface the inline bind address from `listen NAME addr`
+                // first so the detail still renders when the body contains no
+                // explicit `bind` directive; body binds follow so operators
+                // see both sources when both exist. `frontend` never carries
+                // an inline address (grammar only permits it on `listen`).
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(addr) = &h.inline_address {
+                    parts.push(addr.clone());
+                }
+                parts.extend(binds.iter().cloned());
+                if parts.is_empty() {
                     None
                 } else {
-                    Some(binds.join(", "))
+                    Some(parts.join(", "))
                 }
             }
             "resolvers" => Some(format!("{} nameservers", nameserver_count)),
@@ -509,7 +538,11 @@ impl HaproxyLsp {
             
             // Parse backend definitions
             if line.starts_with("backend ") {
-                let name = line.strip_prefix("backend ").unwrap_or("").trim();
+                // Grammar only permits a section_name token after the
+                // keyword; take the first whitespace-delimited token so
+                // inline trailing data (if any) doesn't contaminate the
+                // symbol name.
+                let name = line["backend ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -525,7 +558,7 @@ impl HaproxyLsp {
             }
             // Parse frontend definitions
             else if line.starts_with("frontend ") {
-                let name = line.strip_prefix("frontend ").unwrap_or("").trim();
+                let name = line["frontend ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -541,7 +574,10 @@ impl HaproxyLsp {
             }
             // Parse listen definitions
             else if line.starts_with("listen ") {
-                let name = line.strip_prefix("listen ").unwrap_or("").trim();
+                // `listen` accepts an optional inline bind address per
+                // grammar (`listen stats 127.0.0.1:9000`), so the name is
+                // the first token only — not the full remainder.
+                let name = line["listen ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -682,44 +718,52 @@ impl HaproxyLsp {
         // Resolve the word under the cursor and its byte offset on the line.
         let (word, word_start) = self.word_at_position(line, position.character as usize)?;
 
-        // The last non-whitespace token before the word tells us what role the
-        // word is playing, which disambiguates e.g. `use_backend X if Y` where
-        // X is a backend reference and Y is an ACL reference.
-        let preceding = line[..word_start].split_whitespace().last();
-
-        let hint: Option<SymbolKind> = match preceding {
-            Some("use_backend") | Some("default_backend") => Some(SymbolKind::Backend),
-            Some("if") | Some("unless") | Some("&&") | Some("||") | Some("!") => {
-                Some(SymbolKind::Acl)
+        // Walk tokens backwards from the cursor looking for the controlling
+        // keyword that disambiguates the word's role. Identifier-like tokens
+        // (intermediate ACL names in a chained `if a b c`) and condition
+        // operators (`!`, `&&`, `||`) are skipped so the walk can reach the
+        // real context keyword (`if`, `use_backend`, `listen`, ...).
+        //
+        // Additionally, we must distinguish the keyword's "name slot" (the
+        // first identifier token following it) from later positional tokens.
+        // Example: `listen stats 10.0.0.1:9091` — cursor on the address walks
+        // back past `stats` and hits `listen`, but the address is NOT a listen
+        // name. Without this guard, if another `listen 10.0.0.1` exists in
+        // the file, F12 on the address would misnavigate to it. Same issue
+        // for `server s1 10.0.0.1:8080 check` and any trailing option tokens.
+        //
+        // All supported keywords except `if`/`unless` take exactly one name
+        // slot; only ACL conditions (`if`/`unless`) admit multiple subsequent
+        // identifier references (`if a && b || c`).
+        let prefix = &line[..word_start];
+        let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
+        let kw_match = prefix_tokens.iter().enumerate().rev().find_map(|(idx, tok)| {
+            match *tok {
+                "use_backend" | "default_backend" | "backend" => Some((idx, SymbolKind::Backend)),
+                "if" | "unless" => Some((idx, SymbolKind::Acl)),
+                "frontend" => Some((idx, SymbolKind::Frontend)),
+                "listen" => Some((idx, SymbolKind::Listen)),
+                "acl" => Some((idx, SymbolKind::Acl)),
+                "server" => Some((idx, SymbolKind::Server)),
+                _ => None,
             }
-            // F12 on a definition line's name resolves to the definition itself.
-            Some("backend") => Some(SymbolKind::Backend),
-            Some("frontend") => Some(SymbolKind::Frontend),
-            Some("listen") => Some(SymbolKind::Listen),
-            Some("acl") => Some(SymbolKind::Acl),
-            Some("server") => Some(SymbolKind::Server),
-            _ => None,
-        };
+        });
 
-        if let Some(kind) = hint {
-            if let Some(sym) = self.find_symbol_by_name(uri, &word, kind) {
-                return Some(sym);
+        if let Some((kw_idx, kind)) = kw_match {
+            // For single-name-slot keywords, the cursor word must be the
+            // immediate next token after the keyword. Any token past that
+            // slot (bind address, server address, trailing options, inline
+            // comment text) must not resolve, even if it textually matches
+            // an existing symbol name.
+            let is_condition_kw = matches!(kind, SymbolKind::Acl)
+                && matches!(
+                    prefix_tokens.get(kw_idx).copied(),
+                    Some("if") | Some("unless")
+                );
+            if !is_condition_kw && kw_idx + 1 != prefix_tokens.len() {
+                return None;
             }
-        }
-
-        // Fallback: if the preceding-token heuristic didn't match, try every
-        // symbol kind. This covers cursor placement on tokens whose context we
-        // don't explicitly recognize.
-        for kind in [
-            SymbolKind::Backend,
-            SymbolKind::Acl,
-            SymbolKind::Frontend,
-            SymbolKind::Listen,
-            SymbolKind::Server,
-        ] {
-            if let Some(sym) = self.find_symbol_by_name(uri, &word, kind) {
-                return Some(sym);
-            }
+            return self.find_symbol_by_name(uri, &word, kind);
         }
 
         None
@@ -764,17 +808,27 @@ impl HaproxyLsp {
         let mut acl_names = Vec::new();
         
         for part in parts {
-            // Skip HAProxy operators and keywords
-            if part == "||" || part == "&&" || part == "!" || part.starts_with('!') || part == "{" {
+            // Skip HAProxy operators and keywords.
+            // Note: do NOT skip tokens that merely *start* with `!` — those are
+            // negated ACL references (`if !foo.bar`) and must flow through to
+            // the `trim_start_matches('!')` path below so the bare name is
+            // recorded as a reference.
+            if part == "||" || part == "&&" || part == "!" || part == "{" {
                 continue;
             }
             // Stop at opening brace or other control characters
             if part.contains('{') {
                 break;
             }
-            // Remove negation prefix and add ACL name
+            // Remove negation prefix and add ACL name.
+            // Grammar permits `.` in identifiers (`[a-zA-Z0-9_.-]+`), so
+            // dotted names like `geo.prod.allow` must not be filtered.
             let clean_name = part.trim_start_matches('!').trim();
-            if !clean_name.is_empty() && clean_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            if !clean_name.is_empty()
+                && clean_name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
                 acl_names.push(clean_name.to_string());
             }
         }
@@ -793,7 +847,9 @@ impl HaproxyLsp {
     /// is in whitespace and not adjacent to a word.
     fn word_at_position(&self, line: &str, char_pos: usize) -> Option<(String, usize)> {
         let chars: Vec<char> = line.chars().collect();
-        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+        // Grammar identifier set is `/[a-zA-Z0-9_.-]+/`, so `.` must
+        // count as a word char to resolve dotted names like `foo.bar`.
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '.';
 
         let len = chars.len();
         let mut pos = char_pos.min(len);
@@ -852,17 +908,24 @@ impl HaproxyLsp {
         // Check if we're on a symbol definition (backend, acl, etc.)
         // If so, return all references to that symbol
 
+        // Section-definition lookups must extract only the first
+        // whitespace-delimited token after the keyword so trailing inline
+        // bind addresses (`listen stats 127.0.0.1:9000`) or trailing `#`
+        // comments don't contaminate the symbol name. This mirrors how
+        // parse_document stores the symbol name in the symbol table; any
+        // divergence here would silently drop declarations on such lines.
+        let trimmed = line.trim();
+
         // Check if this line defines a backend
-        if line.trim().starts_with("backend ") {
-            let name = line.trim().strip_prefix("backend ").unwrap_or("").trim();
-            if !name.is_empty() {
+        if let Some(rest) = trimmed.strip_prefix("backend ") {
+            if let Some(name) = rest.split_whitespace().next() {
                 return self.find_references_to_symbol(uri, name, SymbolKind::Backend);
             }
         }
 
         // Check if this line defines an ACL
-        if line.trim().starts_with("acl ") {
-            let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if trimmed.starts_with("acl ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[1];
                 return self.find_references_to_symbol(uri, name, SymbolKind::Acl);
@@ -870,17 +933,15 @@ impl HaproxyLsp {
         }
 
         // Check if this line defines a frontend
-        if line.trim().starts_with("frontend ") {
-            let name = line.trim().strip_prefix("frontend ").unwrap_or("").trim();
-            if !name.is_empty() {
+        if let Some(rest) = trimmed.strip_prefix("frontend ") {
+            if let Some(name) = rest.split_whitespace().next() {
                 return self.find_references_to_symbol(uri, name, SymbolKind::Frontend);
             }
         }
 
         // Check if this line defines a listen section
-        if line.trim().starts_with("listen ") {
-            let name = line.trim().strip_prefix("listen ").unwrap_or("").trim();
-            if !name.is_empty() {
+        if let Some(rest) = trimmed.strip_prefix("listen ") {
+            if let Some(name) = rest.split_whitespace().next() {
                 return self.find_references_to_symbol(uri, name, SymbolKind::Listen);
             }
         }

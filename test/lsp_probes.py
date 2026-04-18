@@ -195,6 +195,26 @@ DEFINITION_PROBES = [
         "character": 10,
         "expected_def_line": 31,
     },
+    # --- dotted identifier coverage (grammar allows `.` in names) ---
+    {
+        "desc": "dotted backend name in `use_backend foo.bar if baz.qux`",
+        "line": 90,
+        "character": 20,
+        "expected_def_line": 82,
+    },
+    {
+        "desc": "dotted ACL name in `use_backend foo.bar if baz.qux`",
+        "line": 90,
+        "character": 35,
+        "expected_def_line": 89,
+    },
+    # --- `listen NAME address` inline-bind form (grammar permits optional bind_address) ---
+    {
+        "desc": "listen name when header has inline bind address",
+        "line": 78,
+        "character": 10,
+        "expected_def_line": 78,
+    },
 ]
 
 # Folding probes verify `textDocument/foldingRange` output against fixture files.
@@ -211,10 +231,10 @@ FOLDING_PROBES: list[dict] = [
         "expected": {"startLine": 50, "endLine": 57, "kind": "region"},
     },
     {
-        "desc": "conf: final section fold extends to EOF",
+        "desc": "conf: section fold of `backend profileEditingService_20000` stops before `listen dotted_stats`",
         "fixture": "conf",
         "match": "contains",
-        "expected": {"startLine": 58, "endLine": 74, "kind": "region"},
+        "expected": {"startLine": 58, "endLine": 77, "kind": "region"},
     },
     {
         "desc": "conf: BEGIN/END `ssl_options` region",
@@ -233,6 +253,30 @@ FOLDING_PROBES: list[dict] = [
         "fixture": "conf",
         "match": "contains",
         "expected": {"startLine": 71, "endLine": 74, "kind": "comment"},
+    },
+    {
+        "desc": "conf: `listen` header with inline bind address folds as a section",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 78, "endLine": 81, "kind": "region"},
+    },
+    {
+        "desc": "conf: dotted backend name folds as a section",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 82, "endLine": 85, "kind": "region"},
+    },
+    {
+        "desc": "conf: final `frontend dotted_caller` fold reaches EOF",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 86, "endLine": 92, "kind": "region"},
+    },
+    {
+        "desc": "conf: BEGIN/END `dotted_names` region wraps new fixtures",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 76, "endLine": 92, "kind": "region"},
     },
     # --- haproxy.prod.cfg: the real 1190-line fixture ---
     {
@@ -343,6 +387,151 @@ DOCUMENT_SYMBOL_PROBES: list[dict] = [
         "desc": "unopened URI returns empty documentSymbol list",
         "fixture": "unopened",
         "match": "absent",
+    },
+    {
+        "desc": "conf: listen with inline bind address surfaces `127.0.0.1:9091` in detail",
+        "fixture": "conf",
+        "match": "root_contains_symbol",
+        "name": "dotted_stats",
+        "kind": 5,
+        "detail_regex": r"127\.0\.0\.1:9091",
+    },
+    # Trailing-`#`-comment header lines: outline must store only the first
+    # identifier token as the symbol name, not the whole tail of the line.
+    # `detail_forbidden_regex` guards against the earlier regression where
+    # `#` or comment text leaked into the symbol detail (e.g. detail="#" or
+    # "#, *:80") — the probes must fail loudly if that ever returns.
+    {
+        "desc": "decl: backend header with trailing `#` comment names symbol `be_commented`",
+        "fixture": "decl",
+        "match": "root_contains_symbol",
+        "name": "be_commented",
+        "kind": 5,
+        "detail_forbidden_regex": r"#",
+    },
+    {
+        "desc": "decl: frontend header with trailing `#` comment names symbol `fe_commented`",
+        "fixture": "decl",
+        "match": "root_contains_symbol",
+        "name": "fe_commented",
+        "kind": 11,
+        "detail_regex": r"^\*:81$",
+    },
+    {
+        "desc": "decl: listen header with trailing `#` comment names symbol `ln_commented`",
+        "fixture": "decl",
+        "match": "root_contains_symbol",
+        "name": "ln_commented",
+        "kind": 5,
+        "detail_regex": r"^\*:82$",
+    },
+]
+
+
+# Declaration probes exercise `textDocument/declaration`, which returns an
+# array of every reference location for the symbol under the cursor. The
+# fixture is constructed inline so adding negation edge cases does not
+# perturb line numbers of the on-disk fixtures used by other probe sets.
+DECLARATION_FIXTURE_URI = "file:///tmp/haproxy-lsp-declaration-fixture.cfg"
+DECLARATION_FIXTURE_TEXT = "\n".join(
+    [
+        "frontend fe",                              # 0
+        "  bind *:80",                              # 1
+        "  acl plain hdr(x-a) a",                   # 2
+        "  acl dotted.acl hdr(x-b) b",              # 3
+        "  use_backend be if plain",                # 4: positive plain
+        "  use_backend be if !plain",               # 5: negated plain
+        "  use_backend be if dotted.acl",           # 6: positive dotted
+        "  use_backend be if !dotted.acl",          # 7: negated dotted
+        "  use_backend be unless !plain",           # 8: negated under unless
+        "  use_backend be_commented if plain",      # 9: ref to trailing-comment backend
+        "",                                          # 10
+        "backend be",                                # 11
+        "  mode http",                               # 12
+        "",                                          # 13
+        "backend be_commented # trailing comment",   # 14: header with inline comment
+        "  mode http",                               # 15
+        "",                                          # 16
+        "frontend fe_commented # trailing comment",  # 17: header with inline comment
+        "  bind *:81",                               # 18
+        "",                                          # 19
+        "listen ln_commented # trailing comment",    # 20: header with inline comment
+        "  bind *:82",                               # 21
+        "",
+    ]
+)
+
+# Separate inline fixture for the IP/hostname-collision regression: the
+# fallback "try every symbol kind" path in find_definition used to return a
+# random symbol of the same textual name (e.g. a backend literally named
+# `10.0.0.1`) when the cursor was on a bind address or server hostname.
+# These probes must see a null result — the LSP should refuse to resolve
+# address/hostname tokens to unrelated symbols.
+DEFINITION_NULL_FIXTURE_URI = "file:///tmp/haproxy-lsp-definition-null-fixture.cfg"
+DEFINITION_NULL_FIXTURE_TEXT = "\n".join(
+    [
+        "backend 10.0.0.1",                     # 0: pathological numeric-name backend
+        "  mode http",                          # 1
+        "",                                      # 2
+        "listen stats 10.0.0.1:9091",           # 3: bind addr collides textually with backend name
+        "  bind *:9091",                        # 4
+        "",                                      # 5
+        "backend app",                           # 6
+        "  mode http",                           # 7
+        "  server s1 10.0.0.1:8080 check",      # 8: server addr collides textually with backend name
+        "",                                      # 9
+        "listen 10.0.0.1",                       # 10: same-kind collision — an actual listen named `10.0.0.1`
+        "  bind *:7777",                         # 11
+        "",                                      # 12
+        "backend svc",                           # 13
+        "  mode http",                           # 14
+        "  server 10.0.0.1 10.0.0.2:8080 check", # 15: same-kind server — name `10.0.0.1` vs addr `10.0.0.2`
+        "",
+    ]
+)
+
+DEFINITION_NULL_PROBES: list[dict] = [
+    {
+        "desc": "bind address on `listen` header does not resolve (cross-kind: backend of same name)",
+        "line": 3,
+        "character": 15,
+    },
+    {
+        "desc": "server address on `server` line does not resolve (cross-kind: backend of same name)",
+        "line": 8,
+        "character": 17,
+    },
+    {
+        "desc": "bind address on `listen` header does not resolve (same-kind: another `listen 10.0.0.1`)",
+        "line": 3,
+        "character": 17,
+    },
+    {
+        "desc": "server address on `server` line does not resolve (same-kind: another `server 10.0.0.1`)",
+        "line": 15,
+        "character": 20,
+    },
+]
+
+
+DECLARATION_PROBES: list[dict] = [
+    {
+        "desc": "`!plain` in `if` condition yields declaration reference",
+        "acl_line": 2,
+        "acl_char": 6,
+        "expected_ref_lines": {4, 5, 8, 9},
+    },
+    {
+        "desc": "`!dotted.acl` in `if` condition yields declaration reference",
+        "acl_line": 3,
+        "acl_char": 8,
+        "expected_ref_lines": {6, 7},
+    },
+    {
+        "desc": "backend header with trailing `#` comment resolves declaration",
+        "acl_line": 14,
+        "acl_char": 10,
+        "expected_ref_lines": {9},
     },
 ]
 
@@ -535,6 +724,13 @@ def run_document_symbol_probes(client: LspClient, results: Results):
         client.did_open(uri, path.read_text())
         opened_uris[key] = uri
 
+    # Expose the inline declaration fixture so documentSymbol probes can
+    # assert on trailing-comment header lines without adding a new on-disk
+    # fixture (and without shifting line numbers of the existing probes).
+    if any(p["fixture"] == "decl" for p in DOCUMENT_SYMBOL_PROBES):
+        client.did_open(DECLARATION_FIXTURE_URI, DECLARATION_FIXTURE_TEXT)
+        opened_uris["decl"] = DECLARATION_FIXTURE_URI
+
     cached: dict[str, list] = {}
 
     def get_symbols(uri: str) -> list | None:
@@ -602,6 +798,16 @@ def run_document_symbol_probes(client: LspClient, results: Results):
                         probe["desc"],
                         False,
                         f"detail {detail_str!r} did not match {probe['detail_regex']!r}",
+                    )
+                    continue
+            if "detail_forbidden_regex" in probe:
+                detail_str = sym.get("detail") or ""
+                if re.search(probe["detail_forbidden_regex"], detail_str):
+                    results.record(
+                        "documentSymbol",
+                        probe["desc"],
+                        False,
+                        f"detail {detail_str!r} matched forbidden {probe['detail_forbidden_regex']!r}",
                     )
                     continue
             results.record(
@@ -679,6 +885,76 @@ def run_document_symbol_probes(client: LspClient, results: Results):
         results.record("documentSymbol", probe["desc"], False, f"unknown match type: {match}")
 
 
+def run_definition_null_probes(client: LspClient, results: Results):
+    if not DEFINITION_NULL_PROBES:
+        return
+    client.did_open(DEFINITION_NULL_FIXTURE_URI, DEFINITION_NULL_FIXTURE_TEXT)
+
+    for probe in DEFINITION_NULL_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": DEFINITION_NULL_FIXTURE_URI},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("definition-null", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        # Accept both `null` and `[]` as "no definition found" per LSP spec.
+        ok = result is None or result == []
+        detail = "null as expected" if ok else f"unexpected result: {result!r}"
+        results.record("definition-null", probe["desc"], ok, detail)
+
+
+def run_declaration_probes(client: LspClient, results: Results):
+    if not DECLARATION_PROBES:
+        return
+    client.did_open(DECLARATION_FIXTURE_URI, DECLARATION_FIXTURE_TEXT)
+
+    for probe in DECLARATION_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/declaration",
+                {
+                    "textDocument": {"uri": DECLARATION_FIXTURE_URI},
+                    "position": {
+                        "line": probe["acl_line"],
+                        "character": probe["acl_char"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("declaration", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if not isinstance(result, list):
+            results.record(
+                "declaration",
+                probe["desc"],
+                False,
+                f"expected list, got {type(result).__name__}: {result!r}",
+            )
+            continue
+
+        actual_lines = {loc["range"]["start"]["line"] for loc in result}
+        expected = probe["expected_ref_lines"]
+        missing = expected - actual_lines
+        ok = not missing
+        if ok:
+            detail = f"ref lines {sorted(actual_lines)}"
+        else:
+            detail = f"missing {sorted(missing)}; got {sorted(actual_lines)}"
+        results.record("declaration", probe["desc"], ok, detail)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -700,8 +976,10 @@ def main() -> int:
         client.initialize()
         client.initialized()
         run_definition_probes(client, results)
+        run_definition_null_probes(client, results)
         run_folding_probes(client, results)
         run_document_symbol_probes(client, results)
+        run_declaration_probes(client, results)
     finally:
         client.shutdown()
 
