@@ -216,13 +216,13 @@ Tiers 2–5 (completion/hover/refs/rename, diagnostics + cross-file, code action
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
-- [ ] README.md: add a "Features" subsection documenting semantic highlighting categories (1 paragraph), section/banner folding, and `# BEGIN <name> … # END <name>` marker folding as a useful convention for long configs. Include a screenshot of outline + fold if practical.
-- [ ] README.md: remove any stale references to single-file limitations that no longer apply (folding and documentSymbol work single-file, which is already correct)
-- [ ] CLAUDE.md: extend the "Architecture Notes" section with the new `folds` and `outline` caches on `HaproxyLsp`, and list the new LSP capabilities (`foldingRangeProvider`, `documentSymbolProvider`) so future sessions know they exist.
-- [ ] CLAUDE.md: update the "Common Commands" section to mention `python3 test/lsp_probes.py` as the regression check
-- [ ] bump `version` in `extension.toml` from `0.1.5` to `0.2.0`
-- [ ] move this plan file to `docs/plans/completed/20260418-tier1-editor-ux.md`
-- [ ] final commit: `Tier 1 editor UX: docs + version bump` (the feature work itself is already split across the per-section commits from Tasks 2, 3, and 5 — this commit only covers doc/version/plan-move)
+- [x] README.md: add a "Features" subsection documenting semantic highlighting categories (1 paragraph), section/banner folding, and `# BEGIN <name> … # END <name>` marker folding as a useful convention for long configs. Include a screenshot of outline + fold if practical. (screenshots skipped — optional per Post-Completion; category paragraph + fold/banner/BEGIN-END docs added)
+- [x] README.md: remove any stale references to single-file limitations that no longer apply (folding and documentSymbol work single-file, which is already correct) (Known Limitations rewritten to reflect cursor-aware navigation and scope; Future Enhancements refreshed)
+- [x] CLAUDE.md: extend the "Architecture Notes" section with the new `folds` and `outline` caches on `HaproxyLsp`, and list the new LSP capabilities (`foldingRangeProvider`, `documentSymbolProvider`) so future sessions know they exist.
+- [x] CLAUDE.md: update the "Common Commands" section to mention `python3 test/lsp_probes.py` as the regression check
+- [x] bump `version` in `extension.toml` from `0.1.5` to `0.2.0`
+- [x] move this plan file to `docs/plans/completed/20260418-tier1-editor-ux.md`
+- [x] final commit: `Tier 1 editor UX: docs + version bump` (the feature work itself is already split across the per-section commits from Tasks 2, 3, and 5 — this commit only covers doc/version/plan-move)
 
 ## Technical Details
 
