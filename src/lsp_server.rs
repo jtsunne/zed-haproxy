@@ -229,34 +229,56 @@ impl HaproxyLsp {
     }
 
     fn find_definition(&self, _uri: &str, position: &Position, content: &str) -> Option<Symbol> {
-        // Find what symbol is at the given position using simple text parsing
         let lines: Vec<&str> = content.lines().collect();
-        if position.line as usize >= lines.len() {
+        let line_idx = position.line as usize;
+        if line_idx >= lines.len() {
             return None;
         }
-        
-        let line = lines[position.line as usize];
-        let char_pos = position.character as usize;
-        
-        // Find word boundaries around the cursor position
-        let word = self.get_word_at_position(line, char_pos)?;
-        
-        // Check if this line contains a reference pattern
-        if line.contains("use_backend") {
-            // Extract the backend name from "use_backend BACKEND_NAME"
-            if let Some(backend_name) = self.extract_backend_from_use_backend(line) {
-                return self.find_symbol_by_name(&backend_name, SymbolKind::Backend);
+        let line = lines[line_idx];
+
+        // Resolve the word under the cursor and its byte offset on the line.
+        let (word, word_start) = self.word_at_position(line, position.character as usize)?;
+
+        // The last non-whitespace token before the word tells us what role the
+        // word is playing, which disambiguates e.g. `use_backend X if Y` where
+        // X is a backend reference and Y is an ACL reference.
+        let preceding = line[..word_start].split_whitespace().last();
+
+        let hint: Option<SymbolKind> = match preceding {
+            Some("use_backend") | Some("default_backend") => Some(SymbolKind::Backend),
+            Some("if") | Some("unless") | Some("&&") | Some("||") | Some("!") => {
+                Some(SymbolKind::Acl)
             }
-        } else if line.contains("default_backend") {
-            // Extract the backend name from "default_backend BACKEND_NAME"
-            if let Some(backend_name) = self.extract_backend_from_default_backend(line) {
-                return self.find_symbol_by_name(&backend_name, SymbolKind::Backend);
+            // F12 on a definition line's name resolves to the definition itself.
+            Some("backend") => Some(SymbolKind::Backend),
+            Some("frontend") => Some(SymbolKind::Frontend),
+            Some("listen") => Some(SymbolKind::Listen),
+            Some("acl") => Some(SymbolKind::Acl),
+            Some("server") => Some(SymbolKind::Server),
+            _ => None,
+        };
+
+        if let Some(kind) = hint {
+            if let Some(sym) = self.find_symbol_by_name(&word, kind) {
+                return Some(sym);
             }
-        } else if line.contains(" if ") && !word.is_empty() {
-            // Check if this might be an ACL reference in a condition
-            return self.find_symbol_by_name(&word, SymbolKind::Acl);
         }
-        
+
+        // Fallback: if the preceding-token heuristic didn't match, try every
+        // symbol kind. This covers cursor placement on tokens whose context we
+        // don't explicitly recognize.
+        for kind in [
+            SymbolKind::Backend,
+            SymbolKind::Acl,
+            SymbolKind::Frontend,
+            SymbolKind::Listen,
+            SymbolKind::Server,
+        ] {
+            if let Some(sym) = self.find_symbol_by_name(&word, kind) {
+                return Some(sym);
+            }
+        }
+
         None
     }
     
@@ -321,45 +343,44 @@ impl HaproxyLsp {
         }
     }
     
-    fn get_word_at_position(&self, line: &str, char_pos: usize) -> Option<String> {
-        if char_pos >= line.len() {
-            return None;
-        }
-        
-        // Find word boundaries
+    /// Return the word under the cursor plus its byte offset on the line.
+    ///
+    /// Accepts a cursor that sits just past the end of a word (common for F12
+    /// targets) by stepping back one character. Returns `None` if the cursor
+    /// is in whitespace and not adjacent to a word.
+    fn word_at_position(&self, line: &str, char_pos: usize) -> Option<(String, usize)> {
         let chars: Vec<char> = line.chars().collect();
-        
-        // If we're on whitespace, try to find the next word
-        let mut pos = char_pos;
-        if pos < chars.len() && chars[pos].is_whitespace() {
-            while pos < chars.len() && chars[pos].is_whitespace() {
-                pos += 1;
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+
+        let len = chars.len();
+        let mut pos = char_pos.min(len);
+        if pos == len || !is_word_char(chars[pos]) {
+            if pos > 0 && is_word_char(chars[pos - 1]) {
+                pos -= 1;
+            } else {
+                return None;
             }
         }
-        
-        if pos >= chars.len() {
-            return None;
-        }
-        
-        // Now find word boundaries from this position
+
         let mut start = pos;
-        let mut end = pos;
-        
-        // Find start of word
-        while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_' || chars[start - 1] == '-') {
+        while start > 0 && is_word_char(chars[start - 1]) {
             start -= 1;
         }
-        
-        // Find end of word
-        while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_' || chars[end] == '-') {
+        let mut end = pos;
+        while end < len && is_word_char(chars[end]) {
             end += 1;
         }
-        
-        if start < end {
-            Some(chars[start..end].iter().collect())
-        } else {
-            None
+        if start >= end {
+            return None;
         }
+
+        let word: String = chars[start..end].iter().collect();
+        let byte_start = line
+            .char_indices()
+            .nth(start)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        Some((word, byte_start))
     }
 
     fn find_symbol_by_name(&self, name: &str, kind: SymbolKind) -> Option<Symbol> {

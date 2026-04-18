@@ -1,34 +1,26 @@
 #!/bin/bash
 set -e
 
-echo "Building HAProxy Zed Extension with LSP server..."
+# Builds the haproxy-lsp binary used by the Zed extension.
+#
+# Zed compiles extension.wasm itself (via its internal wit-component step)
+# whenever you register this directory with "zed: install dev extension", so
+# we deliberately do NOT build the wasm artifact here — the raw cargo output
+# is a plain wasm module and Zed needs a wasm *component*, which only Zed's
+# own builder produces correctly.
 
-# Build the LSP server binary
-echo "Building LSP server..."
+echo "Building haproxy-lsp (LSP server binary)..."
 cargo build --bin haproxy-lsp --features lsp-server --release
 
-# Build the extension WebAssembly
-echo "Building extension WebAssembly..."
-cargo build --target wasm32-unknown-unknown --release --lib
-
-# Copy the extension WebAssembly
-echo "Copying extension WebAssembly..."
-cp target/wasm32-unknown-unknown/release/haproxy_zed.wasm extension.wasm
-
-# Create a binaries directory and copy the LSP server
-echo "Preparing LSP server binary..."
 mkdir -p bin
 cp target/release/haproxy-lsp bin/haproxy-lsp
-
-# Make the binary executable
 chmod +x bin/haproxy-lsp
 
-# Verify files
-echo "Verifying build artifacts..."
-ls -la extension.wasm
-ls -la bin/haproxy-lsp
-
-echo "Build complete! Extension is ready for installation."
 echo ""
-echo "LSP server location: bin/haproxy-lsp"
-echo "Extension WebAssembly: extension.wasm"
+echo "LSP server ready: bin/haproxy-lsp"
+echo ""
+echo "To install the extension in Zed (one-time):"
+echo "  Cmd+Shift+P -> 'zed: install dev extension' -> pick this directory"
+echo ""
+echo "After rebuilding the LSP, restart Zed (or the language server) to pick"
+echo "up the new binary."

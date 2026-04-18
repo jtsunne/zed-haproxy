@@ -20,23 +20,31 @@ A Zed editor extension that provides syntax highlighting and **"Go to Definition
 
 - Rust installed via [rustup](https://rustup.rs/)
 - Zed editor
-- `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
 
 ### Development Installation
 
-1. **Clone and build**:
+1. **Clone and build the LSP server**:
    ```bash
    git clone <repository>
-   cd haproxy-zed
+   cd zed-haproxy
    ./build.sh
    ```
+   This produces `bin/haproxy-lsp`. It does **not** build `extension.wasm` —
+   Zed compiles that itself (see step 2).
 
-2. **Install to Zed**:
-   ```bash
-   ./install-dev.sh
-   ```
+2. **Register the extension with Zed** (one-time):
+   `Cmd+Shift+P` → **`zed: install dev extension`** → select this directory.
+   Zed will compile the extension from source (including the correct
+   wasm-component encoding) and keep a symlink to this directory under
+   `~/Library/Application Support/Zed/extensions/installed/haproxy`.
 
 3. **Restart Zed**
+
+After code changes, re-run `./build.sh` for the LSP and use
+`zed: rebuild dev extension` (or reinstall) to refresh the wasm side. Never
+copy a hand-built `extension.wasm` into Zed's extensions directory — `cargo
+build --target wasm32-unknown-unknown` produces a plain wasm module, and
+Zed requires a wasm *component*. Let Zed's builder handle it.
 
 ## Usage
 
@@ -71,15 +79,14 @@ frontend main
 ### Building
 
 ```bash
-# Build extension only
-cargo build --target wasm32-unknown-unknown --release --lib
-
-# Build LSP server only  
+# Build LSP server (what ./build.sh does)
 cargo build --bin haproxy-lsp --features lsp-server --release
-
-# Build everything
-./build.sh
 ```
+
+The extension's wasm artifact is built by Zed when you run
+`zed: install dev extension` / `zed: rebuild dev extension`. Do not build
+it yourself with `cargo build --target wasm32-unknown-unknown` — the
+resulting plain wasm module won't load (Zed needs a wasm component).
 
 ### Testing LSP Server
 
@@ -122,7 +129,7 @@ haproxy-zed/
 The error means the LSP server binary isn't accessible. Try:
 
 1. **Rebuild**: `./build.sh`
-2. **Reinstall**: `./install-dev.sh` 
+2. **Rebuild the extension in Zed**: `Cmd+Shift+P` → `zed: rebuild dev extension`
 3. **Check binary**: `ls -la bin/haproxy-lsp`
 
 ### Extension not appearing
@@ -141,7 +148,7 @@ The error means the LSP server binary isn't accessible. Try:
 
 1. Fork the repository
 2. Make changes to `src/` files
-3. Test with `./build.sh && ./install-dev.sh`
+3. Test with `./build.sh` then `zed: rebuild dev extension`
 4. Submit pull request
 
 ## Credits
