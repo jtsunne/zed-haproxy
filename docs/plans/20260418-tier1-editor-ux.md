@@ -162,30 +162,30 @@ Tiers 2–5 (completion/hover/refs/rename, diagnostics + cross-file, code action
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] add `DocumentSymbol` struct to `src/lsp_server.rs` with fields `name`, `detail: Option<String>`, `kind: u8` (LSP numeric SymbolKind), `range: Range`, `selection_range: Range`, `children: Vec<DocumentSymbol>`
-- [ ] add `outline: HashMap<String, Vec<DocumentSymbol>>` to `HaproxyLsp`
-- [ ] extend `parse_document` to build the outline tree in a second pass (or interleaved with the folding pass — whichever keeps the code readable):
+- [x] add `DocumentSymbol` struct to `src/lsp_server.rs` with fields `name`, `detail: Option<String>`, `kind: u8` (LSP numeric SymbolKind), `range: Range`, `selection_range: Range`, `children: Vec<DocumentSymbol>`
+- [x] add `outline: HashMap<String, Vec<DocumentSymbol>>` to `HaproxyLsp`
+- [x] extend `parse_document` to build the outline tree in a second pass (or interleaved with the folding pass — whichever keeps the code readable):
   - Top-level symbols for each section with correct SymbolKind per brainstorm mapping (Namespace=3 for global/defaults, Interface=11 for frontend, Class=5 for backend/listen, Module=2 for resolvers/userlist/peers/cache/mailers/program/ring).
   - Children for frontends/listens: each `acl NAME criterion` line becomes a `Property(7)` child with `detail = criterion text truncated to ~40 chars`.
   - Children for backends/listens: each `server NAME addr …` line becomes a `Field(8)` child with `detail = server_address`.
   - Children for resolvers: each `nameserver NAME addr …` line becomes a `Field(8)` child with `detail = address`.
   - Skip in outline: `bind`, `stick-table`, `timeout`, `option`, `http-request`, `default_backend` lines.
-- [ ] compute `detail` strings at section level:
+- [x] compute `detail` strings at section level:
   - backend: `<balance> · <mode> · N servers` (omit pieces that aren't set)
   - frontend/listen: comma-joined `bind` addresses
   - resolvers: `N nameservers`
   - global/defaults: no detail
-- [ ] `selection_range` must cover the identifier token only (e.g. the `http-lb` in `frontend http-lb`); `range` covers the full logical span of the symbol. HAProxy identifiers are ASCII per the grammar regex `/[a-zA-Z0-9_.-]+/`, so byte offsets == char offsets == UTF-16 code units — no conversion needed, but state this invariant in a code comment for future multi-byte safety.
-- [ ] **transactional update**: build `outline` into a local `Vec<DocumentSymbol>` first, only `self.outline.insert(uri, …)` at the very end — matches the Task 3 rule for `folds`, keeps caches consistent on panic.
-- [ ] add `"documentSymbolProvider": true` to the `initialize` response's `capabilities`
-- [ ] implement `textDocument/documentSymbol` handler: read `self.outline.get(uri)`, hand-construct JSON with explicit camelCase via `serde_json::json!({...})` — `selectionRange` not `selection_range`, `kind` as numeric `u32`, `children` recursive. Return `[]` when absent
-- [ ] populate `DOCUMENT_SYMBOL_PROBES` in `test/lsp_probes.py` with assertions covering:
+- [x] `selection_range` must cover the identifier token only (e.g. the `http-lb` in `frontend http-lb`); `range` covers the full logical span of the symbol. HAProxy identifiers are ASCII per the grammar regex `/[a-zA-Z0-9_.-]+/`, so byte offsets == char offsets == UTF-16 code units — no conversion needed, but state this invariant in a code comment for future multi-byte safety.
+- [x] **transactional update**: build `outline` into a local `Vec<DocumentSymbol>` first, only `self.outline.insert(uri, …)` at the very end — matches the Task 3 rule for `folds`, keeps caches consistent on panic.
+- [x] add `"documentSymbolProvider": true` to the `initialize` response's `capabilities`
+- [x] implement `textDocument/documentSymbol` handler: read `self.outline.get(uri)`, hand-construct JSON with explicit camelCase via `serde_json::json!({...})` — `selectionRange` not `selection_range`, `kind` as numeric `u32`, `children` recursive. Return `[]` when absent
+- [x] populate `DOCUMENT_SYMBOL_PROBES` in `test/lsp_probes.py` with assertions covering:
   - Root contains the `defaults`, `frontend http-lb`, `backend opcart-direct`, `listen stats`, `resolvers awsdnsresolvers` symbols with correct kinds.
   - `frontend http-lb` has at least 5 ACL children with non-empty `detail`.
   - `backend opcart-direct` has ≥1 server child with `detail` matching the `server_address` format.
   - `resolvers awsdnsresolvers` has `detail` = `"<N> nameservers"` and `N >= 1` Field children.
-- [ ] **commit** after this task with message `Tier 1/C: documentSymbol outline` (separate from A and B)
-- [ ] run `python3 test/lsp_probes.py` — all probes PASS (definitions, folding, documentSymbol) before Task 6
+- [x] **commit** after this task with message `Tier 1/C: documentSymbol outline` (separate from A and B)
+- [x] run `python3 test/lsp_probes.py` — all probes PASS (definitions, folding, documentSymbol) before Task 6
 
 ### Task 6: Verify outline works in Zed before documentation
 

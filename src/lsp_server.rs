@@ -56,10 +56,30 @@ struct FoldingRange {
     kind: &'static str,
 }
 
+// LSP numeric SymbolKind values. Kept as u8 for compactness; serialized as u32.
+// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
+#[derive(Debug, Clone)]
+struct DocumentSymbol {
+    name: String,
+    detail: Option<String>,
+    kind: u8,
+    // `range` spans the logical extent of the symbol (whole section body for
+    // sections, whole line for children). `selection_range` covers the
+    // identifier token only — Zed targets this for Cmd+Shift+O jump and
+    // breadcrumbs. HAProxy identifiers are ASCII per the grammar regex
+    // `/[a-zA-Z0-9_.-]+/`, so byte == char == UTF-16 code unit; no conversion
+    // needed here, but keep this invariant in mind for any future multi-byte
+    // identifier work.
+    range: Range,
+    selection_range: Range,
+    children: Vec<DocumentSymbol>,
+}
+
 struct HaproxyLsp {
     parser: Parser,
     symbols: HashMap<String, Vec<Symbol>>,
     folds: HashMap<String, Vec<FoldingRange>>,
+    outline: HashMap<String, Vec<DocumentSymbol>>,
     documents: HashMap<String, String>,
 }
 
@@ -174,6 +194,282 @@ fn compute_folds(content: &str) -> Vec<FoldingRange> {
     out
 }
 
+fn section_kind_for(keyword: &str) -> u8 {
+    match keyword {
+        "global" | "defaults" => 3,           // Namespace
+        "frontend" => 11,                      // Interface
+        "backend" | "listen" => 5,             // Class
+        "resolvers" | "userlist" | "peers" | "cache" | "mailers" | "program" | "ring" => 2, // Module
+        _ => 2,
+    }
+}
+
+fn truncate_detail(s: &str, max: usize) -> String {
+    // Char-boundary-safe truncation. ACL criterion strings can contain
+    // multi-byte chars in comments/regexes, so byte slicing is unsafe.
+    let chars: Vec<char> = s.trim().chars().collect();
+    if chars.len() <= max {
+        chars.into_iter().collect()
+    } else {
+        let mut out: String = chars.into_iter().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+
+    // Pass 1: locate section headers.
+    struct HeaderInfo {
+        keyword: String,
+        name: String,
+        name_start_col: u32,
+        header_line: u32,
+    }
+    let mut headers: Vec<HeaderInfo> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !is_section_header(line) {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let keyword = tokens[0].to_string();
+        let name = if tokens.len() >= 2 {
+            tokens[1].to_string()
+        } else {
+            String::new()
+        };
+        let name_start_col = if !name.is_empty() {
+            line.find(&name).map(|n| n as u32).unwrap_or(keyword.len() as u32)
+        } else {
+            0
+        };
+        headers.push(HeaderInfo {
+            keyword,
+            name,
+            name_start_col,
+            header_line: i as u32,
+        });
+    }
+
+    // Pass 2: build DocumentSymbol per section with children and detail.
+    let mut result: Vec<DocumentSymbol> = Vec::with_capacity(headers.len());
+    for (idx, h) in headers.iter().enumerate() {
+        let end_line = if idx + 1 < headers.len() {
+            headers[idx + 1].header_line.saturating_sub(1)
+        } else if line_count > 0 {
+            (line_count - 1) as u32
+        } else {
+            h.header_line
+        };
+
+        let mut children: Vec<DocumentSymbol> = Vec::new();
+        let mut balance: Option<String> = None;
+        let mut mode: Option<String> = None;
+        let mut server_count: usize = 0;
+        let mut nameserver_count: usize = 0;
+        let mut binds: Vec<String> = Vec::new();
+
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (end_line as usize).min(line_count.saturating_sub(1));
+        if body_start <= body_end {
+            for ln_idx in body_start..=body_end {
+                let ln = lines[ln_idx];
+                let trimmed = ln.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+                match tokens[0] {
+                    "acl" if (h.keyword == "frontend" || h.keyword == "listen")
+                        && tokens.len() >= 3 =>
+                    {
+                        let acl_name = tokens[1];
+                        let criterion: String = tokens[2..].join(" ");
+                        let detail = truncate_detail(&criterion, 40);
+                        let name_start = ln.find(acl_name).map(|n| n as u32).unwrap_or(0);
+                        let name_end = name_start + acl_name.len() as u32;
+                        children.push(DocumentSymbol {
+                            name: acl_name.to_string(),
+                            detail: Some(detail),
+                            kind: 7, // Property
+                            range: Range {
+                                start: Position { line: ln_idx as u32, character: 0 },
+                                end: Position { line: ln_idx as u32, character: ln.len() as u32 },
+                            },
+                            selection_range: Range {
+                                start: Position { line: ln_idx as u32, character: name_start },
+                                end: Position { line: ln_idx as u32, character: name_end },
+                            },
+                            children: Vec::new(),
+                        });
+                    }
+                    "server" if (h.keyword == "backend" || h.keyword == "listen")
+                        && tokens.len() >= 3 =>
+                    {
+                        server_count += 1;
+                        let srv_name = tokens[1];
+                        let addr = tokens[2].to_string();
+                        let name_start = ln.find(srv_name).map(|n| n as u32).unwrap_or(0);
+                        let name_end = name_start + srv_name.len() as u32;
+                        children.push(DocumentSymbol {
+                            name: srv_name.to_string(),
+                            detail: Some(addr),
+                            kind: 8, // Field
+                            range: Range {
+                                start: Position { line: ln_idx as u32, character: 0 },
+                                end: Position { line: ln_idx as u32, character: ln.len() as u32 },
+                            },
+                            selection_range: Range {
+                                start: Position { line: ln_idx as u32, character: name_start },
+                                end: Position { line: ln_idx as u32, character: name_end },
+                            },
+                            children: Vec::new(),
+                        });
+                    }
+                    "nameserver" if h.keyword == "resolvers" && tokens.len() >= 3 => {
+                        nameserver_count += 1;
+                        let ns_name = tokens[1];
+                        let addr = tokens[2].to_string();
+                        let name_start = ln.find(ns_name).map(|n| n as u32).unwrap_or(0);
+                        let name_end = name_start + ns_name.len() as u32;
+                        children.push(DocumentSymbol {
+                            name: ns_name.to_string(),
+                            detail: Some(addr),
+                            kind: 8, // Field
+                            range: Range {
+                                start: Position { line: ln_idx as u32, character: 0 },
+                                end: Position { line: ln_idx as u32, character: ln.len() as u32 },
+                            },
+                            selection_range: Range {
+                                start: Position { line: ln_idx as u32, character: name_start },
+                                end: Position { line: ln_idx as u32, character: name_end },
+                            },
+                            children: Vec::new(),
+                        });
+                    }
+                    "balance" if tokens.len() >= 2 && balance.is_none() => {
+                        balance = Some(tokens[1].to_string());
+                    }
+                    "mode" if tokens.len() >= 2 && mode.is_none() => {
+                        mode = Some(tokens[1].to_string());
+                    }
+                    "bind" if tokens.len() >= 2 => {
+                        binds.push(tokens[1].to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let detail = match h.keyword.as_str() {
+            "backend" => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(b) = balance {
+                    parts.push(b);
+                }
+                if let Some(m) = mode {
+                    parts.push(m);
+                }
+                parts.push(format!("{} servers", server_count));
+                Some(parts.join(" · "))
+            }
+            "frontend" | "listen" => {
+                if binds.is_empty() {
+                    None
+                } else {
+                    Some(binds.join(", "))
+                }
+            }
+            "resolvers" => Some(format!("{} nameservers", nameserver_count)),
+            _ => None,
+        };
+
+        let kind = section_kind_for(&h.keyword);
+        let display_name = if h.name.is_empty() {
+            h.keyword.clone()
+        } else {
+            h.name.clone()
+        };
+        let selection = if h.name.is_empty() {
+            Range {
+                start: Position { line: h.header_line, character: 0 },
+                end: Position {
+                    line: h.header_line,
+                    character: h.keyword.len() as u32,
+                },
+            }
+        } else {
+            Range {
+                start: Position {
+                    line: h.header_line,
+                    character: h.name_start_col,
+                },
+                end: Position {
+                    line: h.header_line,
+                    character: h.name_start_col + h.name.len() as u32,
+                },
+            }
+        };
+        let end_char = lines
+            .get(end_line as usize)
+            .map(|l| l.len() as u32)
+            .unwrap_or(0);
+
+        result.push(DocumentSymbol {
+            name: display_name,
+            detail,
+            kind,
+            range: Range {
+                start: Position { line: h.header_line, character: 0 },
+                end: Position { line: end_line, character: end_char },
+            },
+            selection_range: selection,
+            children,
+        });
+    }
+
+    result
+}
+
+fn serialize_document_symbol(sym: &DocumentSymbol) -> Value {
+    // LSP wire format requires camelCase field names (notably `selectionRange`)
+    // and numeric `kind`. Hand-construct to avoid relying on serde renames.
+    json!({
+        "name": sym.name,
+        "detail": sym.detail,
+        "kind": sym.kind as u32,
+        "range": {
+            "start": {
+                "line": sym.range.start.line,
+                "character": sym.range.start.character,
+            },
+            "end": {
+                "line": sym.range.end.line,
+                "character": sym.range.end.character,
+            },
+        },
+        "selectionRange": {
+            "start": {
+                "line": sym.selection_range.start.line,
+                "character": sym.selection_range.start.character,
+            },
+            "end": {
+                "line": sym.selection_range.end.line,
+                "character": sym.selection_range.end.character,
+            },
+        },
+        "children": sym.children.iter().map(serialize_document_symbol).collect::<Vec<_>>(),
+    })
+}
+
 impl HaproxyLsp {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let parser = Parser::new();
@@ -183,6 +479,7 @@ impl HaproxyLsp {
             parser,
             symbols: HashMap::new(),
             folds: HashMap::new(),
+            outline: HashMap::new(),
             documents: HashMap::new(),
         })
     }
@@ -346,12 +643,14 @@ impl HaproxyLsp {
             }
         }
         
-        // Build fold data into locals before any self.* write so a mid-parse
-        // panic cannot leave caches out of sync.
+        // Build fold/outline data into locals before any self.* write so a
+        // mid-parse panic cannot leave caches out of sync with each other.
         let folds = compute_folds(content);
+        let outline = compute_outline(content);
 
         self.symbols.insert(uri.to_string(), updated_symbols);
         self.folds.insert(uri.to_string(), folds);
+        self.outline.insert(uri.to_string(), outline);
         self.documents.insert(uri.to_string(), content.to_string());
         Ok(())
     }
@@ -608,6 +907,7 @@ impl HaproxyLsp {
                             "definitionProvider": true,
                             "declarationProvider": true,
                             "foldingRangeProvider": true,
+                            "documentSymbolProvider": true,
                             "textDocumentSync": {
                                 "openClose": true,
                                 "change": 1
@@ -708,6 +1008,20 @@ impl HaproxyLsp {
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": ranges,
+                }))
+            }
+            "textDocument/documentSymbol" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let syms: Vec<Value> = self
+                    .outline
+                    .get(uri)
+                    .map(|v| v.iter().map(serialize_document_symbol).collect())
+                    .unwrap_or_default();
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": syms,
                 }))
             }
             "textDocument/declaration" => {

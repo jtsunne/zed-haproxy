@@ -251,8 +251,89 @@ FOLDING_PROBES: list[dict] = [
     },
 ]
 
-# Populated in Task 5.
-DOCUMENT_SYMBOL_PROBES: list[dict] = []
+# DocumentSymbol probes verify `textDocument/documentSymbol` output against
+# test/haproxy.prod.cfg. Each probe declares a fixture key plus a match rule:
+#
+#   - "root_contains_symbol": root list must contain a symbol with {name, kind}
+#     (optionally verified detail_contains / detail_regex).
+#   - "children_count_at_least": a named root symbol has >= N children, all of a
+#     required SymbolKind, with non-empty detail strings.
+#   - "child_detail_regex": a named root symbol has >= 1 child whose detail
+#     matches a regex pattern.
+#   - "absent": the URI has no outline cached (never opened).
+#
+# LSP SymbolKind numeric values used here:
+#   Namespace=3, Class=5, Property=7, Field=8, Interface=11.
+DOCUMENT_SYMBOL_PROBES: list[dict] = [
+    {
+        "desc": "prod.cfg: root contains `defaults` (Namespace)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "defaults",
+        "kind": 3,
+    },
+    {
+        "desc": "prod.cfg: root contains `http-lb` (Interface)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "http-lb",
+        "kind": 11,
+    },
+    {
+        "desc": "prod.cfg: root contains `opcart-direct` (Class)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "opcart-direct",
+        "kind": 5,
+    },
+    {
+        "desc": "prod.cfg: root contains `stats` listen (Class)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "stats",
+        "kind": 5,
+    },
+    {
+        "desc": "prod.cfg: root contains `awsdnsresolvers` (Module)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "awsdnsresolvers",
+        "kind": 2,
+        "detail_regex": r"^\d+ nameservers$",
+    },
+    {
+        "desc": "prod.cfg: `http-lb` has >=5 ACL children with non-empty detail",
+        "fixture": "cfg",
+        "match": "children_count_at_least",
+        "name": "http-lb",
+        "child_kind": 7,
+        "min_children": 5,
+        "require_non_empty_detail": True,
+    },
+    {
+        "desc": "prod.cfg: `opcart-direct` has >=1 server child with address detail",
+        "fixture": "cfg",
+        "match": "child_detail_regex",
+        "name": "opcart-direct",
+        "child_kind": 8,
+        "min_children": 1,
+        "detail_regex": r".+:\d+",
+    },
+    {
+        "desc": "prod.cfg: `awsdnsresolvers` has >=1 nameserver Field child",
+        "fixture": "cfg",
+        "match": "child_detail_regex",
+        "name": "awsdnsresolvers",
+        "child_kind": 8,
+        "min_children": 1,
+        "detail_regex": r".+:\d+",
+    },
+    {
+        "desc": "unopened URI returns empty documentSymbol list",
+        "fixture": "unopened",
+        "match": "absent",
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -414,12 +495,177 @@ def run_folding_probes(client: LspClient, results: Results):
             results.record("folding", probe["desc"], False, f"unknown match type: {match}")
 
 
+def _find_root_symbol(symbols: list, name: str) -> dict | None:
+    for s in symbols:
+        if s.get("name") == name:
+            return s
+    return None
+
+
 def run_document_symbol_probes(client: LspClient, results: Results):
-    # Populated in Task 5. No-op for Task 1.
     if not DOCUMENT_SYMBOL_PROBES:
         return
-    # Placeholder: real implementation lands with Task 5.
-    raise NotImplementedError("DOCUMENT_SYMBOL_PROBES runner not yet implemented")
+
+    import re
+
+    opened_uris: dict[str, str] = {}
+    fixtures = {
+        "conf": HAPROXY_CONF,
+        "cfg": HAPROXY_CFG,
+    }
+    for key, path in fixtures.items():
+        if not any(p["fixture"] == key for p in DOCUMENT_SYMBOL_PROBES):
+            continue
+        if not path.exists():
+            results.record("documentSymbol", f"fixture present: {key}", False, f"missing: {path}")
+            continue
+        uri = path_to_uri(path)
+        # Safe to re-open; parse_document is idempotent on the cache.
+        client.did_open(uri, path.read_text())
+        opened_uris[key] = uri
+
+    cached: dict[str, list] = {}
+
+    def get_symbols(uri: str) -> list | None:
+        if uri in cached:
+            return cached[uri]
+        try:
+            resp = client.request(
+                "textDocument/documentSymbol",
+                {"textDocument": {"uri": uri}},
+            )
+        except TimeoutError as exc:
+            return None
+        result = resp.get("result")
+        if not isinstance(result, list):
+            return None
+        cached[uri] = result
+        return result
+
+    for probe in DOCUMENT_SYMBOL_PROBES:
+        fixture_key = probe["fixture"]
+        if fixture_key == "unopened":
+            uri = "file:///tmp/haproxy-lsp-never-opened-ds.cfg"
+        else:
+            uri = opened_uris.get(fixture_key)
+            if uri is None:
+                results.record("documentSymbol", probe["desc"], False, "fixture not opened")
+                continue
+
+        symbols = get_symbols(uri)
+        if symbols is None:
+            results.record("documentSymbol", probe["desc"], False, "no result / timeout")
+            continue
+
+        match = probe["match"]
+        if match == "absent":
+            ok = symbols == []
+            detail = f"got {len(symbols)} symbols" if not ok else "empty as expected"
+            results.record("documentSymbol", probe["desc"], ok, detail)
+            continue
+
+        if match == "root_contains_symbol":
+            sym = _find_root_symbol(symbols, probe["name"])
+            if sym is None:
+                preview = ", ".join(s.get("name", "?") for s in symbols[:8])
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"name {probe['name']!r} not in root ({len(symbols)} total): {preview}",
+                )
+                continue
+            if sym.get("kind") != probe["kind"]:
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"kind mismatch: expected {probe['kind']}, got {sym.get('kind')}",
+                )
+                continue
+            if "detail_regex" in probe:
+                detail_str = sym.get("detail") or ""
+                if not re.match(probe["detail_regex"], detail_str):
+                    results.record(
+                        "documentSymbol",
+                        probe["desc"],
+                        False,
+                        f"detail {detail_str!r} did not match {probe['detail_regex']!r}",
+                    )
+                    continue
+            results.record(
+                "documentSymbol",
+                probe["desc"],
+                True,
+                f"found (kind={sym.get('kind')}, detail={sym.get('detail')!r})",
+            )
+            continue
+
+        if match == "children_count_at_least":
+            sym = _find_root_symbol(symbols, probe["name"])
+            if sym is None:
+                results.record("documentSymbol", probe["desc"], False, f"parent {probe['name']!r} missing")
+                continue
+            kids = sym.get("children") or []
+            kids_of_kind = [c for c in kids if c.get("kind") == probe["child_kind"]]
+            if len(kids_of_kind) < probe["min_children"]:
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"only {len(kids_of_kind)} children of kind {probe['child_kind']} (need {probe['min_children']})",
+                )
+                continue
+            if probe.get("require_non_empty_detail"):
+                empty = [c for c in kids_of_kind if not (c.get("detail") or "").strip()]
+                if empty:
+                    results.record(
+                        "documentSymbol",
+                        probe["desc"],
+                        False,
+                        f"{len(empty)} children had empty detail",
+                    )
+                    continue
+            results.record(
+                "documentSymbol",
+                probe["desc"],
+                True,
+                f"{len(kids_of_kind)} children (kind={probe['child_kind']})",
+            )
+            continue
+
+        if match == "child_detail_regex":
+            sym = _find_root_symbol(symbols, probe["name"])
+            if sym is None:
+                results.record("documentSymbol", probe["desc"], False, f"parent {probe['name']!r} missing")
+                continue
+            kids = sym.get("children") or []
+            matching = [
+                c
+                for c in kids
+                if c.get("kind") == probe["child_kind"]
+                and re.search(probe["detail_regex"], c.get("detail") or "")
+            ]
+            if len(matching) < probe["min_children"]:
+                preview = ", ".join(
+                    f"{c.get('name')}={c.get('detail')!r}" for c in kids[:5]
+                )
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"only {len(matching)} matched; sample: {preview}",
+                )
+                continue
+            results.record(
+                "documentSymbol",
+                probe["desc"],
+                True,
+                f"{len(matching)} children matched regex",
+            )
+            continue
+
+        results.record("documentSymbol", probe["desc"], False, f"unknown match type: {match}")
 
 
 def main() -> int:
