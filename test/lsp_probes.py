@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""
+LSP integration test harness for haproxy-lsp.
+
+Drives the language server over stdio and asserts responses against fixtures.
+Populated incrementally across Tier 1 tasks:
+  - Task 1: DEFINITION_PROBES
+  - Task 3: FOLDING_PROBES
+  - Task 5: DOCUMENT_SYMBOL_PROBES
+
+Usage:
+    python3 test/lsp_probes.py
+    python3 test/lsp_probes.py --binary ./target/debug/haproxy-lsp
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_BINARY = REPO_ROOT / "bin" / "haproxy-lsp"
+HAPROXY_CONF = REPO_ROOT / "test" / "haproxy.conf"
+HAPROXY_CFG = REPO_ROOT / "test" / "haproxy.prod.cfg"
+
+
+def path_to_uri(path: Path) -> str:
+    return "file://" + str(path.resolve())
+
+
+class LspClient:
+    """Minimal LSP stdio client with Content-Length framing."""
+
+    def __init__(self, binary: Path):
+        self.proc = subprocess.Popen(
+            [str(binary)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._next_id = 1
+        self._responses: dict[int, dict] = {}
+        self._lock = threading.Lock()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+        # Drain stderr continuously: the server uses `eprintln!` on framing
+        # errors, and an undrained PIPE buffer (~64 KiB) would block the
+        # server once full, causing spurious test timeouts.
+        self._stderr_thread = threading.Thread(target=self._stderr_drain, daemon=True)
+        self._stderr_thread.start()
+
+    def _stderr_drain(self):
+        stderr = self.proc.stderr
+        if stderr is None:
+            return
+        try:
+            while True:
+                chunk = stderr.read(4096)
+                if not chunk:
+                    return
+        except Exception:
+            return
+
+    def _reader_loop(self):
+        stdout = self.proc.stdout
+        assert stdout is not None
+        while True:
+            header = b""
+            while not header.endswith(b"\r\n\r\n"):
+                chunk = stdout.read(1)
+                if not chunk:
+                    return
+                header += chunk
+            content_length = None
+            for line in header.decode("ascii", errors="replace").split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.split(":", 1)[1].strip())
+                    break
+            if content_length is None:
+                continue
+            body = b""
+            while len(body) < content_length:
+                chunk = stdout.read(content_length - len(body))
+                if not chunk:
+                    return
+                body += chunk
+            try:
+                msg = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg and msg.get("id") is not None:
+                with self._lock:
+                    self._responses[int(msg["id"])] = msg
+
+    def _send(self, payload: dict):
+        body = json.dumps(payload).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(header + body)
+        self.proc.stdin.flush()
+
+    def request(self, method: str, params: dict, timeout: float = 5.0) -> dict:
+        req_id = self._next_id
+        self._next_id += 1
+        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if req_id in self._responses:
+                    return self._responses.pop(req_id)
+            time.sleep(0.01)
+        raise TimeoutError(f"No response for request id={req_id} method={method}")
+
+    def notify(self, method: str, params: dict):
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def initialize(self):
+        return self.request("initialize", {"capabilities": {}})
+
+    def initialized(self):
+        self.notify("initialized", {})
+
+    def did_open(self, uri: str, text: str, language_id: str = "haproxy"):
+        self.notify(
+            "textDocument/didOpen",
+            {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text,
+                }
+            },
+        )
+
+    def shutdown(self):
+        try:
+            if self.proc.stdin is not None:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=2.0)
+        except Exception:
+            self.proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+
+# Definition probes target test/haproxy.conf.
+# All line/col values are 0-indexed, matching LSP Position semantics.
+# Reconstructed from src/lsp_server.rs::find_definition cursor-aware behavior.
+DEFINITION_PROBES = [
+    {
+        "desc": "backend name in `use_backend X if Y`",
+        "line": 33,
+        "character": 20,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "ACL name in `use_backend X if Y`",
+        "line": 33,
+        "character": 55,
+        "expected_def_line": 31,
+    },
+    {
+        "desc": "standalone `use_backend X`",
+        "line": 43,
+        "character": 20,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "end-of-word on backend name",
+        "line": 33,
+        "character": 42,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "on `backend X` definition line",
+        "line": 50,
+        "character": 15,
+        "expected_def_line": 50,
+    },
+    {
+        "desc": "on `acl X ...` definition line",
+        "line": 31,
+        "character": 10,
+        "expected_def_line": 31,
+    },
+    # --- dotted identifier coverage (grammar allows `.` in names) ---
+    {
+        "desc": "dotted backend name in `use_backend foo.bar if baz.qux`",
+        "line": 90,
+        "character": 20,
+        "expected_def_line": 82,
+    },
+    {
+        "desc": "dotted ACL name in `use_backend foo.bar if baz.qux`",
+        "line": 90,
+        "character": 35,
+        "expected_def_line": 89,
+    },
+    # --- `listen NAME address` inline-bind form (grammar permits optional bind_address) ---
+    {
+        "desc": "listen name when header has inline bind address",
+        "line": 78,
+        "character": 10,
+        "expected_def_line": 78,
+    },
+]
+
+# Folding probes verify `textDocument/foldingRange` output against fixture files.
+# Each probe supplies the fixture path, an expected fold (startLine/endLine/kind),
+# and how to match: `contains` asserts the exact fold is in the result,
+# `absent` asserts the URI has no folds cached (not opened).
+# Line numbers are 0-indexed (LSP convention).
+FOLDING_PROBES: list[dict] = [
+    # --- haproxy.conf: augmented with BEGIN/END pairs for this task ---
+    {
+        "desc": "conf: section fold of `backend accountCreationService_10000`",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 50, "endLine": 57, "kind": "region"},
+    },
+    {
+        "desc": "conf: section fold of `backend profileEditingService_20000` stops before `listen dotted_stats`",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 58, "endLine": 77, "kind": "region"},
+    },
+    {
+        "desc": "conf: BEGIN/END `ssl_options` region",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 66, "endLine": 69, "kind": "region"},
+    },
+    {
+        "desc": "conf: BEGIN/END `notes` region",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 71, "endLine": 74, "kind": "region"},
+    },
+    {
+        "desc": "conf: comment banner over `notes` block",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 71, "endLine": 74, "kind": "comment"},
+    },
+    {
+        "desc": "conf: `listen` header with inline bind address folds as a section",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 78, "endLine": 81, "kind": "region"},
+    },
+    {
+        "desc": "conf: dotted backend name folds as a section",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 82, "endLine": 85, "kind": "region"},
+    },
+    {
+        "desc": "conf: final `frontend dotted_caller` fold reaches EOF",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 86, "endLine": 92, "kind": "region"},
+    },
+    {
+        "desc": "conf: BEGIN/END `dotted_names` region wraps new fixtures",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 76, "endLine": 92, "kind": "region"},
+    },
+    # --- haproxy.prod.cfg: the real 1190-line fixture ---
+    {
+        "desc": "prod.cfg: section fold of `defaults`",
+        "fixture": "cfg",
+        "match": "contains",
+        "expected": {"startLine": 35, "endLine": 50, "kind": "region"},
+    },
+    {
+        "desc": "prod.cfg: final section fold reaches last line",
+        "fixture": "cfg",
+        "match": "contains",
+        "expected": {"startLine": 1171, "endLine": 1189, "kind": "region"},
+    },
+    {
+        "desc": "prod.cfg: BEGIN/END `Rate limit for login` region",
+        "fixture": "cfg",
+        "match": "contains",
+        "expected": {"startLine": 59, "endLine": 62, "kind": "region"},
+    },
+    # --- edge case: URI never opened returns [] ---
+    {
+        "desc": "unopened URI returns empty fold list",
+        "fixture": "unopened",
+        "match": "absent",
+        "expected": None,
+    },
+]
+
+# DocumentSymbol probes verify `textDocument/documentSymbol` output against
+# test/haproxy.prod.cfg. Each probe declares a fixture key plus a match rule:
+#
+#   - "root_contains_symbol": root list must contain a symbol with {name, kind}
+#     (optionally verified detail_contains / detail_regex).
+#   - "children_count_at_least": a named root symbol has >= N children, all of a
+#     required SymbolKind, with non-empty detail strings.
+#   - "child_detail_regex": a named root symbol has >= 1 child whose detail
+#     matches a regex pattern.
+#   - "absent": the URI has no outline cached (never opened).
+#
+# LSP SymbolKind numeric values used here:
+#   Namespace=3, Class=5, Property=7, Field=8, Interface=11.
+DOCUMENT_SYMBOL_PROBES: list[dict] = [
+    {
+        "desc": "prod.cfg: root contains `defaults` (Namespace)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "defaults",
+        "kind": 3,
+    },
+    {
+        "desc": "prod.cfg: root contains `http-lb` (Interface)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "http-lb",
+        "kind": 11,
+    },
+    {
+        "desc": "prod.cfg: root contains `opcart-direct` (Class)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "opcart-direct",
+        "kind": 5,
+    },
+    {
+        "desc": "prod.cfg: root contains `stats` listen (Class)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "stats",
+        "kind": 5,
+    },
+    {
+        "desc": "prod.cfg: root contains `awsdnsresolvers` (Module)",
+        "fixture": "cfg",
+        "match": "root_contains_symbol",
+        "name": "awsdnsresolvers",
+        "kind": 2,
+        "detail_regex": r"^\d+ nameservers$",
+    },
+    {
+        "desc": "prod.cfg: `http-lb` has >=5 ACL children with non-empty detail",
+        "fixture": "cfg",
+        "match": "children_count_at_least",
+        "name": "http-lb",
+        "child_kind": 7,
+        "min_children": 5,
+        "require_non_empty_detail": True,
+    },
+    {
+        "desc": "prod.cfg: `opcart-direct` has >=1 server child with address detail",
+        "fixture": "cfg",
+        "match": "child_detail_regex",
+        "name": "opcart-direct",
+        "child_kind": 8,
+        "min_children": 1,
+        "detail_regex": r".+:\d+",
+    },
+    {
+        "desc": "prod.cfg: `awsdnsresolvers` has >=1 nameserver Field child",
+        "fixture": "cfg",
+        "match": "child_detail_regex",
+        "name": "awsdnsresolvers",
+        "child_kind": 8,
+        "min_children": 1,
+        "detail_regex": r".+:\d+",
+    },
+    {
+        "desc": "unopened URI returns empty documentSymbol list",
+        "fixture": "unopened",
+        "match": "absent",
+    },
+    {
+        "desc": "conf: listen with inline bind address surfaces `127.0.0.1:9091` in detail",
+        "fixture": "conf",
+        "match": "root_contains_symbol",
+        "name": "dotted_stats",
+        "kind": 5,
+        "detail_regex": r"127\.0\.0\.1:9091",
+    },
+    # Trailing-`#`-comment header lines: outline must store only the first
+    # identifier token as the symbol name, not the whole tail of the line.
+    # `detail_forbidden_regex` guards against the earlier regression where
+    # `#` or comment text leaked into the symbol detail (e.g. detail="#" or
+    # "#, *:80") — the probes must fail loudly if that ever returns.
+    {
+        "desc": "decl: backend header with trailing `#` comment names symbol `be_commented`",
+        "fixture": "decl",
+        "match": "root_contains_symbol",
+        "name": "be_commented",
+        "kind": 5,
+        "detail_forbidden_regex": r"#",
+    },
+    {
+        "desc": "decl: frontend header with trailing `#` comment names symbol `fe_commented`",
+        "fixture": "decl",
+        "match": "root_contains_symbol",
+        "name": "fe_commented",
+        "kind": 11,
+        "detail_regex": r"^\*:81$",
+    },
+    {
+        "desc": "decl: listen header with trailing `#` comment names symbol `ln_commented`",
+        "fixture": "decl",
+        "match": "root_contains_symbol",
+        "name": "ln_commented",
+        "kind": 5,
+        "detail_regex": r"^\*:82$",
+    },
+]
+
+
+# Declaration probes exercise `textDocument/declaration`, which returns an
+# array of every reference location for the symbol under the cursor. The
+# fixture is constructed inline so adding negation edge cases does not
+# perturb line numbers of the on-disk fixtures used by other probe sets.
+DECLARATION_FIXTURE_URI = "file:///tmp/haproxy-lsp-declaration-fixture.cfg"
+DECLARATION_FIXTURE_TEXT = "\n".join(
+    [
+        "frontend fe",                              # 0
+        "  bind *:80",                              # 1
+        "  acl plain hdr(x-a) a",                   # 2
+        "  acl dotted.acl hdr(x-b) b",              # 3
+        "  use_backend be if plain",                # 4: positive plain
+        "  use_backend be if !plain",               # 5: negated plain
+        "  use_backend be if dotted.acl",           # 6: positive dotted
+        "  use_backend be if !dotted.acl",          # 7: negated dotted
+        "  use_backend be unless !plain",           # 8: negated under unless
+        "  use_backend be_commented if plain",      # 9: ref to trailing-comment backend
+        "",                                          # 10
+        "backend be",                                # 11
+        "  mode http",                               # 12
+        "",                                          # 13
+        "backend be_commented # trailing comment",   # 14: header with inline comment
+        "  mode http",                               # 15
+        "",                                          # 16
+        "frontend fe_commented # trailing comment",  # 17: header with inline comment
+        "  bind *:81",                               # 18
+        "",                                          # 19
+        "listen ln_commented # trailing comment",    # 20: header with inline comment
+        "  bind *:82",                               # 21
+        "",
+    ]
+)
+
+# Separate inline fixture for the IP/hostname-collision regression: the
+# fallback "try every symbol kind" path in find_definition used to return a
+# random symbol of the same textual name (e.g. a backend literally named
+# `10.0.0.1`) when the cursor was on a bind address or server hostname.
+# These probes must see a null result — the LSP should refuse to resolve
+# address/hostname tokens to unrelated symbols.
+DEFINITION_NULL_FIXTURE_URI = "file:///tmp/haproxy-lsp-definition-null-fixture.cfg"
+DEFINITION_NULL_FIXTURE_TEXT = "\n".join(
+    [
+        "backend 10.0.0.1",                     # 0: pathological numeric-name backend
+        "  mode http",                          # 1
+        "",                                      # 2
+        "listen stats 10.0.0.1:9091",           # 3: bind addr collides textually with backend name
+        "  bind *:9091",                        # 4
+        "",                                      # 5
+        "backend app",                           # 6
+        "  mode http",                           # 7
+        "  server s1 10.0.0.1:8080 check",      # 8: server addr collides textually with backend name
+        "",                                      # 9
+        "listen 10.0.0.1",                       # 10: same-kind collision — an actual listen named `10.0.0.1`
+        "  bind *:7777",                         # 11
+        "",                                      # 12
+        "backend svc",                           # 13
+        "  mode http",                           # 14
+        "  server 10.0.0.1 10.0.0.2:8080 check", # 15: same-kind server — name `10.0.0.1` vs addr `10.0.0.2`
+        "",
+    ]
+)
+
+DEFINITION_NULL_PROBES: list[dict] = [
+    {
+        "desc": "bind address on `listen` header does not resolve (cross-kind: backend of same name)",
+        "line": 3,
+        "character": 15,
+    },
+    {
+        "desc": "server address on `server` line does not resolve (cross-kind: backend of same name)",
+        "line": 8,
+        "character": 17,
+    },
+    {
+        "desc": "bind address on `listen` header does not resolve (same-kind: another `listen 10.0.0.1`)",
+        "line": 3,
+        "character": 17,
+    },
+    {
+        "desc": "server address on `server` line does not resolve (same-kind: another `server 10.0.0.1`)",
+        "line": 15,
+        "character": 20,
+    },
+]
+
+
+DECLARATION_PROBES: list[dict] = [
+    {
+        "desc": "`!plain` in `if` condition yields declaration reference",
+        "acl_line": 2,
+        "acl_char": 6,
+        "expected_ref_lines": {4, 5, 8, 9},
+    },
+    {
+        "desc": "`!dotted.acl` in `if` condition yields declaration reference",
+        "acl_line": 3,
+        "acl_char": 8,
+        "expected_ref_lines": {6, 7},
+    },
+    {
+        "desc": "backend header with trailing `#` comment resolves declaration",
+        "acl_line": 14,
+        "acl_char": 10,
+        "expected_ref_lines": {9},
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Runners
+# ---------------------------------------------------------------------------
+
+class Results:
+    def __init__(self):
+        self.rows: list[tuple[str, str, str, str]] = []  # (section, desc, status, detail)
+        self.failures = 0
+
+    def record(self, section: str, desc: str, ok: bool, detail: str = ""):
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            self.failures += 1
+        self.rows.append((section, desc, status, detail))
+
+    def print(self):
+        if not self.rows:
+            print("(no probes run)")
+            return
+        w_section = max(len(r[0]) for r in self.rows + [("Section", "", "", "")])
+        w_desc = max(len(r[1]) for r in self.rows + [("", "Probe", "", "")])
+        w_status = 4
+        header = f"{'Section':<{w_section}}  {'Probe':<{w_desc}}  {'Stat':<{w_status}}  Detail"
+        print(header)
+        print("-" * len(header))
+        for section, desc, status, detail in self.rows:
+            print(f"{section:<{w_section}}  {desc:<{w_desc}}  {status:<{w_status}}  {detail}")
+        print()
+        total = len(self.rows)
+        passed = total - self.failures
+        print(f"{passed}/{total} probes passed")
+
+
+def run_definition_probes(client: LspClient, results: Results):
+    if not HAPROXY_CONF.exists():
+        results.record("definition", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    text = HAPROXY_CONF.read_text()
+    client.did_open(uri, text)
+
+    for probe in DEFINITION_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("definition", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if result is None:
+            results.record(
+                "definition",
+                probe["desc"],
+                False,
+                f"null result (probe at {probe['line']}:{probe['character']})",
+            )
+            continue
+
+        # Server returns a single Location object, not an array.
+        actual_line = None
+        if isinstance(result, dict) and "range" in result:
+            actual_line = result["range"]["start"]["line"]
+        elif isinstance(result, list) and result:
+            actual_line = result[0]["range"]["start"]["line"]
+
+        expected = probe["expected_def_line"]
+        ok = actual_line == expected
+        detail = f"expected def line {expected}, got {actual_line}"
+        results.record("definition", probe["desc"], ok, detail)
+
+
+def run_folding_probes(client: LspClient, results: Results):
+    if not FOLDING_PROBES:
+        return
+
+    # Open each fixture that probes reference so the LSP caches folds for it.
+    opened_uris: dict[str, str] = {}
+    fixtures = {
+        "conf": HAPROXY_CONF,
+        "cfg": HAPROXY_CFG,
+    }
+    for key, path in fixtures.items():
+        if not any(p["fixture"] == key for p in FOLDING_PROBES):
+            continue
+        if not path.exists():
+            results.record("folding", f"fixture present: {key}", False, f"missing: {path}")
+            continue
+        uri = path_to_uri(path)
+        client.did_open(uri, path.read_text())
+        opened_uris[key] = uri
+
+    for probe in FOLDING_PROBES:
+        fixture_key = probe["fixture"]
+        if fixture_key == "unopened":
+            # Use a URI we never sent didOpen for.
+            uri = "file:///tmp/haproxy-lsp-never-opened.cfg"
+        else:
+            uri = opened_uris.get(fixture_key)
+            if uri is None:
+                results.record("folding", probe["desc"], False, "fixture not opened")
+                continue
+
+        try:
+            resp = client.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": uri}},
+            )
+        except TimeoutError as exc:
+            results.record("folding", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if not isinstance(result, list):
+            results.record(
+                "folding",
+                probe["desc"],
+                False,
+                f"expected list, got {type(result).__name__}: {result!r}",
+            )
+            continue
+
+        match = probe["match"]
+        if match == "absent":
+            ok = result == []
+            detail = f"got {len(result)} folds" if not ok else "empty as expected"
+            results.record("folding", probe["desc"], ok, detail)
+        elif match == "contains":
+            expected = probe["expected"]
+            found = any(
+                r.get("startLine") == expected["startLine"]
+                and r.get("endLine") == expected["endLine"]
+                and r.get("kind") == expected["kind"]
+                for r in result
+            )
+            if found:
+                results.record("folding", probe["desc"], True, f"fold present ({len(result)} total)")
+            else:
+                preview = ", ".join(
+                    f"[{r.get('startLine')}-{r.get('endLine')} {r.get('kind')}]" for r in result[:8]
+                )
+                results.record(
+                    "folding",
+                    probe["desc"],
+                    False,
+                    f"expected {expected}, not in {len(result)} folds: {preview}",
+                )
+        else:
+            results.record("folding", probe["desc"], False, f"unknown match type: {match}")
+
+
+def _find_root_symbol(symbols: list, name: str) -> dict | None:
+    for s in symbols:
+        if s.get("name") == name:
+            return s
+    return None
+
+
+def run_document_symbol_probes(client: LspClient, results: Results):
+    if not DOCUMENT_SYMBOL_PROBES:
+        return
+
+    import re
+
+    opened_uris: dict[str, str] = {}
+    fixtures = {
+        "conf": HAPROXY_CONF,
+        "cfg": HAPROXY_CFG,
+    }
+    for key, path in fixtures.items():
+        if not any(p["fixture"] == key for p in DOCUMENT_SYMBOL_PROBES):
+            continue
+        if not path.exists():
+            results.record("documentSymbol", f"fixture present: {key}", False, f"missing: {path}")
+            continue
+        uri = path_to_uri(path)
+        # Safe to re-open; parse_document is idempotent on the cache.
+        client.did_open(uri, path.read_text())
+        opened_uris[key] = uri
+
+    # Expose the inline declaration fixture so documentSymbol probes can
+    # assert on trailing-comment header lines without adding a new on-disk
+    # fixture (and without shifting line numbers of the existing probes).
+    if any(p["fixture"] == "decl" for p in DOCUMENT_SYMBOL_PROBES):
+        client.did_open(DECLARATION_FIXTURE_URI, DECLARATION_FIXTURE_TEXT)
+        opened_uris["decl"] = DECLARATION_FIXTURE_URI
+
+    cached: dict[str, list] = {}
+
+    def get_symbols(uri: str) -> list | None:
+        if uri in cached:
+            return cached[uri]
+        try:
+            resp = client.request(
+                "textDocument/documentSymbol",
+                {"textDocument": {"uri": uri}},
+            )
+        except TimeoutError as exc:
+            return None
+        result = resp.get("result")
+        if not isinstance(result, list):
+            return None
+        cached[uri] = result
+        return result
+
+    for probe in DOCUMENT_SYMBOL_PROBES:
+        fixture_key = probe["fixture"]
+        if fixture_key == "unopened":
+            uri = "file:///tmp/haproxy-lsp-never-opened-ds.cfg"
+        else:
+            uri = opened_uris.get(fixture_key)
+            if uri is None:
+                results.record("documentSymbol", probe["desc"], False, "fixture not opened")
+                continue
+
+        symbols = get_symbols(uri)
+        if symbols is None:
+            results.record("documentSymbol", probe["desc"], False, "no result / timeout")
+            continue
+
+        match = probe["match"]
+        if match == "absent":
+            ok = symbols == []
+            detail = f"got {len(symbols)} symbols" if not ok else "empty as expected"
+            results.record("documentSymbol", probe["desc"], ok, detail)
+            continue
+
+        if match == "root_contains_symbol":
+            sym = _find_root_symbol(symbols, probe["name"])
+            if sym is None:
+                preview = ", ".join(s.get("name", "?") for s in symbols[:8])
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"name {probe['name']!r} not in root ({len(symbols)} total): {preview}",
+                )
+                continue
+            if sym.get("kind") != probe["kind"]:
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"kind mismatch: expected {probe['kind']}, got {sym.get('kind')}",
+                )
+                continue
+            if "detail_regex" in probe:
+                detail_str = sym.get("detail") or ""
+                if not re.match(probe["detail_regex"], detail_str):
+                    results.record(
+                        "documentSymbol",
+                        probe["desc"],
+                        False,
+                        f"detail {detail_str!r} did not match {probe['detail_regex']!r}",
+                    )
+                    continue
+            if "detail_forbidden_regex" in probe:
+                detail_str = sym.get("detail") or ""
+                if re.search(probe["detail_forbidden_regex"], detail_str):
+                    results.record(
+                        "documentSymbol",
+                        probe["desc"],
+                        False,
+                        f"detail {detail_str!r} matched forbidden {probe['detail_forbidden_regex']!r}",
+                    )
+                    continue
+            results.record(
+                "documentSymbol",
+                probe["desc"],
+                True,
+                f"found (kind={sym.get('kind')}, detail={sym.get('detail')!r})",
+            )
+            continue
+
+        if match == "children_count_at_least":
+            sym = _find_root_symbol(symbols, probe["name"])
+            if sym is None:
+                results.record("documentSymbol", probe["desc"], False, f"parent {probe['name']!r} missing")
+                continue
+            kids = sym.get("children") or []
+            kids_of_kind = [c for c in kids if c.get("kind") == probe["child_kind"]]
+            if len(kids_of_kind) < probe["min_children"]:
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"only {len(kids_of_kind)} children of kind {probe['child_kind']} (need {probe['min_children']})",
+                )
+                continue
+            if probe.get("require_non_empty_detail"):
+                empty = [c for c in kids_of_kind if not (c.get("detail") or "").strip()]
+                if empty:
+                    results.record(
+                        "documentSymbol",
+                        probe["desc"],
+                        False,
+                        f"{len(empty)} children had empty detail",
+                    )
+                    continue
+            results.record(
+                "documentSymbol",
+                probe["desc"],
+                True,
+                f"{len(kids_of_kind)} children (kind={probe['child_kind']})",
+            )
+            continue
+
+        if match == "child_detail_regex":
+            sym = _find_root_symbol(symbols, probe["name"])
+            if sym is None:
+                results.record("documentSymbol", probe["desc"], False, f"parent {probe['name']!r} missing")
+                continue
+            kids = sym.get("children") or []
+            matching = [
+                c
+                for c in kids
+                if c.get("kind") == probe["child_kind"]
+                and re.search(probe["detail_regex"], c.get("detail") or "")
+            ]
+            if len(matching) < probe["min_children"]:
+                preview = ", ".join(
+                    f"{c.get('name')}={c.get('detail')!r}" for c in kids[:5]
+                )
+                results.record(
+                    "documentSymbol",
+                    probe["desc"],
+                    False,
+                    f"only {len(matching)} matched; sample: {preview}",
+                )
+                continue
+            results.record(
+                "documentSymbol",
+                probe["desc"],
+                True,
+                f"{len(matching)} children matched regex",
+            )
+            continue
+
+        results.record("documentSymbol", probe["desc"], False, f"unknown match type: {match}")
+
+
+def run_definition_null_probes(client: LspClient, results: Results):
+    if not DEFINITION_NULL_PROBES:
+        return
+    client.did_open(DEFINITION_NULL_FIXTURE_URI, DEFINITION_NULL_FIXTURE_TEXT)
+
+    for probe in DEFINITION_NULL_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": DEFINITION_NULL_FIXTURE_URI},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("definition-null", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        # Accept both `null` and `[]` as "no definition found" per LSP spec.
+        ok = result is None or result == []
+        detail = "null as expected" if ok else f"unexpected result: {result!r}"
+        results.record("definition-null", probe["desc"], ok, detail)
+
+
+def run_declaration_probes(client: LspClient, results: Results):
+    if not DECLARATION_PROBES:
+        return
+    client.did_open(DECLARATION_FIXTURE_URI, DECLARATION_FIXTURE_TEXT)
+
+    for probe in DECLARATION_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/declaration",
+                {
+                    "textDocument": {"uri": DECLARATION_FIXTURE_URI},
+                    "position": {
+                        "line": probe["acl_line"],
+                        "character": probe["acl_char"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("declaration", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if not isinstance(result, list):
+            results.record(
+                "declaration",
+                probe["desc"],
+                False,
+                f"expected list, got {type(result).__name__}: {result!r}",
+            )
+            continue
+
+        actual_lines = {loc["range"]["start"]["line"] for loc in result}
+        expected = probe["expected_ref_lines"]
+        missing = expected - actual_lines
+        ok = not missing
+        if ok:
+            detail = f"ref lines {sorted(actual_lines)}"
+        else:
+            detail = f"missing {sorted(missing)}; got {sorted(actual_lines)}"
+        results.record("declaration", probe["desc"], ok, detail)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
+    parser.add_argument(
+        "--binary",
+        default=str(DEFAULT_BINARY),
+        help="Path to haproxy-lsp binary (default: ./bin/haproxy-lsp)",
+    )
+    args = parser.parse_args()
+
+    binary = Path(args.binary)
+    if not binary.exists():
+        print(f"error: LSP binary not found at {binary}", file=sys.stderr)
+        print("hint: run ./build.sh first", file=sys.stderr)
+        return 2
+
+    results = Results()
+    client = LspClient(binary)
+    try:
+        client.initialize()
+        client.initialized()
+        run_definition_probes(client, results)
+        run_definition_null_probes(client, results)
+        run_folding_probes(client, results)
+        run_document_symbol_probes(client, results)
+        run_declaration_probes(client, results)
+    finally:
+        client.shutdown()
+
+    results.print()
+    return 0 if results.failures == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

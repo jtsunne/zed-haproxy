@@ -1,7 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
-use tree_sitter::{Parser};
 
 #[derive(Debug, Clone)]
 struct Symbol {
@@ -49,19 +48,484 @@ struct Position {
     character: u32,
 }
 
+#[derive(Debug, Clone)]
+struct FoldingRange {
+    start_line: u32,
+    end_line: u32,
+    kind: &'static str,
+}
+
+// LSP numeric SymbolKind values. Kept as u8 for compactness; serialized as u32.
+// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
+#[derive(Debug, Clone)]
+struct DocumentSymbol {
+    name: String,
+    detail: Option<String>,
+    kind: u8,
+    // `range` spans the logical extent of the symbol (whole section body for
+    // sections, whole line for children). `selection_range` covers the
+    // identifier token only — Zed targets this for Cmd+Shift+O jump and
+    // breadcrumbs. HAProxy identifiers are ASCII per the grammar regex
+    // `/[a-zA-Z0-9_.-]+/`, so byte == char == UTF-16 code unit; no conversion
+    // needed here, but keep this invariant in mind for any future multi-byte
+    // identifier work.
+    range: Range,
+    selection_range: Range,
+    children: Vec<DocumentSymbol>,
+}
+
 struct HaproxyLsp {
-    parser: Parser,
     symbols: HashMap<String, Vec<Symbol>>,
+    folds: HashMap<String, Vec<FoldingRange>>,
+    outline: HashMap<String, Vec<DocumentSymbol>>,
+    documents: HashMap<String, String>,
+}
+
+const SECTION_KEYWORDS: &[&str] = &[
+    "global", "defaults", "frontend", "backend", "listen", "resolvers",
+    "userlist", "peers", "mailers", "cache", "program", "ring",
+];
+
+fn is_section_header(line: &str) -> bool {
+    // Section headers live at column 0; any leading whitespace disqualifies.
+    if line.starts_with(|c: char| c.is_whitespace()) {
+        return false;
+    }
+    for kw in SECTION_KEYWORDS {
+        if let Some(rest) = line.strip_prefix(*kw) {
+            if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_marker(line: &str, keyword: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let after_hash = trimmed.strip_prefix('#')?.trim_start();
+    let rest = after_hash.strip_prefix(keyword)?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let name = rest.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn compute_folds(content: &str) -> Vec<FoldingRange> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut section_folds: Vec<FoldingRange> = Vec::new();
+    let mut comment_folds: Vec<FoldingRange> = Vec::new();
+    let mut region_folds: Vec<FoldingRange> = Vec::new();
+
+    // Section folds: open on header, close on line before next header or at EOF.
+    let mut open_section_start: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if is_section_header(line) {
+            if let Some(start) = open_section_start {
+                let end = (i as u32).saturating_sub(1);
+                if end > start {
+                    section_folds.push(FoldingRange { start_line: start, end_line: end, kind: "region" });
+                }
+            }
+            open_section_start = Some(i as u32);
+        }
+    }
+    if let Some(start) = open_section_start {
+        if line_count > 0 {
+            let end = (line_count - 1) as u32;
+            if end > start {
+                section_folds.push(FoldingRange { start_line: start, end_line: end, kind: "region" });
+            }
+        }
+    }
+
+    // Comment banner folds: runs of 2+ consecutive `#`-prefixed lines.
+    let mut banner_start: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let is_comment = line.trim_start().starts_with('#');
+        if is_comment {
+            if banner_start.is_none() {
+                banner_start = Some(i as u32);
+            }
+        } else if let Some(start) = banner_start {
+            let end = (i as u32).saturating_sub(1);
+            if end > start {
+                comment_folds.push(FoldingRange { start_line: start, end_line: end, kind: "comment" });
+            }
+            banner_start = None;
+        }
+    }
+    if let Some(start) = banner_start {
+        if line_count > 0 {
+            let end = (line_count - 1) as u32;
+            if end > start {
+                comment_folds.push(FoldingRange { start_line: start, end_line: end, kind: "comment" });
+            }
+        }
+    }
+
+    // BEGIN/END region folds: case-sensitive, exact-name match via stack.
+    let mut stack: Vec<(String, u32)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(name) = parse_marker(line, "BEGIN") {
+            stack.push((name, i as u32));
+        } else if let Some(name) = parse_marker(line, "END") {
+            if let Some(pos) = stack.iter().rposition(|(n, _)| n == &name) {
+                let (_, start) = stack.remove(pos);
+                let end = i as u32;
+                if end > start {
+                    region_folds.push(FoldingRange { start_line: start, end_line: end, kind: "region" });
+                }
+            }
+        }
+    }
+
+    let mut out = section_folds;
+    out.extend(comment_folds);
+    out.extend(region_folds);
+    out
+}
+
+fn section_kind_for(keyword: &str) -> u8 {
+    match keyword {
+        "global" | "defaults" => 3,           // Namespace
+        "frontend" => 11,                      // Interface
+        "backend" | "listen" => 5,             // Class
+        "resolvers" | "userlist" | "peers" | "cache" | "mailers" | "program" | "ring" => 2, // Module
+        _ => 2,
+    }
+}
+
+fn truncate_detail(s: &str, max: usize) -> String {
+    // Char-boundary-safe truncation. ACL criterion strings can contain
+    // multi-byte chars in comments/regexes, so byte slicing is unsafe.
+    let chars: Vec<char> = s.trim().chars().collect();
+    if chars.len() <= max {
+        chars.into_iter().collect()
+    } else {
+        let mut out: String = chars.into_iter().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+
+    // Pass 1: locate section headers.
+    struct HeaderInfo {
+        keyword: String,
+        name: String,
+        name_start_col: u32,
+        header_line: u32,
+        // Inline bind address on a `listen NAME addr[:port]` or
+        // `frontend NAME addr[:port]` header. HAProxy's grammar allows the
+        // address to appear on the same line as the section declaration; when
+        // present it is recorded here so the outline `detail` can surface it
+        // even when the body has no `bind` directive.
+        inline_address: Option<String>,
+    }
+    let mut headers: Vec<HeaderInfo> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !is_section_header(line) {
+            continue;
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let keyword = tokens[0].to_string();
+        let name = if tokens.len() >= 2 {
+            tokens[1].to_string()
+        } else {
+            String::new()
+        };
+        // Only `listen` permits an inline bind address in the section header
+        // (grammar: `listen NAME [addr]`); `frontend` does not. Also guard
+        // against trailing comments like `listen X # note` leaking `#` as the
+        // address.
+        let inline_address = if keyword == "listen"
+            && tokens.len() >= 3
+            && !tokens[2].starts_with('#')
+        {
+            Some(tokens[2].to_string())
+        } else {
+            None
+        };
+        let name_start_col = if !name.is_empty() {
+            // Search for the name starting *past* the keyword so that
+            // pathological headers like `backend backend` or `frontend end`
+            // (where the name is a substring of the keyword or appears inside
+            // it) still point at the identifier token, not the keyword.
+            let search_from = keyword.len();
+            line.get(search_from..)
+                .and_then(|tail| tail.find(&name).map(|n| (n + search_from) as u32))
+                .unwrap_or(search_from as u32)
+        } else {
+            0
+        };
+        headers.push(HeaderInfo {
+            keyword,
+            name,
+            name_start_col,
+            header_line: i as u32,
+            inline_address,
+        });
+    }
+
+    // Pass 2: build DocumentSymbol per section with children and detail.
+    let mut result: Vec<DocumentSymbol> = Vec::with_capacity(headers.len());
+    for (idx, h) in headers.iter().enumerate() {
+        let end_line = if idx + 1 < headers.len() {
+            headers[idx + 1].header_line.saturating_sub(1)
+        } else if line_count > 0 {
+            (line_count - 1) as u32
+        } else {
+            h.header_line
+        };
+
+        let mut children: Vec<DocumentSymbol> = Vec::new();
+        let mut balance: Option<String> = None;
+        let mut mode: Option<String> = None;
+        let mut server_count: usize = 0;
+        let mut nameserver_count: usize = 0;
+        let mut binds: Vec<String> = Vec::new();
+
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (end_line as usize).min(line_count.saturating_sub(1));
+        if body_start <= body_end {
+            for ln_idx in body_start..=body_end {
+                let ln = lines[ln_idx];
+                let trimmed = ln.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+                match tokens[0] {
+                    "acl" if (h.keyword == "frontend" || h.keyword == "listen" || h.keyword == "backend")
+                        && tokens.len() >= 3 =>
+                    {
+                        let acl_name = tokens[1];
+                        let criterion: String = tokens[2..].join(" ");
+                        let detail = truncate_detail(&criterion, 40);
+                        // Search past the `acl` keyword to avoid matching an
+                        // earlier occurrence of the name (e.g. in indentation
+                        // alignment or an `acl acl ...` edge case).
+                        let search_from = ln.find("acl").map(|p| p + 3).unwrap_or(0);
+                        let name_start = ln
+                            .get(search_from..)
+                            .and_then(|tail| tail.find(acl_name).map(|n| (n + search_from) as u32))
+                            .unwrap_or(search_from as u32);
+                        let name_end = name_start + acl_name.len() as u32;
+                        children.push(DocumentSymbol {
+                            name: acl_name.to_string(),
+                            detail: Some(detail),
+                            kind: 7, // Property
+                            range: Range {
+                                start: Position { line: ln_idx as u32, character: 0 },
+                                end: Position { line: ln_idx as u32, character: ln.len() as u32 },
+                            },
+                            selection_range: Range {
+                                start: Position { line: ln_idx as u32, character: name_start },
+                                end: Position { line: ln_idx as u32, character: name_end },
+                            },
+                            children: Vec::new(),
+                        });
+                    }
+                    "server" if (h.keyword == "backend" || h.keyword == "listen")
+                        && tokens.len() >= 3 =>
+                    {
+                        server_count += 1;
+                        let srv_name = tokens[1];
+                        let addr = tokens[2].to_string();
+                        let search_from = ln.find("server").map(|p| p + 6).unwrap_or(0);
+                        let name_start = ln
+                            .get(search_from..)
+                            .and_then(|tail| tail.find(srv_name).map(|n| (n + search_from) as u32))
+                            .unwrap_or(search_from as u32);
+                        let name_end = name_start + srv_name.len() as u32;
+                        children.push(DocumentSymbol {
+                            name: srv_name.to_string(),
+                            detail: Some(addr),
+                            kind: 8, // Field
+                            range: Range {
+                                start: Position { line: ln_idx as u32, character: 0 },
+                                end: Position { line: ln_idx as u32, character: ln.len() as u32 },
+                            },
+                            selection_range: Range {
+                                start: Position { line: ln_idx as u32, character: name_start },
+                                end: Position { line: ln_idx as u32, character: name_end },
+                            },
+                            children: Vec::new(),
+                        });
+                    }
+                    "nameserver" if h.keyword == "resolvers" && tokens.len() >= 3 => {
+                        nameserver_count += 1;
+                        let ns_name = tokens[1];
+                        let addr = tokens[2].to_string();
+                        let search_from = ln.find("nameserver").map(|p| p + 10).unwrap_or(0);
+                        let name_start = ln
+                            .get(search_from..)
+                            .and_then(|tail| tail.find(ns_name).map(|n| (n + search_from) as u32))
+                            .unwrap_or(search_from as u32);
+                        let name_end = name_start + ns_name.len() as u32;
+                        children.push(DocumentSymbol {
+                            name: ns_name.to_string(),
+                            detail: Some(addr),
+                            kind: 8, // Field
+                            range: Range {
+                                start: Position { line: ln_idx as u32, character: 0 },
+                                end: Position { line: ln_idx as u32, character: ln.len() as u32 },
+                            },
+                            selection_range: Range {
+                                start: Position { line: ln_idx as u32, character: name_start },
+                                end: Position { line: ln_idx as u32, character: name_end },
+                            },
+                            children: Vec::new(),
+                        });
+                    }
+                    "balance" if tokens.len() >= 2 && balance.is_none() => {
+                        balance = Some(tokens[1].to_string());
+                    }
+                    "mode" if tokens.len() >= 2 && mode.is_none() => {
+                        mode = Some(tokens[1].to_string());
+                    }
+                    "bind" if tokens.len() >= 2 => {
+                        binds.push(tokens[1].to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let detail = match h.keyword.as_str() {
+            "backend" => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(b) = balance {
+                    parts.push(b);
+                }
+                if let Some(m) = mode {
+                    parts.push(m);
+                }
+                parts.push(format!("{} servers", server_count));
+                Some(parts.join(" · "))
+            }
+            "frontend" | "listen" => {
+                // Surface the inline bind address from `listen NAME addr`
+                // first so the detail still renders when the body contains no
+                // explicit `bind` directive; body binds follow so operators
+                // see both sources when both exist. `frontend` never carries
+                // an inline address (grammar only permits it on `listen`).
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(addr) = &h.inline_address {
+                    parts.push(addr.clone());
+                }
+                parts.extend(binds.iter().cloned());
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(", "))
+                }
+            }
+            "resolvers" => Some(format!("{} nameservers", nameserver_count)),
+            _ => None,
+        };
+
+        let kind = section_kind_for(&h.keyword);
+        let display_name = if h.name.is_empty() {
+            h.keyword.clone()
+        } else {
+            h.name.clone()
+        };
+        let selection = if h.name.is_empty() {
+            Range {
+                start: Position { line: h.header_line, character: 0 },
+                end: Position {
+                    line: h.header_line,
+                    character: h.keyword.len() as u32,
+                },
+            }
+        } else {
+            Range {
+                start: Position {
+                    line: h.header_line,
+                    character: h.name_start_col,
+                },
+                end: Position {
+                    line: h.header_line,
+                    character: h.name_start_col + h.name.len() as u32,
+                },
+            }
+        };
+        let end_char = lines
+            .get(end_line as usize)
+            .map(|l| l.len() as u32)
+            .unwrap_or(0);
+
+        result.push(DocumentSymbol {
+            name: display_name,
+            detail,
+            kind,
+            range: Range {
+                start: Position { line: h.header_line, character: 0 },
+                end: Position { line: end_line, character: end_char },
+            },
+            selection_range: selection,
+            children,
+        });
+    }
+
+    result
+}
+
+fn serialize_document_symbol(sym: &DocumentSymbol) -> Value {
+    // LSP wire format requires camelCase field names (notably `selectionRange`)
+    // and numeric `kind`. Hand-construct to avoid relying on serde renames.
+    json!({
+        "name": sym.name,
+        "detail": sym.detail,
+        "kind": sym.kind as u32,
+        "range": {
+            "start": {
+                "line": sym.range.start.line,
+                "character": sym.range.start.character,
+            },
+            "end": {
+                "line": sym.range.end.line,
+                "character": sym.range.end.character,
+            },
+        },
+        "selectionRange": {
+            "start": {
+                "line": sym.selection_range.start.line,
+                "character": sym.selection_range.start.character,
+            },
+            "end": {
+                "line": sym.selection_range.end.line,
+                "character": sym.selection_range.end.character,
+            },
+        },
+        "children": sym.children.iter().map(serialize_document_symbol).collect::<Vec<_>>(),
+    })
 }
 
 impl HaproxyLsp {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let parser = Parser::new();
-        // TODO: Set up the HAProxy language when tree-sitter integration is ready
-        
         Ok(HaproxyLsp {
-            parser,
             symbols: HashMap::new(),
+            folds: HashMap::new(),
+            outline: HashMap::new(),
+            documents: HashMap::new(),
         })
     }
 
@@ -74,7 +538,11 @@ impl HaproxyLsp {
             
             // Parse backend definitions
             if line.starts_with("backend ") {
-                let name = line.strip_prefix("backend ").unwrap_or("").trim();
+                // Grammar only permits a section_name token after the
+                // keyword; take the first whitespace-delimited token so
+                // inline trailing data (if any) doesn't contaminate the
+                // symbol name.
+                let name = line["backend ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -90,7 +558,7 @@ impl HaproxyLsp {
             }
             // Parse frontend definitions
             else if line.starts_with("frontend ") {
-                let name = line.strip_prefix("frontend ").unwrap_or("").trim();
+                let name = line["frontend ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -106,7 +574,10 @@ impl HaproxyLsp {
             }
             // Parse listen definitions
             else if line.starts_with("listen ") {
-                let name = line.strip_prefix("listen ").unwrap_or("").trim();
+                // `listen` accepts an optional inline bind address per
+                // grammar (`listen stats 127.0.0.1:9000`), so the name is
+                // the first token only — not the full remainder.
+                let name = line["listen ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
                         name: name.to_string(),
@@ -224,11 +695,19 @@ impl HaproxyLsp {
             }
         }
         
+        // Build fold/outline data into locals before any self.* write so a
+        // mid-parse panic cannot leave caches out of sync with each other.
+        let folds = compute_folds(content);
+        let outline = compute_outline(content);
+
         self.symbols.insert(uri.to_string(), updated_symbols);
+        self.folds.insert(uri.to_string(), folds);
+        self.outline.insert(uri.to_string(), outline);
+        self.documents.insert(uri.to_string(), content.to_string());
         Ok(())
     }
 
-    fn find_definition(&self, _uri: &str, position: &Position, content: &str) -> Option<Symbol> {
+    fn find_definition(&self, uri: &str, position: &Position, content: &str) -> Option<Symbol> {
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
         if line_idx >= lines.len() {
@@ -239,44 +718,52 @@ impl HaproxyLsp {
         // Resolve the word under the cursor and its byte offset on the line.
         let (word, word_start) = self.word_at_position(line, position.character as usize)?;
 
-        // The last non-whitespace token before the word tells us what role the
-        // word is playing, which disambiguates e.g. `use_backend X if Y` where
-        // X is a backend reference and Y is an ACL reference.
-        let preceding = line[..word_start].split_whitespace().last();
-
-        let hint: Option<SymbolKind> = match preceding {
-            Some("use_backend") | Some("default_backend") => Some(SymbolKind::Backend),
-            Some("if") | Some("unless") | Some("&&") | Some("||") | Some("!") => {
-                Some(SymbolKind::Acl)
+        // Walk tokens backwards from the cursor looking for the controlling
+        // keyword that disambiguates the word's role. Identifier-like tokens
+        // (intermediate ACL names in a chained `if a b c`) and condition
+        // operators (`!`, `&&`, `||`) are skipped so the walk can reach the
+        // real context keyword (`if`, `use_backend`, `listen`, ...).
+        //
+        // Additionally, we must distinguish the keyword's "name slot" (the
+        // first identifier token following it) from later positional tokens.
+        // Example: `listen stats 10.0.0.1:9091` — cursor on the address walks
+        // back past `stats` and hits `listen`, but the address is NOT a listen
+        // name. Without this guard, if another `listen 10.0.0.1` exists in
+        // the file, F12 on the address would misnavigate to it. Same issue
+        // for `server s1 10.0.0.1:8080 check` and any trailing option tokens.
+        //
+        // All supported keywords except `if`/`unless` take exactly one name
+        // slot; only ACL conditions (`if`/`unless`) admit multiple subsequent
+        // identifier references (`if a && b || c`).
+        let prefix = &line[..word_start];
+        let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
+        let kw_match = prefix_tokens.iter().enumerate().rev().find_map(|(idx, tok)| {
+            match *tok {
+                "use_backend" | "default_backend" | "backend" => Some((idx, SymbolKind::Backend)),
+                "if" | "unless" => Some((idx, SymbolKind::Acl)),
+                "frontend" => Some((idx, SymbolKind::Frontend)),
+                "listen" => Some((idx, SymbolKind::Listen)),
+                "acl" => Some((idx, SymbolKind::Acl)),
+                "server" => Some((idx, SymbolKind::Server)),
+                _ => None,
             }
-            // F12 on a definition line's name resolves to the definition itself.
-            Some("backend") => Some(SymbolKind::Backend),
-            Some("frontend") => Some(SymbolKind::Frontend),
-            Some("listen") => Some(SymbolKind::Listen),
-            Some("acl") => Some(SymbolKind::Acl),
-            Some("server") => Some(SymbolKind::Server),
-            _ => None,
-        };
+        });
 
-        if let Some(kind) = hint {
-            if let Some(sym) = self.find_symbol_by_name(&word, kind) {
-                return Some(sym);
+        if let Some((kw_idx, kind)) = kw_match {
+            // For single-name-slot keywords, the cursor word must be the
+            // immediate next token after the keyword. Any token past that
+            // slot (bind address, server address, trailing options, inline
+            // comment text) must not resolve, even if it textually matches
+            // an existing symbol name.
+            let is_condition_kw = matches!(kind, SymbolKind::Acl)
+                && matches!(
+                    prefix_tokens.get(kw_idx).copied(),
+                    Some("if") | Some("unless")
+                );
+            if !is_condition_kw && kw_idx + 1 != prefix_tokens.len() {
+                return None;
             }
-        }
-
-        // Fallback: if the preceding-token heuristic didn't match, try every
-        // symbol kind. This covers cursor placement on tokens whose context we
-        // don't explicitly recognize.
-        for kind in [
-            SymbolKind::Backend,
-            SymbolKind::Acl,
-            SymbolKind::Frontend,
-            SymbolKind::Listen,
-            SymbolKind::Server,
-        ] {
-            if let Some(sym) = self.find_symbol_by_name(&word, kind) {
-                return Some(sym);
-            }
+            return self.find_symbol_by_name(uri, &word, kind);
         }
 
         None
@@ -321,17 +808,27 @@ impl HaproxyLsp {
         let mut acl_names = Vec::new();
         
         for part in parts {
-            // Skip HAProxy operators and keywords
-            if part == "||" || part == "&&" || part == "!" || part.starts_with('!') || part == "{" {
+            // Skip HAProxy operators and keywords.
+            // Note: do NOT skip tokens that merely *start* with `!` — those are
+            // negated ACL references (`if !foo.bar`) and must flow through to
+            // the `trim_start_matches('!')` path below so the bare name is
+            // recorded as a reference.
+            if part == "||" || part == "&&" || part == "!" || part == "{" {
                 continue;
             }
             // Stop at opening brace or other control characters
             if part.contains('{') {
                 break;
             }
-            // Remove negation prefix and add ACL name
+            // Remove negation prefix and add ACL name.
+            // Grammar permits `.` in identifiers (`[a-zA-Z0-9_.-]+`), so
+            // dotted names like `geo.prod.allow` must not be filtered.
             let clean_name = part.trim_start_matches('!').trim();
-            if !clean_name.is_empty() && clean_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            if !clean_name.is_empty()
+                && clean_name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
+            {
                 acl_names.push(clean_name.to_string());
             }
         }
@@ -350,7 +847,9 @@ impl HaproxyLsp {
     /// is in whitespace and not adjacent to a word.
     fn word_at_position(&self, line: &str, char_pos: usize) -> Option<(String, usize)> {
         let chars: Vec<char> = line.chars().collect();
-        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+        // Grammar identifier set is `/[a-zA-Z0-9_.-]+/`, so `.` must
+        // count as a word char to resolve dotted names like `foo.bar`.
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '.';
 
         let len = chars.len();
         let mut pos = char_pos.min(len);
@@ -383,8 +882,11 @@ impl HaproxyLsp {
         Some((word, byte_start))
     }
 
-    fn find_symbol_by_name(&self, name: &str, kind: SymbolKind) -> Option<Symbol> {
-        for symbols in self.symbols.values() {
+    fn find_symbol_by_name(&self, uri: &str, name: &str, kind: SymbolKind) -> Option<Symbol> {
+        // Single-file scope: only resolve against the requesting document so
+        // that two open files with the same backend/acl name don't silently
+        // cross-navigate.
+        if let Some(symbols) = self.symbols.get(uri) {
             for symbol in symbols {
                 if symbol.name == name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&kind) {
                     return Some(symbol.clone());
@@ -400,66 +902,71 @@ impl HaproxyLsp {
         if position.line as usize >= lines.len() {
             return None;
         }
-        
+
         let line = lines[position.line as usize];
-        
+
         // Check if we're on a symbol definition (backend, acl, etc.)
         // If so, return all references to that symbol
-        
+
+        // Section-definition lookups must extract only the first
+        // whitespace-delimited token after the keyword so trailing inline
+        // bind addresses (`listen stats 127.0.0.1:9000`) or trailing `#`
+        // comments don't contaminate the symbol name. This mirrors how
+        // parse_document stores the symbol name in the symbol table; any
+        // divergence here would silently drop declarations on such lines.
+        let trimmed = line.trim();
+
         // Check if this line defines a backend
-        if line.trim().starts_with("backend ") {
-            let name = line.trim().strip_prefix("backend ").unwrap_or("").trim();
-            if !name.is_empty() {
-                return self.find_references_to_symbol(name, SymbolKind::Backend);
+        if let Some(rest) = trimmed.strip_prefix("backend ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                return self.find_references_to_symbol(uri, name, SymbolKind::Backend);
             }
         }
-        
+
         // Check if this line defines an ACL
-        if line.trim().starts_with("acl ") {
-            let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if trimmed.starts_with("acl ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[1];
-                return self.find_references_to_symbol(name, SymbolKind::Acl);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Acl);
             }
         }
-        
+
         // Check if this line defines a frontend
-        if line.trim().starts_with("frontend ") {
-            let name = line.trim().strip_prefix("frontend ").unwrap_or("").trim();
-            if !name.is_empty() {
-                return self.find_references_to_symbol(name, SymbolKind::Frontend);
+        if let Some(rest) = trimmed.strip_prefix("frontend ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                return self.find_references_to_symbol(uri, name, SymbolKind::Frontend);
             }
         }
-        
+
         // Check if this line defines a listen section
-        if line.trim().starts_with("listen ") {
-            let name = line.trim().strip_prefix("listen ").unwrap_or("").trim();
-            if !name.is_empty() {
-                return self.find_references_to_symbol(name, SymbolKind::Listen);
+        if let Some(rest) = trimmed.strip_prefix("listen ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                return self.find_references_to_symbol(uri, name, SymbolKind::Listen);
             }
         }
-        
+
         // Check if this line defines a server
         if line.trim().trim_start().starts_with("server ") {
             let parts: Vec<&str> = line.trim().trim_start().split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[1];
-                return self.find_references_to_symbol(name, SymbolKind::Server);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Server);
             }
         }
-        
+
         None
     }
-    
-    fn find_references_to_symbol(&self, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
-        for symbols in self.symbols.values() {
-            for symbol in symbols {
-                if symbol.name == symbol_name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&symbol_kind) {
-                    if symbol.references.is_empty() {
-                        return None;
-                    } else {
-                        return Some(symbol.references.clone());
-                    }
+
+    fn find_references_to_symbol(&self, uri: &str, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
+        // Single-file scope: look only in the requesting document.
+        let symbols = self.symbols.get(uri)?;
+        for symbol in symbols {
+            if symbol.name == symbol_name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&symbol_kind) {
+                if symbol.references.is_empty() {
+                    return None;
+                } else {
+                    return Some(symbol.references.clone());
                 }
             }
         }
@@ -479,6 +986,8 @@ impl HaproxyLsp {
                         "capabilities": {
                             "definitionProvider": true,
                             "declarationProvider": true,
+                            "foldingRangeProvider": true,
+                            "documentSymbolProvider": true,
                             "textDocumentSync": {
                                 "openClose": true,
                                 "change": 1
@@ -497,6 +1006,18 @@ impl HaproxyLsp {
                 }
                 
                 None // No response needed for notifications
+            }
+            "textDocument/didClose" => {
+                // Evict all per-URI caches so long-lived sessions don't grow
+                // unbounded as files are opened and closed.
+                let params = &request["params"];
+                if let Some(uri) = params["textDocument"]["uri"].as_str() {
+                    self.symbols.remove(uri);
+                    self.folds.remove(uri);
+                    self.outline.remove(uri);
+                    self.documents.remove(uri);
+                }
+                None
             }
             "textDocument/didChange" => {
                 let params = &request["params"];
@@ -521,9 +1042,9 @@ impl HaproxyLsp {
                     character: params["position"]["character"].as_u64()? as u32,
                 };
 
-                // For this basic implementation, we'll need to re-read the file content
-                // In production, we'd cache the content from didOpen/didChange events
-                if let Ok(content) = std::fs::read_to_string(uri.strip_prefix("file://").unwrap_or(uri)) {
+                // Serve from the in-memory document cache populated on didOpen/didChange.
+                // Keeps unsaved-buffer navigation correct.
+                if let Some(content) = self.documents.get(uri).cloned() {
                     if let Some(symbol) = self.find_definition(uri, &position, &content) {
                         Some(json!({
                             "jsonrpc": "2.0",
@@ -557,6 +1078,44 @@ impl HaproxyLsp {
                     }))
                 }
             }
+            "textDocument/foldingRange" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let ranges: Vec<Value> = self
+                    .folds
+                    .get(uri)
+                    .map(|v| {
+                        v.iter()
+                            .map(|r| {
+                                json!({
+                                    "startLine": r.start_line,
+                                    "endLine": r.end_line,
+                                    "kind": r.kind,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": ranges,
+                }))
+            }
+            "textDocument/documentSymbol" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let syms: Vec<Value> = self
+                    .outline
+                    .get(uri)
+                    .map(|v| v.iter().map(serialize_document_symbol).collect())
+                    .unwrap_or_default();
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": syms,
+                }))
+            }
             "textDocument/declaration" => {
                 let params = &request["params"];
                 let uri = params["textDocument"]["uri"].as_str()?;
@@ -565,8 +1124,8 @@ impl HaproxyLsp {
                     character: params["position"]["character"].as_u64()? as u32,
                 };
 
-                // For this basic implementation, we'll need to re-read the file content
-                if let Ok(content) = std::fs::read_to_string(uri.strip_prefix("file://").unwrap_or(uri)) {
+                // Serve from the in-memory document cache populated on didOpen/didChange.
+                if let Some(content) = self.documents.get(uri).cloned() {
                     if let Some(references) = self.find_declaration(uri, &position, &content) {
                         // Return array of locations for multiple references
                         let locations: Vec<Value> = references.into_iter().map(|reference| {
@@ -611,49 +1170,71 @@ impl HaproxyLsp {
 }
 
 
+// Cap per-message size to avoid unbounded allocation on malicious/malformed
+// Content-Length. 64 MiB is far larger than any reasonable HAProxy config.
+const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lsp = HaproxyLsp::new()?;
-    let mut stdin = io::stdin();
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
     let mut stdout = io::stdout();
 
     loop {
-        // Read LSP message with Content-Length header
-        let mut header_line = String::new();
-        let bytes_read = stdin.read_line(&mut header_line)?;
-        
-        if bytes_read == 0 {
-            break; // EOF
+        // Read LSP message headers until blank line. Per LSP spec, multiple
+        // headers (e.g. Content-Type in addition to Content-Length) may
+        // precede the body; header names are case-insensitive.
+        let mut content_length: Option<usize> = None;
+        let mut eof = false;
+        loop {
+            let mut header_line = String::new();
+            let bytes_read = stdin.read_line(&mut header_line)?;
+            if bytes_read == 0 {
+                eof = true;
+                break;
+            }
+            let trimmed = header_line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break; // end of headers
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().ok();
+                }
+            }
         }
-        
-        // Parse Content-Length header
-        let content_length = if header_line.starts_with("Content-Length: ") {
-            header_line
-                .strip_prefix("Content-Length: ")
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .unwrap_or(0)
-        } else {
-            continue;
+        if eof {
+            break;
+        }
+
+        let content_length = match content_length {
+            Some(n) if n > 0 && n <= MAX_CONTENT_LENGTH => n,
+            Some(n) if n > MAX_CONTENT_LENGTH => {
+                eprintln!("Content-Length {} exceeds cap {}; dropping frame", n, MAX_CONTENT_LENGTH);
+                continue;
+            }
+            _ => continue, // missing/zero/invalid length: resync on next header block
         };
-        
-        if content_length == 0 {
-            continue;
-        }
-        
-        // Read empty line separator
-        let mut empty_line = String::new();
-        stdin.read_line(&mut empty_line)?;
-        
+
         // Read the JSON content
         let mut buffer = vec![0; content_length];
         stdin.read_exact(&mut buffer)?;
-        let content = String::from_utf8(buffer)?;
-        
+        let content = match String::from_utf8(buffer) {
+            Ok(s) => s,
+            Err(err) => {
+                // Malformed UTF-8: log and continue. Don't kill the server on
+                // one bad message — subsequent frames may be fine.
+                eprintln!("Skipping frame with invalid UTF-8: {}", err);
+                continue;
+            }
+        };
+
         // Parse JSON-RPC request
         if let Ok(request) = serde_json::from_str::<Value>(&content) {
             if let Some(response) = lsp.handle_request(request) {
                 let response_str = serde_json::to_string(&response)?;
                 let response_len = response_str.len();
-                
+
                 // Write LSP response with headers
                 write!(stdout, "Content-Length: {}\r\n\r\n{}", response_len, response_str)?;
                 stdout.flush()?;

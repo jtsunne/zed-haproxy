@@ -13,11 +13,10 @@ required-features = ["lsp-server"]
 
 [features]
 default = []
-lsp-server = ["dep:serde_json", "dep:serde", "dep:tree-sitter"]
+lsp-server = ["dep:serde_json", "dep:serde"]
 
 [dependencies]
 zed_extension_api = "0.1.0"
 
 serde_json = { version = "1.0", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
-tree-sitter = { version = "0.20", optional = true }

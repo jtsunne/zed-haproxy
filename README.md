@@ -4,14 +4,16 @@ A Zed editor extension that provides syntax highlighting and **"Go to Definition
 
 ## Features
 
-- **Syntax Highlighting**: Rich syntax highlighting for HAProxy config files
-- **Go to Definition**: Jump to backend/ACL definitions from references
-- **Language Server Protocol**: Full LSP integration for navigation features
+- **Semantic Syntax Highlighting**: Directives are colored by category — section headers (`frontend`, `backend`, `listen`, `resolvers`, etc.) vs. identifier names, declaration directives (`bind`, `server`, `acl`, `peer`, `stick-table`) vs. action directives (`use_backend`, `default_backend`, `http-request`, `http-response`, `tcp-request`, `redirect`), settings directives (`timeout`, `maxconn`, `balance`, `stats`, `log`, etc.), option properties (`option httplog` → `httplog` as a property), enumerated types (`mode http`, `balance roundrobin`, `log-level info`), control keywords (`if`, `unless`, `!`, `||`, `&&`, and the TCP phase selectors `connection`/`content`/`session`), and value kinds (addresses, strings, numbers, time values). The coarse `@keyword`/`@function` coloring from older versions is gone.
+- **Code Folding**: Top-level sections collapse to one line (`global`, `defaults`, `frontend X`, `backend X`, `listen X`, `resolvers X`, `userlist`, `peers`, `mailers`, `cache`, `program`, `ring`). Multi-line comment banners (2+ consecutive `#`-prefixed lines) fold as comment regions. Paired `# BEGIN <name>` / `# END <name>` markers fold as explicit regions — a useful convention for grouping related directives inside a long section. Use `editor: fold all` / `Cmd+K Cmd+0` to collapse, `editor: unfold all` / `Cmd+K Cmd+J` to expand.
+- **Document Outline & Breadcrumbs**: The outline panel and breadcrumbs show a two-level tree — each section with its key children (ACLs under frontends/listens, servers under backends/listens, nameservers under resolvers). Section detail strings summarize relevant settings (e.g. a backend shows `<balance> · <mode> · N servers`, a resolvers block shows `N nameservers`, a frontend shows its `bind` addresses). `Cmd+Shift+O` jumps to any symbol by name; the selection range covers the identifier only, not the whole line.
+- **Go to Definition**: Cursor-aware — F12 on an ACL name inside `use_backend X if Y` jumps to the ACL, not to backend X. Works for backend, frontend, listen, ACL, and server references within the current file.
+- **Language Server Protocol**: `foldingRangeProvider`, `documentSymbolProvider`, `definitionProvider`, `declarationProvider`. Single-file scope.
 
 ### Supported Navigation
 
 - **Backend References**: `use_backend web_servers` → jumps to `backend web_servers`
-- **Default Backend**: `default_backend api` → jumps to `backend api` 
+- **Default Backend**: `default_backend api` → jumps to `backend api`
 - **ACL References**: `if is_mobile` → jumps to `acl is_mobile`
 
 ## Installation
@@ -93,6 +95,10 @@ resulting plain wasm module won't load (Zed needs a wasm component).
 ```bash
 # Test LSP server directly
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}' | ./bin/haproxy-lsp
+
+# Regression check — drives the LSP over stdio and asserts
+# definition/folding/documentSymbol responses against fixtures.
+python3 test/lsp_probes.py
 ```
 
 ### Project Structure
@@ -110,17 +116,17 @@ haproxy-zed/
 
 ## Known Limitations
 
-- **Single-file only**: References work within the same file
-- **Simple parsing**: Uses regex-based parsing instead of full tree-sitter
-- **Limited patterns**: Supports basic `use_backend` and ACL patterns
+- **Single-file scope for navigation**: Go to Definition / references resolve within the currently open document. Folding and outline are single-file by design.
+- **Regex-based LSP parsing**: The LSP analyzes configs line-by-line with regex rather than a full tree-sitter AST. Works well for the directive set it supports, but complex quoted-string edge cases may be missed. Tree-sitter migration is planned.
 
 ## Future Enhancements
 
-- Cross-file reference resolution
+- Cross-file reference resolution (`-f path.cfg`, `include`)
 - Hover information and documentation
-- Auto-completion for backend/ACL names
-- Full tree-sitter integration
-- Support for more HAProxy directives
+- Auto-completion for backend/ACL/server names
+- Diagnostics for undefined references, unused sections, duplicate names
+- `haproxy -c` integration for real syntax errors
+- Full tree-sitter integration in the LSP
 
 ## Troubleshooting
 

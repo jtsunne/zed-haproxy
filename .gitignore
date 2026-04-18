@@ -6,3 +6,5 @@ CLAUDE*
 *test*.*
 .DS_Store
 bin/**
+test/haproxy.cfg
+test/haproxy.*.cfg
