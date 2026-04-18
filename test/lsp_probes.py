@@ -48,6 +48,23 @@ class LspClient:
         self._lock = threading.Lock()
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
+        # Drain stderr continuously: the server uses `eprintln!` on framing
+        # errors, and an undrained PIPE buffer (~64 KiB) would block the
+        # server once full, causing spurious test timeouts.
+        self._stderr_thread = threading.Thread(target=self._stderr_drain, daemon=True)
+        self._stderr_thread.start()
+
+    def _stderr_drain(self):
+        stderr = self.proc.stderr
+        if stderr is None:
+            return
+        try:
+            while True:
+                chunk = stderr.read(4096)
+                if not chunk:
+                    return
+        except Exception:
+            return
 
     def _reader_loop(self):
         stdout = self.proc.stdout

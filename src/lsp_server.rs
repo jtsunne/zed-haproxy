@@ -242,7 +242,14 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
             String::new()
         };
         let name_start_col = if !name.is_empty() {
-            line.find(&name).map(|n| n as u32).unwrap_or(keyword.len() as u32)
+            // Search for the name starting *past* the keyword so that
+            // pathological headers like `backend backend` or `frontend end`
+            // (where the name is a substring of the keyword or appears inside
+            // it) still point at the identifier token, not the keyword.
+            let search_from = keyword.len();
+            line.get(search_from..)
+                .and_then(|tail| tail.find(&name).map(|n| (n + search_from) as u32))
+                .unwrap_or(search_from as u32)
         } else {
             0
         };
@@ -286,13 +293,20 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
                     continue;
                 }
                 match tokens[0] {
-                    "acl" if (h.keyword == "frontend" || h.keyword == "listen")
+                    "acl" if (h.keyword == "frontend" || h.keyword == "listen" || h.keyword == "backend")
                         && tokens.len() >= 3 =>
                     {
                         let acl_name = tokens[1];
                         let criterion: String = tokens[2..].join(" ");
                         let detail = truncate_detail(&criterion, 40);
-                        let name_start = ln.find(acl_name).map(|n| n as u32).unwrap_or(0);
+                        // Search past the `acl` keyword to avoid matching an
+                        // earlier occurrence of the name (e.g. in indentation
+                        // alignment or an `acl acl ...` edge case).
+                        let search_from = ln.find("acl").map(|p| p + 3).unwrap_or(0);
+                        let name_start = ln
+                            .get(search_from..)
+                            .and_then(|tail| tail.find(acl_name).map(|n| (n + search_from) as u32))
+                            .unwrap_or(search_from as u32);
                         let name_end = name_start + acl_name.len() as u32;
                         children.push(DocumentSymbol {
                             name: acl_name.to_string(),
@@ -315,7 +329,11 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
                         server_count += 1;
                         let srv_name = tokens[1];
                         let addr = tokens[2].to_string();
-                        let name_start = ln.find(srv_name).map(|n| n as u32).unwrap_or(0);
+                        let search_from = ln.find("server").map(|p| p + 6).unwrap_or(0);
+                        let name_start = ln
+                            .get(search_from..)
+                            .and_then(|tail| tail.find(srv_name).map(|n| (n + search_from) as u32))
+                            .unwrap_or(search_from as u32);
                         let name_end = name_start + srv_name.len() as u32;
                         children.push(DocumentSymbol {
                             name: srv_name.to_string(),
@@ -336,7 +354,11 @@ fn compute_outline(content: &str) -> Vec<DocumentSymbol> {
                         nameserver_count += 1;
                         let ns_name = tokens[1];
                         let addr = tokens[2].to_string();
-                        let name_start = ln.find(ns_name).map(|n| n as u32).unwrap_or(0);
+                        let search_from = ln.find("nameserver").map(|p| p + 10).unwrap_or(0);
+                        let name_start = ln
+                            .get(search_from..)
+                            .and_then(|tail| tail.find(ns_name).map(|n| (n + search_from) as u32))
+                            .unwrap_or(search_from as u32);
                         let name_end = name_start + ns_name.len() as u32;
                         children.push(DocumentSymbol {
                             name: ns_name.to_string(),
@@ -649,7 +671,7 @@ impl HaproxyLsp {
         Ok(())
     }
 
-    fn find_definition(&self, _uri: &str, position: &Position, content: &str) -> Option<Symbol> {
+    fn find_definition(&self, uri: &str, position: &Position, content: &str) -> Option<Symbol> {
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
         if line_idx >= lines.len() {
@@ -680,7 +702,7 @@ impl HaproxyLsp {
         };
 
         if let Some(kind) = hint {
-            if let Some(sym) = self.find_symbol_by_name(&word, kind) {
+            if let Some(sym) = self.find_symbol_by_name(uri, &word, kind) {
                 return Some(sym);
             }
         }
@@ -695,7 +717,7 @@ impl HaproxyLsp {
             SymbolKind::Listen,
             SymbolKind::Server,
         ] {
-            if let Some(sym) = self.find_symbol_by_name(&word, kind) {
+            if let Some(sym) = self.find_symbol_by_name(uri, &word, kind) {
                 return Some(sym);
             }
         }
@@ -804,8 +826,11 @@ impl HaproxyLsp {
         Some((word, byte_start))
     }
 
-    fn find_symbol_by_name(&self, name: &str, kind: SymbolKind) -> Option<Symbol> {
-        for symbols in self.symbols.values() {
+    fn find_symbol_by_name(&self, uri: &str, name: &str, kind: SymbolKind) -> Option<Symbol> {
+        // Single-file scope: only resolve against the requesting document so
+        // that two open files with the same backend/acl name don't silently
+        // cross-navigate.
+        if let Some(symbols) = self.symbols.get(uri) {
             for symbol in symbols {
                 if symbol.name == name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&kind) {
                     return Some(symbol.clone());
@@ -821,66 +846,66 @@ impl HaproxyLsp {
         if position.line as usize >= lines.len() {
             return None;
         }
-        
+
         let line = lines[position.line as usize];
-        
+
         // Check if we're on a symbol definition (backend, acl, etc.)
         // If so, return all references to that symbol
-        
+
         // Check if this line defines a backend
         if line.trim().starts_with("backend ") {
             let name = line.trim().strip_prefix("backend ").unwrap_or("").trim();
             if !name.is_empty() {
-                return self.find_references_to_symbol(name, SymbolKind::Backend);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Backend);
             }
         }
-        
+
         // Check if this line defines an ACL
         if line.trim().starts_with("acl ") {
             let parts: Vec<&str> = line.trim().split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[1];
-                return self.find_references_to_symbol(name, SymbolKind::Acl);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Acl);
             }
         }
-        
+
         // Check if this line defines a frontend
         if line.trim().starts_with("frontend ") {
             let name = line.trim().strip_prefix("frontend ").unwrap_or("").trim();
             if !name.is_empty() {
-                return self.find_references_to_symbol(name, SymbolKind::Frontend);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Frontend);
             }
         }
-        
+
         // Check if this line defines a listen section
         if line.trim().starts_with("listen ") {
             let name = line.trim().strip_prefix("listen ").unwrap_or("").trim();
             if !name.is_empty() {
-                return self.find_references_to_symbol(name, SymbolKind::Listen);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Listen);
             }
         }
-        
+
         // Check if this line defines a server
         if line.trim().trim_start().starts_with("server ") {
             let parts: Vec<&str> = line.trim().trim_start().split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[1];
-                return self.find_references_to_symbol(name, SymbolKind::Server);
+                return self.find_references_to_symbol(uri, name, SymbolKind::Server);
             }
         }
-        
+
         None
     }
-    
-    fn find_references_to_symbol(&self, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
-        for symbols in self.symbols.values() {
-            for symbol in symbols {
-                if symbol.name == symbol_name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&symbol_kind) {
-                    if symbol.references.is_empty() {
-                        return None;
-                    } else {
-                        return Some(symbol.references.clone());
-                    }
+
+    fn find_references_to_symbol(&self, uri: &str, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
+        // Single-file scope: look only in the requesting document.
+        let symbols = self.symbols.get(uri)?;
+        for symbol in symbols {
+            if symbol.name == symbol_name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&symbol_kind) {
+                if symbol.references.is_empty() {
+                    return None;
+                } else {
+                    return Some(symbol.references.clone());
                 }
             }
         }
@@ -920,6 +945,18 @@ impl HaproxyLsp {
                 }
                 
                 None // No response needed for notifications
+            }
+            "textDocument/didClose" => {
+                // Evict all per-URI caches so long-lived sessions don't grow
+                // unbounded as files are opened and closed.
+                let params = &request["params"];
+                if let Some(uri) = params["textDocument"]["uri"].as_str() {
+                    self.symbols.remove(uri);
+                    self.folds.remove(uri);
+                    self.outline.remove(uri);
+                    self.documents.remove(uri);
+                }
+                None
             }
             "textDocument/didChange" => {
                 let params = &request["params"];
