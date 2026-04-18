@@ -33,9 +33,6 @@
 ; ---------------------------------------------------------------------------
 "if"     @keyword.control
 "unless" @keyword.control
-"!"      @keyword.control
-"||"     @keyword.control
-"&&"     @keyword.control
 (tcp_type) @keyword.control
 
 ; ---------------------------------------------------------------------------
