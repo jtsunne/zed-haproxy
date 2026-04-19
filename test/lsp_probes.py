@@ -623,6 +623,100 @@ REFERENCES_PROBES: list[dict] = [
 ]
 
 
+# Rename probes exercise `textDocument/prepareRename` and `textDocument/rename`
+# against test/haproxy.conf. `type` selects the handler; identifier ranges are
+# computed from the on-disk fixture (identifiers are ASCII so char == byte).
+#   - prepare: asserts `result.range` and `result.placeholder`, or that
+#     the server returns `null` for non-renameable cursors.
+#   - rename: asserts the set of edits under `changes[uri]` as
+#     (line, start_char, end_char) tuples. A `new_name` field is required.
+#   - rename with `expect_error`: asserts a JSON-RPC error with the given
+#     `expected_error_code`.
+RENAME_PROBES: list[dict] = [
+    {
+        "desc": "prepareRename on backend reference returns identifier range",
+        "type": "prepare",
+        "line": 33,
+        "character": 20,
+        "expected_range": (33, 14, 42),
+        "expected_placeholder": "accountCreationService_10000",
+    },
+    {
+        "desc": "prepareRename on backend definition returns identifier range",
+        "type": "prepare",
+        "line": 50,
+        "character": 15,
+        "expected_range": (50, 8, 36),
+        "expected_placeholder": "accountCreationService_10000",
+    },
+    {
+        "desc": "prepareRename on ACL reference returns identifier range",
+        "type": "prepare",
+        "line": 33,
+        "character": 55,
+        "expected_range": (33, 46, 73),
+        "expected_placeholder": "app__accountCreationService",
+    },
+    {
+        "desc": "prepareRename on `use_backend` keyword returns null",
+        "type": "prepare",
+        "line": 33,
+        "character": 5,
+        "expected_null": True,
+    },
+    {
+        "desc": "prepareRename on `backend` keyword of definition line returns null",
+        "type": "prepare",
+        "line": 50,
+        "character": 3,
+        "expected_null": True,
+    },
+    {
+        "desc": "rename backend updates definition + every reference",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "newBackend",
+        "expected_edits": {(50, 8, 36), (33, 14, 42), (43, 14, 42)},
+    },
+    {
+        "desc": "rename ACL updates definition + every if-condition reference",
+        "type": "rename",
+        "line": 33,
+        "character": 55,
+        "new_name": "newAcl",
+        "expected_edits": {(31, 6, 33), (33, 46, 73)},
+    },
+    {
+        "desc": "rename with empty name returns -32602",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "",
+        "expect_error": True,
+        "expected_error_code": -32602,
+    },
+    {
+        "desc": "rename with whitespace in name returns -32602",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "bad name",
+        "expect_error": True,
+        "expected_error_code": -32602,
+    },
+    {
+        "desc": "rename with disallowed character returns -32602",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "bad@name",
+        "expect_error": True,
+        "expected_error_code": -32602,
+    },
+]
+
+
 DECLARATION_PROBES: list[dict] = [
     {
         "desc": "`!plain` in `if` condition yields declaration reference",
@@ -1068,6 +1162,185 @@ def run_references_probes(client: LspClient, results: Results):
         results.record("references", probe["desc"], ok, detail)
 
 
+def run_rename_probes(client: LspClient, results: Results):
+    if not RENAME_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record("rename", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    client.did_open(uri, HAPROXY_CONF.read_text())
+
+    for probe in RENAME_PROBES:
+        probe_type = probe["type"]
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {
+                "line": probe["line"],
+                "character": probe["character"],
+            },
+        }
+
+        if probe_type == "prepare":
+            try:
+                resp = client.request("textDocument/prepareRename", params)
+            except TimeoutError as exc:
+                results.record("rename", probe["desc"], False, str(exc))
+                continue
+
+            result = resp.get("result")
+            if probe.get("expected_null"):
+                ok = result is None
+                detail = "null as expected" if ok else f"expected null, got {result!r}"
+                results.record("rename", probe["desc"], ok, detail)
+                continue
+
+            if not isinstance(result, dict):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected object, got {type(result).__name__}: {result!r}",
+                )
+                continue
+
+            rng = result.get("range") or {}
+            start = rng.get("start") or {}
+            end = rng.get("end") or {}
+            actual = (
+                start.get("line"),
+                start.get("character"),
+                end.get("character"),
+            )
+            if end.get("line") != start.get("line"):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"range spans multiple lines: {rng!r}",
+                )
+                continue
+            expected = probe["expected_range"]
+            if actual != expected:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected range {expected}, got {actual}",
+                )
+                continue
+            placeholder = result.get("placeholder")
+            if placeholder != probe["expected_placeholder"]:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"placeholder {placeholder!r} != {probe['expected_placeholder']!r}",
+                )
+                continue
+            results.record(
+                "rename",
+                probe["desc"],
+                True,
+                f"range={actual} placeholder={placeholder!r}",
+            )
+            continue
+
+        if probe_type == "rename":
+            params["newName"] = probe["new_name"]
+            try:
+                resp = client.request("textDocument/rename", params)
+            except TimeoutError as exc:
+                results.record("rename", probe["desc"], False, str(exc))
+                continue
+
+            if probe.get("expect_error"):
+                err = resp.get("error")
+                if not isinstance(err, dict):
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        False,
+                        f"expected error, got result={resp.get('result')!r}",
+                    )
+                    continue
+                code = err.get("code")
+                if code != probe["expected_error_code"]:
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        False,
+                        f"error code {code} != {probe['expected_error_code']}",
+                    )
+                    continue
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    True,
+                    f"error code {code}: {err.get('message')!r}",
+                )
+                continue
+
+            result = resp.get("result")
+            if not isinstance(result, dict):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected object, got {type(result).__name__}: {result!r}",
+                )
+                continue
+            changes = result.get("changes") or {}
+            edits = changes.get(uri)
+            if not isinstance(edits, list):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"no edits for uri: changes={changes!r}",
+                )
+                continue
+            actual = set()
+            all_newtext_ok = True
+            for e in edits:
+                rng = e.get("range") or {}
+                s = rng.get("start") or {}
+                en = rng.get("end") or {}
+                if s.get("line") != en.get("line"):
+                    all_newtext_ok = False
+                    break
+                actual.add((s.get("line"), s.get("character"), en.get("character")))
+                if e.get("newText") != probe["new_name"]:
+                    all_newtext_ok = False
+                    break
+            if not all_newtext_ok:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"malformed edit in {edits!r}",
+                )
+                continue
+            expected = probe["expected_edits"]
+            if actual != expected:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected edits {sorted(expected)}, got {sorted(actual)}",
+                )
+                continue
+            results.record(
+                "rename",
+                probe["desc"],
+                True,
+                f"{len(actual)} edits at {sorted(actual)}",
+            )
+            continue
+
+        results.record("rename", probe["desc"], False, f"unknown probe type: {probe_type}")
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -1136,6 +1409,7 @@ def main() -> int:
         run_document_symbol_probes(client, results)
         run_declaration_probes(client, results)
         run_references_probes(client, results)
+        run_rename_probes(client, results)
     finally:
         client.shutdown()
 

@@ -72,13 +72,13 @@ Single-file scope retained from Tier 1. Cross-file resolution is explicitly defe
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] advertise `renameProvider: { prepareProvider: true }` in `initialize`
-- [ ] implement `textDocument/prepareRename`: resolve the symbol at cursor (backend, ACL, server, frontend, listen); return the exact identifier range so Zed pre-fills the rename box, or `null` when the cursor is not on a renameable token
-- [ ] implement `textDocument/rename`: build a `WorkspaceEdit` with `changes: { uri: TextEdit[] }` containing one edit for the definition identifier range and one per reference; compute identifier ranges by locating the symbol token inside the cached line text (use the existing `search_from` pattern to avoid matching keywords like `backend` substring)
-- [ ] reject invalid new names (empty, whitespace, containing characters outside `[a-zA-Z0-9_.-]`) by returning a JSON-RPC error with code `-32602` and a message Zed will surface
-- [ ] stick-tables are intentionally NOT renameable this tier (they are bound to the enclosing section name — renaming the section handles it)
-- [ ] add `RENAME_PROBES` covering: prepareRename returns correct range on a backend name, prepareRename returns null on a keyword, rename of a backend updates definition + every `use_backend`/`default_backend` reference, rename of an ACL updates definition + every `if`/`unless` reference, rename with invalid name returns an error
-- [ ] run `python3 test/lsp_probes.py` — full suite must PASS before Task 4
+- [x] advertise `renameProvider: { prepareProvider: true }` in `initialize`
+- [x] implement `textDocument/prepareRename`: resolve the symbol at cursor (backend, ACL, server, frontend, listen); return the exact identifier range so Zed pre-fills the rename box, or `null` when the cursor is not on a renameable token
+- [x] implement `textDocument/rename`: build a `WorkspaceEdit` with `changes: { uri: TextEdit[] }` containing one edit for the definition identifier range and one per reference; compute identifier ranges by locating the symbol token inside the cached line text (use the existing `search_from` pattern to avoid matching keywords like `backend` substring)
+- [x] reject invalid new names (empty, whitespace, containing characters outside `[a-zA-Z0-9_.-]`) by returning a JSON-RPC error with code `-32602` and a message Zed will surface
+- [x] stick-tables are intentionally NOT renameable this tier (they are bound to the enclosing section name — renaming the section handles it)
+- [x] add `RENAME_PROBES` covering: prepareRename returns correct range on a backend name, prepareRename returns null on a keyword, rename of a backend updates definition + every `use_backend`/`default_backend` reference, rename of an ACL updates definition + every `if`/`unless` reference, rename with invalid name returns an error
+- [x] run `python3 test/lsp_probes.py` — full suite must PASS before Task 4 (pre-existing 3 prod.cfg fold failures unchanged; all 10 new rename probes plus all prior passing probes PASS)
 
 ### Task 4: Implement hover provider with directive docs
 

@@ -287,6 +287,83 @@ fn is_valid_identifier(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+/// Locate a word-bounded occurrence of `name` in `line` starting at byte
+/// offset `search_from`. Returns (start, end) byte offsets. Because HAProxy
+/// identifiers are ASCII per the grammar regex, byte offsets equal char
+/// offsets equal UTF-16 code-unit offsets — the returned values can be used
+/// directly as LSP `character` positions.
+///
+/// Word boundaries use the grammar's identifier charset (alphanumeric, `_`,
+/// `-`, `.`), so `accountCreationService_10000` does not match inside
+/// `app__accountCreationService`, and `backend` does not match inside
+/// `use_backend`.
+fn find_identifier_range(line: &str, name: &str, search_from: usize) -> Option<(u32, u32)> {
+    let bytes = line.as_bytes();
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() || name_bytes.len() > bytes.len() {
+        return None;
+    }
+    let is_id_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-';
+    let mut i = search_from.min(bytes.len());
+    while i + name_bytes.len() <= bytes.len() {
+        if &bytes[i..i + name_bytes.len()] == name_bytes {
+            let left_ok = i == 0 || !is_id_byte(bytes[i - 1]);
+            let right_i = i + name_bytes.len();
+            let right_ok = right_i == bytes.len() || !is_id_byte(bytes[right_i]);
+            if left_ok && right_ok {
+                return Some((i as u32, right_i as u32));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte offset just past the keyword on a symbol's definition line, used as
+/// the starting point for `find_identifier_range`. This avoids matching the
+/// keyword itself when a user's symbol name happens to collide textually
+/// with the keyword (e.g. a backend literally named `backend`).
+fn def_line_search_from(line: &str, kind: &SymbolKind) -> Option<usize> {
+    let skip = match kind {
+        SymbolKind::Backend => "backend",
+        SymbolKind::Frontend => "frontend",
+        SymbolKind::Listen => "listen",
+        SymbolKind::Acl => "acl",
+        SymbolKind::Server => "server",
+        SymbolKind::StickTable => return None,
+    };
+    let trimmed_start = line.len() - line.trim_start().len();
+    Some(trimmed_start + skip.len())
+}
+
+/// Byte offset just past the reference-context keyword on a reference line.
+/// For contexts without a fixed leading keyword (server references,
+/// stick-table references) the search starts at the first non-whitespace
+/// column, relying on the word-bounded match in `find_identifier_range` to
+/// skip stray substring hits.
+fn ref_line_search_from(line: &str, ctx: &ReferenceContext) -> usize {
+    let trimmed_start = line.len() - line.trim_start().len();
+    match ctx {
+        ReferenceContext::UseBackend => line
+            .find("use_backend")
+            .map(|p| p + "use_backend".len())
+            .unwrap_or(trimmed_start),
+        ReferenceContext::DefaultBackend => line
+            .find("default_backend")
+            .map(|p| p + "default_backend".len())
+            .unwrap_or(trimmed_start),
+        ReferenceContext::AclCondition => line
+            .find(" if ")
+            .map(|p| p + " if ".len())
+            .unwrap_or(trimmed_start),
+        ReferenceContext::AclUnlessCondition => line
+            .find(" unless ")
+            .map(|p| p + " unless ".len())
+            .unwrap_or(trimmed_start),
+        ReferenceContext::ServerReference | ReferenceContext::StickTable => trimmed_start,
+    }
+}
+
 fn section_kind_for(keyword: &str) -> u8 {
     match keyword {
         "global" | "defaults" => 3,           // Namespace
@@ -1250,6 +1327,7 @@ impl HaproxyLsp {
                             "definitionProvider": true,
                             "declarationProvider": true,
                             "referencesProvider": true,
+                            "renameProvider": { "prepareProvider": true },
                             "foldingRangeProvider": true,
                             "documentSymbolProvider": true,
                             "textDocumentSync": {
@@ -1441,6 +1519,189 @@ impl HaproxyLsp {
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": locations,
+                }))
+            }
+            "textDocument/prepareRename" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let position = Position {
+                    line: params["position"]["line"].as_u64()? as u32,
+                    character: params["position"]["character"].as_u64()? as u32,
+                };
+
+                // prepareRename returns the exact identifier range so Zed
+                // pre-fills the rename box. Resolution:
+                //   1. Cursor must sit on a word.
+                //   2. find_symbol_at_cursor must resolve to a renameable
+                //      symbol (StickTable intentionally excluded — it is
+                //      bound to the enclosing section name).
+                //   3. The cursor word must equal the symbol's name. This
+                //      guards the cursor-on-definition-line fallback in
+                //      find_symbol_at_cursor, which would otherwise claim
+                //      the `backend` keyword itself is a renameable token.
+                let result: Value = (|| -> Option<Value> {
+                    let content = self.documents.get(uri)?.clone();
+                    let lines: Vec<&str> = content.lines().collect();
+                    let line_idx = position.line as usize;
+                    if line_idx >= lines.len() {
+                        return None;
+                    }
+                    let line = lines[line_idx];
+                    let (word, word_start) =
+                        self.word_at_position(line, position.character as usize)?;
+                    let symbol = self.find_symbol_at_cursor(uri, &position, &content)?;
+                    let renameable = matches!(
+                        symbol.kind,
+                        SymbolKind::Backend
+                            | SymbolKind::Frontend
+                            | SymbolKind::Listen
+                            | SymbolKind::Acl
+                            | SymbolKind::Server
+                    );
+                    if !renameable {
+                        return None;
+                    }
+                    if word != symbol.name {
+                        return None;
+                    }
+                    let start_col = word_start as u32;
+                    let end_col = start_col + word.len() as u32;
+                    Some(json!({
+                        "range": {
+                            "start": { "line": position.line, "character": start_col },
+                            "end": { "line": position.line, "character": end_col },
+                        },
+                        "placeholder": word,
+                    }))
+                })()
+                .unwrap_or(Value::Null);
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+            }
+            "textDocument/rename" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let position = Position {
+                    line: params["position"]["line"].as_u64()? as u32,
+                    character: params["position"]["character"].as_u64()? as u32,
+                };
+                let new_name = params["newName"].as_str()?;
+
+                // Validate new name against the grammar's identifier charset.
+                // Rejecting invalid names with a structured JSON-RPC error
+                // lets Zed surface a clear message instead of silently
+                // applying a malformed edit.
+                if !is_valid_identifier(new_name) {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": format!(
+                                "Invalid rename: {:?} must be non-empty and contain only [a-zA-Z0-9_.-]",
+                                new_name
+                            ),
+                        }
+                    }));
+                }
+
+                let content = match self.documents.get(uri).cloned() {
+                    Some(c) => c,
+                    None => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": Value::Null,
+                        }));
+                    }
+                };
+
+                let symbol = match self.find_symbol_at_cursor(uri, &position, &content) {
+                    Some(s) => s,
+                    None => {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": Value::Null,
+                        }));
+                    }
+                };
+
+                // Stick-tables are bound to the enclosing section name in
+                // HAProxy's grammar (one table per section), so renaming a
+                // stick-table independent of its section is not meaningful
+                // — the user must rename the section instead.
+                if matches!(symbol.kind, SymbolKind::StickTable) {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "Stick-tables cannot be renamed directly; rename the enclosing section instead",
+                        }
+                    }));
+                }
+
+                let lines: Vec<&str> = content.lines().collect();
+                let mut edits: Vec<Value> = Vec::new();
+                // Dedup by (line, start) so identical edits from duplicate
+                // reference entries (e.g. the same ACL appearing twice in a
+                // condition) don't produce overlapping TextEdits, which
+                // violates the LSP WorkspaceEdit invariant.
+                let mut seen: std::collections::HashSet<(u32, u32)> =
+                    std::collections::HashSet::new();
+                let mut push_edit = |line: u32, start: u32, end: u32, edits: &mut Vec<Value>| {
+                    if seen.insert((line, start)) {
+                        edits.push(json!({
+                            "range": {
+                                "start": { "line": line, "character": start },
+                                "end": { "line": line, "character": end },
+                            },
+                            "newText": new_name,
+                        }));
+                    }
+                };
+
+                // Definition edit.
+                let def_line_idx = symbol.range.start.line as usize;
+                if def_line_idx < lines.len() {
+                    let def_line = lines[def_line_idx];
+                    if let Some(search_from) = def_line_search_from(def_line, &symbol.kind) {
+                        if let Some((s, e)) =
+                            find_identifier_range(def_line, &symbol.name, search_from)
+                        {
+                            push_edit(symbol.range.start.line, s, e, &mut edits);
+                        }
+                    }
+                }
+
+                // Reference edits.
+                for r in &symbol.references {
+                    let ref_line_idx = r.range.start.line as usize;
+                    if ref_line_idx >= lines.len() {
+                        continue;
+                    }
+                    let ref_line = lines[ref_line_idx];
+                    let search_from = ref_line_search_from(ref_line, &r.context);
+                    if let Some((s, e)) =
+                        find_identifier_range(ref_line, &symbol.name, search_from)
+                    {
+                        push_edit(r.range.start.line, s, e, &mut edits);
+                    }
+                }
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "changes": {
+                            uri: edits,
+                        }
+                    }
                 }))
             }
             "textDocument/declaration" => {
