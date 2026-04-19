@@ -24,6 +24,7 @@ struct Reference {
 enum ReferenceContext {
     UseBackend,
     DefaultBackend,
+    UseServer,
     AclCondition,
     AclUnlessCondition,
     StickTable,
@@ -282,6 +283,19 @@ fn collect_stick_table_references(line: &str) -> Vec<String> {
     out
 }
 
+/// Strip a trailing `#...` comment from a line. Returns the slice up to the
+/// first `#` preceded by whitespace (or at column 0), mirroring HAProxy's
+/// comment rule while leaving `#` embedded inside tokens alone.
+fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return &line[..i];
+        }
+    }
+    line
+}
+
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -352,6 +366,10 @@ fn ref_line_search_from(line: &str, ctx: &ReferenceContext) -> usize {
         ReferenceContext::DefaultBackend => line
             .find("default_backend")
             .map(|p| p + "default_backend".len())
+            .unwrap_or(trimmed_start),
+        ReferenceContext::UseServer => line
+            .find("use_server")
+            .map(|p| p + "use_server".len())
             .unwrap_or(trimmed_start),
         ReferenceContext::AclCondition => line
             .find(" if ")
@@ -948,6 +966,24 @@ impl HaproxyLsp {
                                               });
                 }
             }
+
+            // Collect server references from `use_server NAME [if ACL]`.
+            // Required for rename: Tier 2 lists servers as renameable, and
+            // without this the definition line is rewritten but every call
+            // site is left stale, silently breaking the config.
+            if line.starts_with("use_server ") {
+                if let Some(server_name) = self.extract_server_from_use_server(line) {
+                    self.add_reference_to_symbol(&mut updated_symbols, &server_name, SymbolKind::Server,
+                                              Reference {
+                                                  range: Range {
+                                                      start: Position { line: line_num as u32, character: 0 },
+                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
+                                                  },
+                                                  uri: uri.to_string(),
+                                                  context: ReferenceContext::UseServer,
+                                              });
+                }
+            }
             
             // Collect ACL references
             if line.contains(" if ") {
@@ -982,8 +1018,12 @@ impl HaproxyLsp {
                 }
             }
 
-            // Collect stick-table references.
-            let stick_refs = collect_stick_table_references(line);
+            // Collect stick-table references. Strip any trailing `# comment`
+            // so a commented-out ` table foo` suffix doesn't register a
+            // phantom reference (which would also corrupt the comment text
+            // on rename).
+            let line_no_comment = strip_inline_comment(line);
+            let stick_refs = collect_stick_table_references(line_no_comment);
             for table_name in stick_refs {
                 self.add_reference_to_symbol(
                     &mut updated_symbols,
@@ -1094,7 +1134,7 @@ impl HaproxyLsp {
                 "frontend" => Some((idx, SymbolKind::Frontend)),
                 "listen" => Some((idx, SymbolKind::Listen)),
                 "acl" => Some((idx, SymbolKind::Acl)),
-                "server" => Some((idx, SymbolKind::Server)),
+                "server" | "use_server" => Some((idx, SymbolKind::Server)),
                 _ => None,
             }
         });
@@ -1133,6 +1173,16 @@ impl HaproxyLsp {
         // Parse "default_backend BACKEND_NAME"
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
         if parts.len() >= 2 && parts[0] == "default_backend" {
+            Some(parts[1].to_string())
+        } else {
+            None
+        }
+    }
+
+    fn extract_server_from_use_server(&self, line: &str) -> Option<String> {
+        // Parse "use_server SERVER_NAME [if condition]"
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() >= 2 && parts[0] == "use_server" && is_valid_identifier(parts[1]) {
             Some(parts[1].to_string())
         } else {
             None
@@ -1782,7 +1832,11 @@ impl HaproxyLsp {
             let entry = seen
                 .entry(s.name.clone())
                 .or_insert_with(|| (0, def_line.clone()));
-            entry.0 += s.references.len();
+            // HAProxy allows multiple `acl NAME ...` lines for OR semantics,
+            // and `add_reference_to_symbol` attaches each call-site to every
+            // duplicate symbol. Take the max (all duplicates share the same
+            // reference set) rather than summing, which would produce N*M.
+            entry.0 = entry.0.max(s.references.len());
         }
         let mut items: Vec<(String, usize, String)> = seen
             .into_iter()
