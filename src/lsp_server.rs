@@ -2103,43 +2103,64 @@ impl HaproxyLsp {
                     .as_bool()
                     .unwrap_or(false);
 
-                let symbol = self
-                    .documents
-                    .get(uri)
-                    .cloned()
-                    .and_then(|content| self.find_symbol_at_cursor(uri, &position, &content));
+                let content_opt = self.documents.get(uri).cloned();
+                let symbol = content_opt
+                    .as_ref()
+                    .and_then(|content| self.find_symbol_at_cursor(uri, &position, content));
 
-                let locations: Vec<Value> = if let Some(sym) = symbol {
+                let locations: Vec<Value> = if let (Some(sym), Some(content)) =
+                    (symbol, content_opt)
+                {
+                    // Narrow reference and declaration ranges to the identifier
+                    // token so clients like Zed highlight the symbol itself
+                    // rather than the whole line. Falls back to the stored
+                    // line-span range if the raw line can't be located or the
+                    // identifier can't be found in it.
+                    let lines: Vec<&str> = content.lines().collect();
                     let mut locs: Vec<Value> = Vec::new();
-                    if include_declaration {
-                        locs.push(json!({
+                    let narrow_reference = |line_num: u32,
+                                            stored_start: &Position,
+                                            stored_end: &Position,
+                                            search_from_hint: Option<usize>|
+                     -> Value {
+                        let (start_char, end_char) = lines
+                            .get(line_num as usize)
+                            .and_then(|raw| {
+                                let start = search_from_hint.unwrap_or(0);
+                                find_identifier_range(raw, &sym.name, start)
+                            })
+                            .unwrap_or((stored_start.character, stored_end.character));
+                        json!({
                             "uri": sym.uri,
                             "range": {
-                                "start": {
-                                    "line": sym.range.start.line,
-                                    "character": sym.range.start.character,
-                                },
-                                "end": {
-                                    "line": sym.range.end.line,
-                                    "character": sym.range.end.character,
-                                },
+                                "start": { "line": line_num, "character": start_char },
+                                "end": { "line": line_num, "character": end_char },
                             }
-                        }));
+                        })
+                    };
+                    if include_declaration {
+                        let def_line_idx = sym.range.start.line as usize;
+                        let search_from = lines
+                            .get(def_line_idx)
+                            .and_then(|raw| def_line_search_from(raw, &sym.kind));
+                        locs.push(narrow_reference(
+                            sym.range.start.line,
+                            &sym.range.start,
+                            &sym.range.end,
+                            search_from,
+                        ));
                     }
                     for r in &sym.references {
-                        locs.push(json!({
-                            "uri": r.uri,
-                            "range": {
-                                "start": {
-                                    "line": r.range.start.line,
-                                    "character": r.range.start.character,
-                                },
-                                "end": {
-                                    "line": r.range.end.line,
-                                    "character": r.range.end.character,
-                                },
-                            }
-                        }));
+                        let ref_line_idx = r.range.start.line as usize;
+                        let search_from = lines
+                            .get(ref_line_idx)
+                            .map(|raw| ref_line_search_from(raw, &r.context));
+                        locs.push(narrow_reference(
+                            r.range.start.line,
+                            &r.range.start,
+                            &r.range.end,
+                            search_from,
+                        ));
                     }
                     locs
                 } else {
@@ -2453,7 +2474,23 @@ impl HaproxyLsp {
                     }))
                 }
             }
-            _ => None,
+            _ => {
+                // LSP requests (those with a non-null `id`) require a response;
+                // notifications (null id) do not. Reply with method-not-found
+                // for unknown requests so clients don't hang waiting.
+                if id.is_null() {
+                    None
+                } else {
+                    Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("Method not found: {}", method),
+                        }
+                    }))
+                }
+            }
         }
     }
 }
