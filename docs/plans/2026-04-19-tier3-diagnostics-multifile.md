@@ -103,11 +103,11 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] parse `.include <path>`, `.if`/`.elif`/`.else`/`.endif` (follow all included branches conservatively), and `-f <path>` / `crt <path>` references during document parse; emit an `IncludedFiles` set per URI
-- [ ] build `ProjectIndex { symbols_by_name: HashMap<(SymbolKind, String), Vec<(Uri, Range)>>, symbols_by_uri: HashMap<Uri, Vec<Symbol>> }`; populate lazily on first request and refresh when any member file changes
-- [ ] on `didOpen`/`didChange` of any file in the graph, eagerly `parse_document` for every file in the graph (read from disk for unopened files) so the index stays coherent
-- [ ] add probes asserting: opening `main.cfg` populates the project index with symbols from `backends.cfg`; changing `backends.cfg` on disk and sending `didChange` for `main.cfg` refreshes the index
-- [ ] run `./build.sh && python3 test/lsp_probes.py`
+- [x] parse `.include <path>`, `.if`/`.elif`/`.else`/`.endif` (follow all included branches conservatively), and `-f <path>` / `crt <path>` references during document parse; emit an `IncludedFiles` set per URI
+- [x] build `ProjectIndex { symbols_by_name: HashMap<(SymbolKind, String), Vec<(Uri, Range)>>, symbols_by_uri: HashMap<Uri, Vec<Symbol>> }`; populate lazily on first request and refresh when any member file changes
+- [x] on `didOpen`/`didChange` of any file in the graph, eagerly `parse_document` for every file in the graph (read from disk for unopened files) so the index stays coherent
+- [x] add probes asserting: opening `main.cfg` populates the project index with symbols from `backends.cfg`; changing `backends.cfg` on disk and sending `didChange` for `main.cfg` refreshes the index
+- [x] run `./build.sh && python3 test/lsp_probes.py`
 
 ### Task 6: Cross-file definition, declaration, references, rename
 

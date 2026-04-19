@@ -2267,6 +2267,133 @@ def run_project_info_probes(client: LspClient, results: Results):
         )
 
 
+def run_cross_file_probes(client: LspClient, results: Results):
+    """Exercise Task 5's include-graph + project index.
+
+    Fixture: `test/fragments/main.cfg` uses `.include backends.cfg`. Opening
+    `main.cfg` must walk the include graph, parse `backends.cfg` from disk,
+    and aggregate its symbols into the project index. A follow-up `didChange`
+    of `main.cfg` after the sibling's on-disk content changes must refresh
+    the index to reflect the new sibling symbols.
+    """
+    if not FRAGMENTS_MAIN.exists() or not FRAGMENTS_BACKENDS.exists():
+        results.record(
+            "cross-file",
+            "fragments fixture present",
+            False,
+            f"missing: {FRAGMENTS_MAIN} or {FRAGMENTS_BACKENDS}",
+        )
+        return
+
+    original_backends = FRAGMENTS_BACKENDS.read_text()
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    backends_uri = path_to_uri(FRAGMENTS_BACKENDS)
+
+    try:
+        client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": main_uri}},
+            )
+        except TimeoutError as exc:
+            results.record("cross-file", "projectIndex responds", False, str(exc))
+            return
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            results.record(
+                "cross-file",
+                "projectIndex payload is an object",
+                False,
+                f"got {type(result).__name__}: {result!r}",
+            )
+            return
+
+        uris = result.get("uris") or []
+        ok_uris = main_uri in uris and backends_uri in uris
+        results.record(
+            "cross-file",
+            "opening main.cfg includes backends.cfg in index",
+            ok_uris,
+            f"uris={uris}",
+        )
+
+        symbols = result.get("symbols") or []
+        def has_symbol(name: str, kind: str, uri: str) -> bool:
+            return any(
+                s.get("name") == name and s.get("kind") == kind and s.get("uri") == uri
+                for s in symbols
+            )
+
+        results.record(
+            "cross-file",
+            "index contains `backend be_web` from backends.cfg",
+            has_symbol("be_web", "Backend", backends_uri),
+            f"symbols for backends.cfg: {[s for s in symbols if s.get('uri') == backends_uri]}",
+        )
+        results.record(
+            "cross-file",
+            "index contains `server web1` scoped to be_web",
+            any(
+                s.get("name") == "web1"
+                and s.get("kind") == "Server"
+                and s.get("uri") == backends_uri
+                and s.get("scope") == "be_web"
+                for s in symbols
+            ),
+            "web1 present" ,
+        )
+        results.record(
+            "cross-file",
+            "index contains `frontend fe_main` from main.cfg",
+            has_symbol("fe_main", "Frontend", main_uri),
+            "fe_main present",
+        )
+
+        # Task 5 "changing backends.cfg on disk and sending didChange for
+        # main.cfg refreshes the index": write a new backend into
+        # backends.cfg on disk, then fire a didChange for main.cfg with
+        # unchanged content. The LSP must re-read the sibling from disk.
+        updated_backends = original_backends + (
+            "\nbackend be_refresh\n    server refreshed 10.0.0.9:9000\n"
+        )
+        FRAGMENTS_BACKENDS.write_text(updated_backends)
+
+        client.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": main_uri, "version": 2},
+                "contentChanges": [{"text": FRAGMENTS_MAIN.read_text()}],
+            },
+        )
+
+        try:
+            resp2 = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": main_uri}},
+            )
+        except TimeoutError as exc:
+            results.record("cross-file", "projectIndex after didChange responds", False, str(exc))
+            return
+        result2 = resp2.get("result") or {}
+        symbols2 = result2.get("symbols") or []
+        results.record(
+            "cross-file",
+            "didChange on main.cfg refreshes sibling (picks up be_refresh)",
+            any(
+                s.get("name") == "be_refresh"
+                and s.get("kind") == "Backend"
+                and s.get("uri") == backends_uri
+                for s in symbols2
+            ),
+            f"found symbols for backends.cfg: {[s.get('name') for s in symbols2 if s.get('uri') == backends_uri]}",
+        )
+    finally:
+        # Restore the fixture so re-runs start from a known state.
+        FRAGMENTS_BACKENDS.write_text(original_backends)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -2298,6 +2425,7 @@ def main() -> int:
         run_completion_probes(client, results)
         run_diagnostics_probes(client, results)
         run_project_info_probes(client, results)
+        run_cross_file_probes(client, results)
     finally:
         client.shutdown()
 

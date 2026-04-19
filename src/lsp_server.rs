@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -57,7 +57,7 @@ enum ReferenceContext {
     StickTable,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SymbolKind {
     Backend,
     Frontend,
@@ -65,6 +65,20 @@ enum SymbolKind {
     Acl,
     Server,
     StickTable,
+}
+
+// Serialize `SymbolKind` as a stable string for introspection endpoints.
+// Numeric `DocumentSymbol.kind` values are LSP-defined and reused elsewhere;
+// the project index speaks its own schema and benefits from legible names.
+fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Backend => "Backend",
+        SymbolKind::Frontend => "Frontend",
+        SymbolKind::Listen => "Listen",
+        SymbolKind::Acl => "Acl",
+        SymbolKind::Server => "Server",
+        SymbolKind::StickTable => "StickTable",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +152,41 @@ struct HaproxyLsp {
     // `resolve_project_config`; reused by `$/haproxy/projectInfo` and by
     // cross-file resolution in subsequent tasks.
     project_configs: HashMap<String, ProjectConfig>,
+    // Per-URI resolved include graph neighbours (file URIs). Populated during
+    // `parse_document` from `.include`, `-f`, and `crt` directives. Used to
+    // reach sibling files during the recursive graph walk and to aggregate
+    // the per-project symbol index.
+    included_files: HashMap<String, Vec<String>>,
+    // URIs the client has explicitly opened via `textDocument/didOpen`. Kept
+    // as a separate set from `self.documents` because the graph walk also
+    // caches sibling documents; when re-parsing the graph we want to trust
+    // only client-owned buffers for unsaved edits and re-read siblings from
+    // disk so edits made out-of-band (e.g. another editor) are picked up.
+    explicitly_opened: HashSet<String>,
+    // Per-project-root symbol index, keyed by the project-root path string.
+    // Populated at the tail of every top-level `parse_document` call after
+    // the include graph has been walked; consulted by the cross-file
+    // resolution handlers in later tasks (Task 6+) and by the
+    // `$/haproxy/projectIndex` introspection request.
+    project_indices: HashMap<String, ProjectIndex>,
+}
+
+// Aggregate symbol index for all files reachable from a single project root
+// via `.include` / `-f` / `crt` resolution. Keyed per (SymbolKind, name) so
+// cross-file definition / references / rename lookups can enumerate every
+// occurrence without re-scanning per-URI maps.
+#[derive(Debug, Clone, Default)]
+struct ProjectIndex {
+    project_root: PathBuf,
+    uris: Vec<String>,
+    symbols_by_name: HashMap<(SymbolKind, String), Vec<ProjectSymbolRef>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSymbolRef {
+    uri: String,
+    range: Range,
+    scope: Option<String>,
 }
 
 const SECTION_KEYWORDS: &[&str] = &[
@@ -156,6 +205,66 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     // would follow. We only target Unix (Zed runs on macOS/Linux).
     let decoded = percent_decode(rest);
     Some(PathBuf::from(decoded))
+}
+
+// Convert a filesystem path to a `file://` URI. Mirrors `uri_to_path` — the
+// canonicalized absolute path becomes the URI body with spaces percent-encoded
+// so the round-trip through `uri_to_path` stays lossless on the (rare) path
+// that contains them. Non-canonicalizable paths (does-not-exist, permission)
+// yield `None` so callers can skip them from the include graph.
+fn path_to_file_uri(p: &Path) -> Option<String> {
+    let canon = p.canonicalize().ok()?;
+    let s = canon.to_string_lossy();
+    let encoded = s.replace(' ', "%20");
+    Some(format!("file://{}", encoded))
+}
+
+// Strip a surrounding pair of `"` or `'` from an include path token if
+// present; otherwise return the slice unchanged. `.include "foo bar.cfg"`
+// is not exercised by our fixtures but appears in real configs, so the
+// defensive strip keeps us from treating the leading quote as part of the
+// filename and then failing to resolve it on disk.
+fn unquote_path_token(tok: &str) -> &str {
+    let bytes = tok.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &tok[1..tok.len() - 1]
+    } else {
+        tok
+    }
+}
+
+// Resolve an include-directive path token against the including file's
+// directory first, then the project root. Absolute paths must exist on
+// disk to be returned. Returns the resolved path as-is (not canonicalized
+// — that happens in `path_to_file_uri` to keep the include graph keyed on
+// canonical URIs).
+fn resolve_include_path(
+    path_tok: &str,
+    file_dir: &Path,
+    project_root: &Path,
+) -> Option<PathBuf> {
+    if path_tok.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(path_tok);
+    if p.is_absolute() {
+        if p.exists() {
+            return Some(p);
+        }
+        return None;
+    }
+    let candidate = file_dir.join(&p);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    let candidate = project_root.join(&p);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1679,6 +1788,9 @@ impl HaproxyLsp {
             pending_notifications: Vec::new(),
             workspace_root: None,
             project_configs: HashMap::new(),
+            included_files: HashMap::new(),
+            explicitly_opened: HashSet::new(),
+            project_indices: HashMap::new(),
         })
     }
 
@@ -1727,7 +1839,224 @@ impl HaproxyLsp {
         );
     }
 
+    // Top-level parse entry point. Parses the document at `uri`, then walks
+    // the include graph (`.include`, `-f`, `crt`) so siblings are parsed
+    // transitively, and finally rebuilds the project index keyed by the
+    // file's project root. Preserves the single-file semantics of the
+    // original `parse_document` (symbols / folds / outline / diagnostics all
+    // committed for `uri`) while layering cross-file state on top.
     fn parse_document(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut visited: HashSet<String> = HashSet::new();
+        self.parse_graph_node(uri, Some(content), &mut visited)?;
+        self.rebuild_project_index_for(uri);
+        Ok(())
+    }
+
+    // Parse a single node in the include graph and recurse into its
+    // neighbours. `content_override` is supplied for the top-level call (the
+    // buffer the client just sent); sibling calls pass `None`, which either
+    // picks up the last content the client explicitly provided via
+    // didOpen/didChange, or reads from disk when the sibling isn't an open
+    // editor buffer. `visited` is shared across the whole walk to prevent
+    // cycles.
+    fn parse_graph_node(
+        &mut self,
+        uri: &str,
+        content_override: Option<&str>,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !visited.insert(uri.to_string()) {
+            return Ok(());
+        }
+
+        let content: String = if let Some(c) = content_override {
+            c.to_string()
+        } else if self.explicitly_opened.contains(uri) {
+            // Sibling that the client is actively editing — trust its buffer
+            // over the on-disk copy so unsaved edits stay authoritative.
+            self.documents.get(uri).cloned().unwrap_or_default()
+        } else if let Some(path) = uri_to_path(uri) {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Ensure a project config is resolved for this URI. Siblings discovered
+        // via the include graph inherit the root file's config implicitly;
+        // `resolve_project_config_for_path` walks up from the sibling's
+        // directory so a shared `.zed/haproxy.toml` still applies.
+        if !self.project_configs.contains_key(uri) {
+            if let Some(path) = uri_to_path(uri) {
+                let cfg = resolve_project_config_for_path(
+                    &path,
+                    self.workspace_root.as_deref(),
+                );
+                self.project_configs.insert(uri.to_string(), cfg);
+            }
+        }
+
+        self.parse_single_file(uri, &content)?;
+
+        let includes = self.extract_include_uris(uri, &content);
+        self.included_files.insert(uri.to_string(), includes.clone());
+
+        for inc_uri in includes {
+            if visited.contains(&inc_uri) {
+                continue;
+            }
+            let _ = self.parse_graph_node(&inc_uri, None, visited);
+        }
+
+        Ok(())
+    }
+
+    // Discover include-graph neighbours on `content` for the file at `uri`.
+    // Recognised directives:
+    //   - `.include <path>` — HAProxy 2.4+ preprocessor include.
+    //   - `-f <path>` — command-line-style include (rare inside configs but
+    //     appears in `program` sections and deployment wrappers).
+    //   - `crt <path>` — TLS certificate include on `bind` lines; only
+    //     included when the resolved path is a file (directories are skipped
+    //     since Task 5 does not implement directory walking).
+    //
+    // Path resolution tries the file's own directory first, then the project
+    // root from the resolved `ProjectConfig`. Absolute paths are kept as-is.
+    // `.if` / `.elif` / `.else` / `.endif` are parsed conservatively: every
+    // branch is walked regardless of the condition, since the line-scanner
+    // already treats conditional directives as ordinary content.
+    fn extract_include_uris(&self, uri: &str, content: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let file_path = match uri_to_path(uri) {
+            Some(p) => p,
+            None => return out,
+        };
+        let file_dir = file_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let project_root = self
+            .project_configs
+            .get(uri)
+            .map(|c| c.project_root.clone())
+            .unwrap_or_else(|| file_dir.clone());
+
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        for raw_line in content.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let line_no_comment = strip_inline_comment(trimmed);
+            let tokens: Vec<&str> = line_no_comment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            if tokens[0] == ".include" && tokens.len() >= 2 {
+                let path_tok = unquote_path_token(tokens[1]);
+                if let Some(resolved) =
+                    resolve_include_path(path_tok, &file_dir, &project_root)
+                {
+                    if resolved.is_file() && seen.insert(resolved.clone()) {
+                        if let Some(u) = path_to_file_uri(&resolved) {
+                            out.push(u);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            for (i, tok) in tokens.iter().enumerate() {
+                if *tok == "-f" {
+                    if let Some(path_tok) = tokens.get(i + 1) {
+                        let path_tok = unquote_path_token(path_tok);
+                        if let Some(resolved) =
+                            resolve_include_path(path_tok, &file_dir, &project_root)
+                        {
+                            if resolved.is_file() && seen.insert(resolved.clone()) {
+                                if let Some(u) = path_to_file_uri(&resolved) {
+                                    out.push(u);
+                                }
+                            }
+                        }
+                    }
+                } else if *tok == "crt" {
+                    if let Some(path_tok) = tokens.get(i + 1) {
+                        let path_tok = unquote_path_token(path_tok);
+                        if let Some(resolved) =
+                            resolve_include_path(path_tok, &file_dir, &project_root)
+                        {
+                            if resolved.is_file() && seen.insert(resolved.clone()) {
+                                if let Some(u) = path_to_file_uri(&resolved) {
+                                    out.push(u);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    // Rebuild the project index rooted at the project_root of `seed_uri`.
+    // Reachability is computed by walking `self.included_files` forward from
+    // `seed_uri`; any URI reachable contributes its cached `self.symbols`
+    // entries into `symbols_by_name`. The resulting index replaces any prior
+    // index for the same project root.
+    fn rebuild_project_index_for(&mut self, seed_uri: &str) {
+        let project_root = match self.project_configs.get(seed_uri) {
+            Some(cfg) => cfg.project_root.clone(),
+            None => return,
+        };
+
+        let mut reachable: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![seed_uri.to_string()];
+        while let Some(u) = stack.pop() {
+            if !seen.insert(u.clone()) {
+                continue;
+            }
+            reachable.push(u.clone());
+            if let Some(incs) = self.included_files.get(&u) {
+                for i in incs {
+                    stack.push(i.clone());
+                }
+            }
+        }
+        reachable.sort();
+
+        let mut symbols_by_name: HashMap<(SymbolKind, String), Vec<ProjectSymbolRef>> =
+            HashMap::new();
+        for u in &reachable {
+            if let Some(syms) = self.symbols.get(u) {
+                for s in syms {
+                    symbols_by_name
+                        .entry((s.kind.clone(), s.name.clone()))
+                        .or_default()
+                        .push(ProjectSymbolRef {
+                            uri: u.clone(),
+                            range: s.range.clone(),
+                            scope: s.scope.clone(),
+                        });
+                }
+            }
+        }
+
+        let key = project_root.to_string_lossy().into_owned();
+        self.project_indices.insert(
+            key,
+            ProjectIndex {
+                project_root,
+                uris: reachable,
+                symbols_by_name,
+            },
+        );
+    }
+
+    fn parse_single_file(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Line-scanning parser. Tree-sitter is loaded by Zed for highlighting
         // only; no AST is available to the LSP.
         let mut symbols = Vec::new();
@@ -3212,6 +3541,11 @@ impl HaproxyLsp {
                     self.project_configs.insert(uri.to_string(), cfg);
                 }
 
+                // Mark this URI as a client-owned buffer so subsequent
+                // include-graph walks rooted elsewhere still trust the
+                // in-memory copy over on-disk content for unsaved edits.
+                self.explicitly_opened.insert(uri.to_string());
+
                 if let Err(_) = self.parse_document(uri, content) {
                     eprintln!("Failed to parse document: {}", uri);
                 }
@@ -3229,6 +3563,8 @@ impl HaproxyLsp {
                     self.documents.remove(uri);
                     self.diagnostics.remove(uri);
                     self.project_configs.remove(uri);
+                    self.included_files.remove(uri);
+                    self.explicitly_opened.remove(uri);
                     // Clear any stale diagnostics the client may still show.
                     let uri_owned = uri.to_string();
                     self.send_notification(
@@ -3984,6 +4320,67 @@ impl HaproxyLsp {
                         "result": []
                     }))
                 }
+            }
+            "$/haproxy/projectIndex" => {
+                // Introspection request used by the test harness to verify the
+                // cross-file symbol index. Returns the project root, the list
+                // of URIs in the include graph, and a flat list of every
+                // symbol aggregated across them. Emitted as stable-sorted by
+                // URI then by (line, character) so tests can compare
+                // deterministically.
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                let root_key = self
+                    .project_configs
+                    .get(uri)
+                    .map(|cfg| cfg.project_root.to_string_lossy().into_owned());
+                let result = match root_key.as_deref().and_then(|k| self.project_indices.get(k)) {
+                    Some(idx) => {
+                        let mut symbols: Vec<Value> = Vec::new();
+                        for ((kind, name), refs) in &idx.symbols_by_name {
+                            for r in refs {
+                                symbols.push(json!({
+                                    "name": name,
+                                    "kind": symbol_kind_name(kind),
+                                    "uri": r.uri,
+                                    "range": {
+                                        "start": { "line": r.range.start.line, "character": r.range.start.character },
+                                        "end": { "line": r.range.end.line, "character": r.range.end.character },
+                                    },
+                                    "scope": r.scope,
+                                }));
+                            }
+                        }
+                        symbols.sort_by(|a, b| {
+                            let au = a["uri"].as_str().unwrap_or("");
+                            let bu = b["uri"].as_str().unwrap_or("");
+                            au.cmp(bu)
+                                .then_with(|| {
+                                    a["range"]["start"]["line"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        .cmp(&b["range"]["start"]["line"].as_u64().unwrap_or(0))
+                                })
+                                .then_with(|| {
+                                    a["range"]["start"]["character"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        .cmp(&b["range"]["start"]["character"].as_u64().unwrap_or(0))
+                                })
+                        });
+                        json!({
+                            "project_root": idx.project_root.to_string_lossy(),
+                            "uris": idx.uris,
+                            "symbols": symbols,
+                        })
+                    }
+                    None => Value::Null,
+                };
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
             }
             "$/haproxy/projectInfo" => {
                 // Introspection request used by the test harness to verify
