@@ -1606,14 +1606,6 @@ impl HaproxyLsp {
                 }
             }
         }
-        if trimmed.starts_with("acl ") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Some(sym) = self.find_symbol_by_name(uri, parts[1], SymbolKind::Acl) {
-                    return Some(sym);
-                }
-            }
-        }
         if let Some(rest) = trimmed.strip_prefix("frontend ") {
             if let Some(name) = rest.split_whitespace().next() {
                 if let Some(sym) = self.find_symbol_by_name(uri, name, SymbolKind::Frontend) {
