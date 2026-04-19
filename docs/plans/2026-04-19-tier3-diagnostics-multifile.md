@@ -128,11 +128,11 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] advertise `workspaceSymbolProvider: true` in `initialize`
-- [ ] implement `workspace/symbol`: enumerate every symbol in the project index, case-insensitive substring match on `query`, return `SymbolInformation[]` with `name`, `kind`, `location`, and (optionally) `containerName` set to the enclosing backend/frontend
-- [ ] empty query returns up to a reasonable cap (e.g. 1000) of symbols so Zed can stream
-- [ ] add `WORKSPACE_SYMBOL_PROBES` asserting: `opcart` query from `test/haproxy.prod.cfg` returns `backend opcart-direct`; cross-file query from `test/fragments/` returns symbols from multiple files
-- [ ] run `./build.sh && python3 test/lsp_probes.py`
+- [x] advertise `workspaceSymbolProvider: true` in `initialize`
+- [x] implement `workspace/symbol`: enumerate every symbol in the project index, case-insensitive substring match on `query`, return `SymbolInformation[]` with `name`, `kind`, `location`, and (optionally) `containerName` set to the enclosing backend/frontend
+- [x] empty query returns up to a reasonable cap (e.g. 1000) of symbols so Zed can stream
+- [x] add `WORKSPACE_SYMBOL_PROBES` asserting: `opcart` query from `test/haproxy.prod.cfg` returns `backend opcart-direct`; cross-file query from `test/fragments/` returns symbols from multiple files
+- [x] run `./build.sh && python3 test/lsp_probes.py`
 
 ### Task 8: Verify acceptance criteria
 

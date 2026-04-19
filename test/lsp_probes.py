@@ -2571,6 +2571,151 @@ def run_cross_file_navigation_probes(client: LspClient, results: Results):
     )
 
 
+def run_workspace_symbol_probes(client: LspClient, results: Results):
+    """Exercise Task 7's `workspace/symbol` provider.
+
+    The handler enumerates every known symbol across all opened URIs
+    (including include-graph siblings) and does a case-insensitive substring
+    match on the query string. Empty query returns up to WORKSPACE_SYMBOL_CAP
+    entries so Zed can stream.
+
+    Assumes prior probes have opened `test/haproxy.prod.cfg` and the
+    `test/fragments/` pair. Those did_opens run earlier in `main`, so the
+    per-URI symbol cache is already populated by the time we query.
+    """
+    prod_uri = path_to_uri(HAPROXY_CFG)
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    backends_uri = path_to_uri(FRAGMENTS_BACKENDS)
+
+    # Ensure prod.cfg is opened — document-symbol probes do this, but guard
+    # in case probe ordering ever changes.
+    if HAPROXY_CFG.exists():
+        client.did_open(prod_uri, HAPROXY_CFG.read_text())
+
+    # --- 1. query `opcart` must return `backend opcart-direct`.
+    try:
+        resp = client.request(
+            "workspace/symbol",
+            {"query": "opcart"},
+        )
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "opcart query responds", False, str(exc))
+        return
+
+    items = resp.get("result")
+    if not isinstance(items, list):
+        results.record(
+            "workspace-symbol",
+            "workspace/symbol returns a list",
+            False,
+            f"got {type(items).__name__}: {items!r}",
+        )
+        return
+    results.record(
+        "workspace-symbol",
+        "workspace/symbol returns a list",
+        True,
+        f"{len(items)} items",
+    )
+
+    opcart_direct = [
+        it
+        for it in items
+        if it.get("name") == "opcart-direct"
+        and it.get("kind") == 5  # Class / Backend
+        and (it.get("location") or {}).get("uri") == prod_uri
+    ]
+    results.record(
+        "workspace-symbol",
+        "`opcart` query finds `backend opcart-direct` in prod.cfg",
+        bool(opcart_direct),
+        f"matched: {opcart_direct[:1]}",
+    )
+
+    # Every returned item must contain a substring of the query.
+    bad = [it for it in items if "opcart" not in (it.get("name") or "").lower()]
+    results.record(
+        "workspace-symbol",
+        "every result name contains `opcart` (case-insensitive)",
+        not bad,
+        f"violators: {bad[:3]}" if bad else "all match",
+    )
+
+    # --- 2. cross-file query across test/fragments/: `be_` returns symbols
+    # from both main.cfg (fe_main references) and backends.cfg (be_web).
+    if FRAGMENTS_MAIN.exists() and FRAGMENTS_BACKENDS.exists():
+        client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+        try:
+            resp = client.request("workspace/symbol", {"query": "be_"})
+        except TimeoutError as exc:
+            results.record("workspace-symbol", "be_ query responds", False, str(exc))
+            return
+        items = resp.get("result") or []
+
+        be_web = [
+            it
+            for it in items
+            if it.get("name") == "be_web"
+            and (it.get("location") or {}).get("uri") == backends_uri
+        ]
+        results.record(
+            "workspace-symbol",
+            "`be_` query finds `backend be_web` in backends.cfg",
+            bool(be_web),
+            f"matched: {be_web[:1]}",
+        )
+
+    # --- 3. case-insensitive match.
+    try:
+        resp = client.request("workspace/symbol", {"query": "OPCART"})
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "case-insensitive query responds", False, str(exc))
+        return
+    items = resp.get("result") or []
+    results.record(
+        "workspace-symbol",
+        "case-insensitive query `OPCART` still finds opcart-direct",
+        any(it.get("name") == "opcart-direct" for it in items),
+        f"{len(items)} items",
+    )
+
+    # --- 4. containerName populated for Server symbols (scope = backend).
+    try:
+        resp = client.request("workspace/symbol", {"query": "web1"})
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "web1 query responds", False, str(exc))
+        return
+    items = resp.get("result") or []
+    web1_hits = [
+        it
+        for it in items
+        if it.get("name") == "web1"
+        and it.get("kind") == 8  # Field / Server
+        and (it.get("location") or {}).get("uri") == backends_uri
+    ]
+    results.record(
+        "workspace-symbol",
+        "web1 server has containerName = be_web",
+        bool(web1_hits) and web1_hits[0].get("containerName") == "be_web",
+        f"hit: {web1_hits[:1]}",
+    )
+
+    # --- 5. empty query returns a bounded but non-empty list.
+    try:
+        resp = client.request("workspace/symbol", {"query": ""})
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "empty query responds", False, str(exc))
+        return
+    items = resp.get("result") or []
+    results.record(
+        "workspace-symbol",
+        "empty query returns non-empty list (caps at 1000)",
+        len(items) > 0 and len(items) <= 1000,
+        f"{len(items)} items",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -2604,6 +2749,7 @@ def main() -> int:
         run_project_info_probes(client, results)
         run_cross_file_probes(client, results)
         run_cross_file_navigation_probes(client, results)
+        run_workspace_symbol_probes(client, results)
     finally:
         client.shutdown()
 

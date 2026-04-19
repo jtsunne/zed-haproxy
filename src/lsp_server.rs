@@ -97,6 +97,21 @@ fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
     }
 }
 
+// Map internal `SymbolKind` to the LSP-defined numeric `SymbolKind` used in
+// `SymbolInformation`/`WorkspaceSymbol` and `DocumentSymbol` payloads. Kept in
+// sync with the choices made in the per-section `documentSymbol` outliner
+// (`section_kind_for` + child push sites): Backend/Listen = Class,
+// Frontend = Interface, Acl = Property, Server = Field, StickTable = Struct.
+fn lsp_symbol_kind(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Backend | SymbolKind::Listen => 5,
+        SymbolKind::Frontend => 11,
+        SymbolKind::Acl => 7,
+        SymbolKind::Server => 8,
+        SymbolKind::StickTable => 23,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Range {
     start: Position,
@@ -2175,6 +2190,33 @@ impl HaproxyLsp {
         }
     }
 
+    // Return the enclosing section name for a child symbol (ACL, StickTable)
+    // located at `target_line` within `uri`. Scans the per-URI `symbols` cache
+    // for the highest-line Backend/Frontend/Listen definition at or before
+    // `target_line`. Returns `None` if the child appears before any section
+    // header (e.g. a top-of-file stray `acl` line).
+    fn enclosing_section_for_uri(&self, uri: &str, target_line: u32) -> Option<String> {
+        let syms = self.symbols.get(uri)?;
+        let mut best: Option<(u32, &str)> = None;
+        for s in syms {
+            if !matches!(
+                s.kind,
+                SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
+            ) {
+                continue;
+            }
+            let sl = s.range.start.line;
+            if sl > target_line {
+                continue;
+            }
+            match best {
+                Some((bl, _)) if bl >= sl => {}
+                _ => best = Some((sl, s.name.as_str())),
+            }
+        }
+        best.map(|(_, n)| n.to_string())
+    }
+
     // Aggregate references to `(name, kind, scope)` across every URI in the
     // project graph, deduped by (uri, line, start, context). Drives cross-file
     // `textDocument/references`, `textDocument/rename`, and the unused-symbol
@@ -4097,6 +4139,7 @@ impl HaproxyLsp {
                             "renameProvider": { "prepareProvider": true },
                             "foldingRangeProvider": true,
                             "documentSymbolProvider": true,
+                            "workspaceSymbolProvider": true,
                             "hoverProvider": true,
                             "completionProvider": {
                                 "triggerCharacters": [" ", "("],
@@ -4720,6 +4763,83 @@ impl HaproxyLsp {
                     }))
                 }
             }
+            "workspace/symbol" => {
+                // Enumerate every symbol known to the server (all URIs in the
+                // per-file `symbols` cache — populated on didOpen and by the
+                // include-graph walker for sibling files). Case-insensitive
+                // substring match on `query`; an empty query returns up to
+                // `WORKSPACE_SYMBOL_CAP` entries so Zed can stream.
+                let params = &request["params"];
+                let query = params["query"].as_str().unwrap_or("");
+                let lower = query.to_lowercase();
+                let cap = WORKSPACE_SYMBOL_CAP;
+
+                // Stable ordering: URIs lexically ascending, then definition
+                // line within each URI. Matches the projectIndex introspection
+                // schema so cross-test comparisons stay deterministic.
+                let mut uris: Vec<String> = self.symbols.keys().cloned().collect();
+                uris.sort();
+
+                let mut items: Vec<Value> = Vec::new();
+                'outer: for uri in &uris {
+                    let syms = match self.symbols.get(uri) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    for s in syms {
+                        if !lower.is_empty() {
+                            if !s.name.to_lowercase().contains(&lower) {
+                                continue;
+                            }
+                        }
+                        let container = match s.kind {
+                            // Server carries its enclosing section in `scope`.
+                            SymbolKind::Server => s.scope.clone(),
+                            // ACL / StickTable identity is section-local but
+                            // not stored on the symbol — recover it by
+                            // scanning the per-URI symbol list for the most
+                            // recent Backend/Frontend/Listen at or above the
+                            // child's line.
+                            SymbolKind::Acl | SymbolKind::StickTable => {
+                                self.enclosing_section_for_uri(uri, s.range.start.line)
+                            }
+                            _ => None,
+                        };
+                        let mut entry = json!({
+                            "name": s.name,
+                            "kind": lsp_symbol_kind(&s.kind),
+                            "location": {
+                                "uri": s.uri,
+                                "range": {
+                                    "start": {
+                                        "line": s.range.start.line,
+                                        "character": s.range.start.character,
+                                    },
+                                    "end": {
+                                        "line": s.range.end.line,
+                                        "character": s.range.end.character,
+                                    },
+                                },
+                            },
+                        });
+                        if let Some(c) = container {
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("containerName".to_string(), Value::String(c));
+                            }
+                        }
+                        items.push(entry);
+                        if items.len() >= cap {
+                            break 'outer;
+                        }
+                    }
+                }
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": items,
+                }))
+            }
             "$/haproxy/projectIndex" => {
                 // Introspection request used by the test harness to verify the
                 // cross-file symbol index. Returns the project root, the list
@@ -4829,6 +4949,12 @@ impl HaproxyLsp {
 // Cap per-message size to avoid unbounded allocation on malicious/malformed
 // Content-Length. 64 MiB is far larger than any reasonable HAProxy config.
 const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+
+// Upper bound on `workspace/symbol` results. An empty query must return
+// something streamable rather than dumping an arbitrary count — real-world
+// configs top out at a few thousand symbols, so 1000 is a reasonable ceiling
+// for the fuzzy-search pane without flooding the wire.
+const WORKSPACE_SYMBOL_CAP: usize = 1000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lsp = HaproxyLsp::new()?;
