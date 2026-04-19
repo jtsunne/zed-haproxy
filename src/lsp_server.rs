@@ -594,6 +594,313 @@ fn undefined_reference_diagnostics(content: &str, symbols: &[Symbol]) -> Vec<Dia
     diags
 }
 
+/// Section header metadata used by structural diagnostic passes.
+///
+/// `name_start` / `name_end` are byte offsets on `header_line` (which equal
+/// LSP character offsets — HAProxy identifiers are ASCII per the grammar).
+/// `body_end_line` is inclusive and clamped to the line index immediately
+/// before the next section header (or the last line of the file for the
+/// trailing section). `name` is empty for section kinds that take no name
+/// token (`global`, `defaults`).
+struct SectionHeaderInfo {
+    keyword: String,
+    name: String,
+    name_start: u32,
+    name_end: u32,
+    header_line: u32,
+    body_end_line: u32,
+}
+
+fn collect_section_headers(content: &str) -> Vec<SectionHeaderInfo> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut hdrs: Vec<SectionHeaderInfo> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !is_section_header(line) {
+            continue;
+        }
+        let keyword = match line.split_whitespace().next() {
+            Some(k) => k.to_string(),
+            None => continue,
+        };
+        let (name, name_start, name_end) = match find_leading_directive_arg(line, &keyword) {
+            Some((n, s, e)) => (n, s, e),
+            None => (String::new(), 0u32, 0u32),
+        };
+        hdrs.push(SectionHeaderInfo {
+            keyword,
+            name,
+            name_start,
+            name_end,
+            header_line: i as u32,
+            body_end_line: 0,
+        });
+    }
+    for i in 0..hdrs.len() {
+        let next = if i + 1 < hdrs.len() {
+            hdrs[i + 1].header_line.saturating_sub(1)
+        } else if line_count > 0 {
+            (line_count - 1) as u32
+        } else {
+            hdrs[i].header_line
+        };
+        hdrs[i].body_end_line = next;
+    }
+    hdrs
+}
+
+/// Emit a `duplicate-section` error (severity `Error`) on every second-and-later
+/// occurrence of a `backend` / `frontend` / `listen` section with a name already
+/// declared earlier in the file under the same keyword. Cross-kind collisions
+/// (e.g. `backend foo` + `frontend foo`) are not flagged here; HAProxy permits
+/// distinct namespaces per keyword in practice.
+fn duplicate_section_diagnostics(headers: &[SectionHeaderInfo]) -> Vec<Diagnostic> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "backend" | "frontend" | "listen") {
+            continue;
+        }
+        if h.name.is_empty() {
+            continue;
+        }
+        let key = (h.keyword.clone(), h.name.clone());
+        if !seen.insert(key) {
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: h.header_line, character: h.name_start },
+                    end: Position { line: h.header_line, character: h.name_end },
+                },
+                severity: 1,
+                code: "duplicate-section",
+                source: "haproxy-lsp",
+                message: format!("Duplicate {} section: {}", h.keyword, h.name),
+            });
+        }
+    }
+    diags
+}
+
+/// Emit a `duplicate-acl` error on every second-and-later `acl NAME ...` within
+/// the same `frontend` / `listen` body. Restricted to frontend/listen per the
+/// Tier 3 plan — HAProxy technically permits repeated `acl` lines as an OR
+/// shorthand, but in frontends/listens the typical intent of a repeat is a
+/// copy-paste mistake that silently overrides condition semantics.
+fn duplicate_acl_diagnostics(
+    content: &str,
+    headers: &[SectionHeaderInfo],
+) -> Vec<Diagnostic> {
+    use std::collections::HashSet;
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "frontend" | "listen") {
+            continue;
+        }
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (h.body_end_line as usize).min(line_count.saturating_sub(1));
+        if body_start > body_end {
+            continue;
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for ln_idx in body_start..=body_end {
+            let line = lines[ln_idx];
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !trimmed.starts_with("acl ") && trimmed != "acl" {
+                continue;
+            }
+            if let Some((name, start, end)) = find_leading_directive_arg(line, "acl") {
+                if !seen.insert(name.clone()) {
+                    diags.push(Diagnostic {
+                        range: Range {
+                            start: Position { line: ln_idx as u32, character: start },
+                            end: Position { line: ln_idx as u32, character: end },
+                        },
+                        severity: 1,
+                        code: "duplicate-acl",
+                        source: "haproxy-lsp",
+                        message: format!("Duplicate ACL in section: {}", name),
+                    });
+                }
+            }
+        }
+    }
+    diags
+}
+
+/// Emit a `missing-default-backend` warning for each `frontend` / `listen`
+/// that has a `bind` directive (or a `listen NAME addr` inline bind) but
+/// neither a `default_backend` nor any `use_backend` directive in its body.
+/// Range is anchored on the section name token in the header.
+fn missing_default_backend_diagnostics(
+    content: &str,
+    headers: &[SectionHeaderInfo],
+) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "frontend" | "listen") {
+            continue;
+        }
+        if h.name.is_empty() {
+            continue;
+        }
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (h.body_end_line as usize).min(line_count.saturating_sub(1));
+        let mut has_bind = false;
+        let mut has_backend_ref = false;
+        // `listen NAME addr[:port]` header form counts as an inline bind.
+        if h.keyword == "listen" {
+            if let Some(hdr_line) = lines.get(h.header_line as usize) {
+                let toks: Vec<&str> = hdr_line.split_whitespace().collect();
+                if toks.len() >= 3 && !toks[2].starts_with('#') {
+                    has_bind = true;
+                }
+            }
+        }
+        if body_start <= body_end {
+            for ln_idx in body_start..=body_end {
+                let line = lines[ln_idx];
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let tok = trimmed.split_whitespace().next().unwrap_or("");
+                if tok == "bind" {
+                    has_bind = true;
+                }
+                if tok == "default_backend" || tok == "use_backend" {
+                    has_backend_ref = true;
+                }
+            }
+        }
+        if has_bind && !has_backend_ref {
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: h.header_line, character: h.name_start },
+                    end: Position { line: h.header_line, character: h.name_end },
+                },
+                severity: 2,
+                code: "missing-default-backend",
+                source: "haproxy-lsp",
+                message: format!(
+                    "{} '{}' has `bind` but no `default_backend` or `use_backend`",
+                    h.keyword, h.name
+                ),
+            });
+        }
+    }
+    diags
+}
+
+/// Emit an `unused-backend` warning for every `backend` symbol whose reference
+/// list is empty. Stick-table accessors (`sc0_*(name)`, `stick match name`)
+/// attach to the `StickTable` symbol rather than the enclosing backend, so a
+/// backend whose sole purpose is carrying a `stick-table` is still flagged —
+/// callers are expected to reference the backend via `use_backend` somewhere
+/// if they want the warning suppressed.
+fn unused_backend_diagnostics(content: &str, symbols: &[Symbol]) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut diags = Vec::new();
+    for s in symbols {
+        if s.kind != SymbolKind::Backend || !s.references.is_empty() {
+            continue;
+        }
+        let line_idx = s.range.start.line as usize;
+        let line = match lines.get(line_idx) {
+            Some(l) => l,
+            None => continue,
+        };
+        if let Some((_, start, end)) = find_leading_directive_arg(line, "backend") {
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: line_idx as u32, character: start },
+                    end: Position { line: line_idx as u32, character: end },
+                },
+                severity: 2,
+                code: "unused-backend",
+                source: "haproxy-lsp",
+                message: format!("Unused backend: {}", s.name),
+            });
+        }
+    }
+    diags
+}
+
+/// Emit an `unused-acl` warning for every `acl NAME ...` defined inside a
+/// `frontend` / `listen` / `backend` body where no `if` / `unless` condition
+/// in the same section body references `NAME`. Scope is enforced at the
+/// section level to avoid cross-section false negatives: two sections each
+/// defining `acl foo` don't suppress each other's warning.
+///
+/// Only the first occurrence of a duplicated ACL name within a section is
+/// considered for this rule; the duplicates are already reported by
+/// `duplicate_acl_diagnostics`.
+fn unused_acl_diagnostics(
+    content: &str,
+    headers: &[SectionHeaderInfo],
+) -> Vec<Diagnostic> {
+    use std::collections::HashSet;
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "frontend" | "listen" | "backend") {
+            continue;
+        }
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (h.body_end_line as usize).min(line_count.saturating_sub(1));
+        if body_start > body_end {
+            continue;
+        }
+        let mut defs: Vec<(String, u32, u32, u32)> = Vec::new();
+        let mut refs: HashSet<String> = HashSet::new();
+        for ln_idx in body_start..=body_end {
+            let line = lines[ln_idx];
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with("acl ") || trimmed == "acl" {
+                if let Some((name, start, end)) = find_leading_directive_arg(line, "acl") {
+                    defs.push((name, ln_idx as u32, start, end));
+                }
+            }
+            for kw in &["if", "unless"] {
+                for (name, _, _) in collect_acl_ref_positions(line, kw) {
+                    refs.insert(name);
+                }
+            }
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for (name, ln, start, end) in defs {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if refs.contains(&name) {
+                continue;
+            }
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: ln, character: start },
+                    end: Position { line: ln, character: end },
+                },
+                severity: 2,
+                code: "unused-acl",
+                source: "haproxy-lsp",
+                message: format!("Unused ACL: {}", name),
+            });
+        }
+    }
+    diags
+}
+
 /// Collect ACL identifier references on a line under an `if` / `unless`
 /// condition, with precise column ranges for each occurrence. Mirrors the
 /// token-filtering semantics of `extract_acl_names_from_condition`
@@ -1116,6 +1423,12 @@ impl HaproxyLsp {
             self.symbols.get(uri).cloned(),
         ) {
             diags.extend(undefined_reference_diagnostics(&content, &symbols));
+            let headers = collect_section_headers(&content);
+            diags.extend(duplicate_section_diagnostics(&headers));
+            diags.extend(duplicate_acl_diagnostics(&content, &headers));
+            diags.extend(missing_default_backend_diagnostics(&content, &headers));
+            diags.extend(unused_backend_diagnostics(&content, &symbols));
+            diags.extend(unused_acl_diagnostics(&content, &headers));
         }
         let diags_json: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
         self.diagnostics.insert(uri.to_string(), diags);

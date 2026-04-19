@@ -1959,6 +1959,42 @@ DIAGNOSTICS_PROBES: list[dict] = [
         "range": (188, 13, 188, 29),
         "message_contains": "diag_missing_srv",
     },
+    # Task 3: unused-symbol / duplicate / structural diagnostics.
+    {
+        "desc": "conf: unused-backend on `backend diag_unused_backend`",
+        "code": "unused-backend",
+        "severity": 2,
+        "range": (192, 8, 192, 27),
+        "message_contains": "diag_unused_backend",
+    },
+    {
+        "desc": "conf: unused-acl on `acl diag_unused_acl`",
+        "code": "unused-acl",
+        "severity": 2,
+        "range": (199, 6, 199, 21),
+        "message_contains": "diag_unused_acl",
+    },
+    {
+        "desc": "conf: duplicate-section on second `backend diag_dup_section`",
+        "code": "duplicate-section",
+        "severity": 1,
+        "range": (206, 8, 206, 24),
+        "message_contains": "diag_dup_section",
+    },
+    {
+        "desc": "conf: duplicate-acl on repeated `acl diag_dup_acl`",
+        "code": "duplicate-acl",
+        "severity": 1,
+        "range": (214, 6, 214, 18),
+        "message_contains": "diag_dup_acl",
+    },
+    {
+        "desc": "conf: missing-default-backend on `frontend diag_no_backend_frontend`",
+        "code": "missing-default-backend",
+        "severity": 2,
+        "range": (217, 9, 217, 33),
+        "message_contains": "diag_no_backend_frontend",
+    },
 ]
 
 

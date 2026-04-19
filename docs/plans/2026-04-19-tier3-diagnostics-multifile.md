@@ -70,14 +70,14 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 - Modify: `test/haproxy.conf`
 - Modify: `test/lsp_probes.py`
 
-- [ ] implement unused-backend warning (`Symbol.references.is_empty()` for `SymbolKind::Backend`; skip backends used only as `default_backend` — those already count as references)
-- [ ] implement unused-ACL warning (ACL defined but never appears in `if`/`unless` within same section)
-- [ ] implement duplicate-section error (two `backend foo` / `frontend foo` / `listen foo` with same name)
-- [ ] implement duplicate-ACL-in-same-section error (two `acl foo …` inside one frontend/listen)
-- [ ] implement missing-`default_backend` warning (frontend/listen that has `bind` but neither a `default_backend` nor any `use_backend` directive)
-- [ ] extend fixture with examples for each rule
-- [ ] add probes asserting severity/code/range for each rule
-- [ ] run `./build.sh && python3 test/lsp_probes.py` — all pass
+- [x] implement unused-backend warning (`Symbol.references.is_empty()` for `SymbolKind::Backend`; skip backends used only as `default_backend` — those already count as references)
+- [x] implement unused-ACL warning (ACL defined but never appears in `if`/`unless` within same section)
+- [x] implement duplicate-section error (two `backend foo` / `frontend foo` / `listen foo` with same name)
+- [x] implement duplicate-ACL-in-same-section error (two `acl foo …` inside one frontend/listen)
+- [x] implement missing-`default_backend` warning (frontend/listen that has `bind` but neither a `default_backend` nor any `use_backend` directive)
+- [x] extend fixture with examples for each rule
+- [x] add probes asserting severity/code/range for each rule
+- [x] run `./build.sh && python3 test/lsp_probes.py` — all pass
 
 ### Task 4: Project-root discovery + config loader
 
