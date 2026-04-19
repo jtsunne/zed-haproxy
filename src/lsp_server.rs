@@ -765,7 +765,8 @@ impl HaproxyLsp {
     }
 
     fn parse_document(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // For now, use simple regex-based parsing until tree-sitter integration is complete
+        // Line-scanning parser. Tree-sitter is loaded by Zed for highlighting
+        // only; no AST is available to the LSP.
         let mut symbols = Vec::new();
         // Track the enclosing named section so `stick-table` directives can
         // be attributed to the correct backend/frontend/listen/peers name
@@ -1128,10 +1129,13 @@ impl HaproxyLsp {
     }
     
     fn add_reference_to_symbol(&self, symbols: &mut Vec<Symbol>, symbol_name: &str, symbol_kind: SymbolKind, reference: Reference) {
+        // HAProxy permits multiple `acl NAME ...` lines for OR semantics; the
+        // same applies to any duplicated definition. Attach the reference to
+        // every matching symbol so that resolving from any definition line
+        // (or via name lookup) returns the full reference set.
         for symbol in symbols.iter_mut() {
-            if symbol.name == symbol_name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&symbol_kind) {
-                symbol.references.push(reference);
-                break;
+            if symbol.name == symbol_name && symbol.kind == symbol_kind {
+                symbol.references.push(reference.clone());
             }
         }
     }
@@ -1140,11 +1144,16 @@ impl HaproxyLsp {
         // Find the condition part after "if" or "unless"
         let condition_start = line.find(&format!(" {} ", condition_type))?;
         let condition_part = &line[condition_start + condition_type.len() + 2..];
-        
+
+        // Strip trailing line comments so words after `#` aren't recorded as
+        // spurious ACL references (e.g. `use_backend foo if bar # production`
+        // would otherwise register `production` as an ACL name).
+        let condition_part = condition_part.split('#').next().unwrap_or(condition_part);
+
         // Simple parsing: split by whitespace and filter out operators and logical keywords
         let parts: Vec<&str> = condition_part.split_whitespace().collect();
         let mut acl_names = Vec::new();
-        
+
         for part in parts {
             // Skip HAProxy operators and keywords.
             // Note: do NOT skip tokens that merely *start* with `!` — those are
@@ -1549,8 +1558,18 @@ impl HaproxyLsp {
             return Vec::new();
         }
         let line = lines[line_idx];
-        let char_pos = (position.character as usize).min(line.len());
-        let prefix = &line[..char_pos];
+        // `position.character` is a char index (matching word_at_position's
+        // convention elsewhere in this file). Convert to a byte offset that
+        // lands on a valid char boundary so slicing `&line[..byte_pos]` on a
+        // line containing multi-byte UTF-8 (comments, description strings)
+        // does not panic with "byte index is not a char boundary".
+        let char_pos_chars = position.character as usize;
+        let byte_pos = line
+            .char_indices()
+            .nth(char_pos_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        let prefix = &line[..byte_pos];
 
         // Case 1: inside an unclosed sc<N>_*(...) call, first positional arg.
         if let Some(open) = prefix.rfind('(') {
@@ -2278,15 +2297,32 @@ impl HaproxyLsp {
                     }
                 };
 
-                // Definition edit.
-                let def_line_idx = symbol.range.start.line as usize;
-                if def_line_idx < lines.len() {
+                // Definition edits. HAProxy allows multiple `acl NAME ...`
+                // lines for OR semantics, so rename must rewrite every same-
+                // name/kind definition, not just the one at the cursor — a
+                // partial rename would leave an orphan declaration and
+                // silently break the config.
+                let all_defs: Vec<(u32, String)> = self
+                    .symbols
+                    .get(uri)
+                    .map(|syms| {
+                        syms.iter()
+                            .filter(|s| s.name == symbol.name && s.kind == symbol.kind)
+                            .map(|s| (s.range.start.line, s.name.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (def_line_num, _) in &all_defs {
+                    let def_line_idx = *def_line_num as usize;
+                    if def_line_idx >= lines.len() {
+                        continue;
+                    }
                     let def_line = lines[def_line_idx];
                     if let Some(search_from) = def_line_search_from(def_line, &symbol.kind) {
                         if let Some((s, e)) =
                             find_identifier_range(def_line, &symbol.name, search_from)
                         {
-                            push_edit(symbol.range.start.line, s, e, &mut edits);
+                            push_edit(*def_line_num, s, e, &mut edits);
                         }
                     }
                 }

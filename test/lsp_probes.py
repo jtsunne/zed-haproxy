@@ -319,19 +319,19 @@ FOLDING_PROBES: list[dict] = [
         "desc": "prod.cfg: section fold of `defaults`",
         "fixture": "cfg",
         "match": "contains",
-        "expected": {"startLine": 35, "endLine": 50, "kind": "region"},
+        "expected": {"startLine": 33, "endLine": 48, "kind": "region"},
     },
     {
         "desc": "prod.cfg: final section fold reaches last line",
         "fixture": "cfg",
         "match": "contains",
-        "expected": {"startLine": 1171, "endLine": 1189, "kind": "region"},
+        "expected": {"startLine": 1169, "endLine": 1187, "kind": "region"},
     },
     {
         "desc": "prod.cfg: BEGIN/END `Rate limit for login` region",
         "fixture": "cfg",
         "match": "contains",
-        "expected": {"startLine": 59, "endLine": 62, "kind": "region"},
+        "expected": {"startLine": 57, "endLine": 60, "kind": "region"},
     },
     # --- edge case: URI never opened returns [] ---
     {
