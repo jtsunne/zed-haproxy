@@ -45,6 +45,12 @@ class LspClient:
         )
         self._next_id = 1
         self._responses: dict[int, dict] = {}
+        # Latest `publishDiagnostics` payload per URI, plus a monotonically
+        # increasing version that bumps on every update. Tests call
+        # `wait_for_diagnostics(uri, min_version=...)` after a did_open /
+        # did_change to wait for the *next* publish rather than stale state.
+        self._diagnostics: dict[str, list[dict]] = {}
+        self._diagnostics_version: dict[str, int] = {}
         self._lock = threading.Lock()
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
@@ -96,6 +102,16 @@ class LspClient:
             if "id" in msg and msg.get("id") is not None:
                 with self._lock:
                     self._responses[int(msg["id"])] = msg
+            elif msg.get("method") == "textDocument/publishDiagnostics":
+                params = msg.get("params") or {}
+                uri = params.get("uri")
+                if isinstance(uri, str):
+                    diags = params.get("diagnostics") or []
+                    with self._lock:
+                        self._diagnostics[uri] = diags
+                        self._diagnostics_version[uri] = (
+                            self._diagnostics_version.get(uri, 0) + 1
+                        )
 
     def _send(self, payload: dict):
         body = json.dumps(payload).encode("utf-8")
@@ -119,6 +135,30 @@ class LspClient:
 
     def notify(self, method: str, params: dict):
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def diagnostics_version(self, uri: str) -> int:
+        with self._lock:
+            return self._diagnostics_version.get(uri, 0)
+
+    def wait_for_diagnostics(
+        self, uri: str, min_version: int = 1, timeout: float = 3.0
+    ) -> list[dict]:
+        """Block until a `publishDiagnostics` for `uri` with version >=
+        `min_version` arrives, then return its `diagnostics` array.
+
+        Call `diagnostics_version(uri)` before sending a did_open / did_change
+        to snapshot the pre-publish version, then pass `snapshot + 1` here.
+        Raises TimeoutError on timeout."""
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._diagnostics_version.get(uri, 0) >= min_version:
+                    return list(self._diagnostics.get(uri, []))
+            time.sleep(0.01)
+        raise TimeoutError(
+            f"No publishDiagnostics v>={min_version} for {uri} within {timeout}s"
+        )
 
     def initialize(self):
         return self.request("initialize", {"capabilities": {}})
@@ -1887,6 +1927,44 @@ def run_completion_probes(client: LspClient, results: Results):
         )
 
 
+def run_diagnostics_probes(client: LspClient, results: Results):
+    """Drive `textDocument/publishDiagnostics` and assert observed payloads.
+
+    Task 1 baseline: every clean file must publish an empty diagnostics
+    array so stale marks clear on the client. Tasks 2 and 3 will extend
+    this with undefined-reference, unused-symbol, and structural probes.
+    """
+    # Use an inline minimal config so this probe stays stable even as the
+    # on-disk fixtures gain intentionally-broken lines in later tasks.
+    clean_cfg = (
+        "global\n"
+        "    daemon\n"
+        "\n"
+        "defaults\n"
+        "    mode http\n"
+        "\n"
+        "backend web\n"
+        "    server s1 127.0.0.1:8080\n"
+        "\n"
+        "frontend fe\n"
+        "    bind *:80\n"
+        "    default_backend web\n"
+    )
+    fake_uri = "file:///tmp/haproxy-lsp-diag-clean.cfg"
+
+    prev_version = client.diagnostics_version(fake_uri)
+    client.did_open(fake_uri, clean_cfg)
+    try:
+        diags = client.wait_for_diagnostics(fake_uri, min_version=prev_version + 1)
+    except TimeoutError as exc:
+        results.record("diagnostics", "clean file publishes empty array", False, str(exc))
+        return
+
+    ok = diags == []
+    detail = "empty array as expected" if ok else f"unexpected diagnostics: {diags!r}"
+    results.record("diagnostics", "clean file publishes empty array", ok, detail)
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -1958,6 +2036,7 @@ def main() -> int:
         run_rename_probes(client, results)
         run_hover_probes(client, results)
         run_completion_probes(client, results)
+        run_diagnostics_probes(client, results)
     finally:
         client.shutdown()
 

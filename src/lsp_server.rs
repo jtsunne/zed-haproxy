@@ -70,6 +70,17 @@ struct FoldingRange {
     kind: &'static str,
 }
 
+// LSP DiagnosticSeverity: 1=Error, 2=Warning, 3=Information, 4=Hint.
+// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#diagnostic
+#[derive(Debug, Clone)]
+struct Diagnostic {
+    range: Range,
+    severity: u8,
+    code: &'static str,
+    source: &'static str,
+    message: String,
+}
+
 // LSP numeric SymbolKind values. Kept as u8 for compactness; serialized as u32.
 // See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
 #[derive(Debug, Clone)]
@@ -94,12 +105,33 @@ struct HaproxyLsp {
     folds: HashMap<String, Vec<FoldingRange>>,
     outline: HashMap<String, Vec<DocumentSymbol>>,
     documents: HashMap<String, String>,
+    // Per-URI diagnostics cache. Rebuilt at the tail of `parse_document` and
+    // published via a `textDocument/publishDiagnostics` notification; an
+    // empty Vec is still published so stale diagnostics clear on the client.
+    diagnostics: HashMap<String, Vec<Diagnostic>>,
+    // Pending outbound notifications. `send_notification` pushes; the main
+    // loop drains after `handle_request` returns so framed writes to stdout
+    // stay serialized with the single optional response per request frame.
+    pending_notifications: Vec<Value>,
 }
 
 const SECTION_KEYWORDS: &[&str] = &[
     "global", "defaults", "frontend", "backend", "listen", "resolvers",
     "userlist", "peers", "mailers", "cache", "program", "ring",
 ];
+
+fn diagnostic_to_json(d: &Diagnostic) -> Value {
+    json!({
+        "range": {
+            "start": { "line": d.range.start.line, "character": d.range.start.character },
+            "end": { "line": d.range.end.line, "character": d.range.end.character },
+        },
+        "severity": d.severity,
+        "code": d.code,
+        "source": d.source,
+        "message": d.message,
+    })
+}
 
 fn is_section_header(line: &str) -> bool {
     // Section headers live at column 0; any leading whitespace disqualifies.
@@ -801,7 +833,42 @@ impl HaproxyLsp {
             folds: HashMap::new(),
             outline: HashMap::new(),
             documents: HashMap::new(),
+            diagnostics: HashMap::new(),
+            pending_notifications: Vec::new(),
         })
+    }
+
+    // Queue a JSON-RPC notification. The main loop drains the queue after the
+    // current request handler returns, so the framed write to stdout is
+    // serialized with the (at most one) response for that request.
+    fn send_notification(&mut self, method: &str, params: Value) {
+        self.pending_notifications.push(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }));
+    }
+
+    fn drain_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending_notifications)
+    }
+
+    // Build the diagnostics set for `uri` and publish it. Called at the tail
+    // of `parse_document` after the per-URI caches are committed, so rule
+    // handlers can rely on `self.symbols[uri]` / `self.documents[uri]`.
+    // Task 1 lays the plumbing with an empty ruleset; Tasks 2 and 3 add
+    // undefined-reference, unused-symbol, and structural rules.
+    fn collect_diagnostics(&mut self, uri: &str) {
+        let diags: Vec<Diagnostic> = Vec::new();
+        let diags_json: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
+        self.diagnostics.insert(uri.to_string(), diags);
+        self.send_notification(
+            "textDocument/publishDiagnostics",
+            json!({
+                "uri": uri,
+                "diagnostics": diags_json,
+            }),
+        );
     }
 
     fn parse_document(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1112,6 +1179,9 @@ impl HaproxyLsp {
         self.folds.insert(uri.to_string(), folds);
         self.outline.insert(uri.to_string(), outline);
         self.documents.insert(uri.to_string(), content.to_string());
+        // Always publish diagnostics (possibly empty) so stale marks clear on
+        // the client even when the file is now clean.
+        self.collect_diagnostics(uri);
         Ok(())
     }
 
@@ -2280,6 +2350,13 @@ impl HaproxyLsp {
                     self.folds.remove(uri);
                     self.outline.remove(uri);
                     self.documents.remove(uri);
+                    self.diagnostics.remove(uri);
+                    // Clear any stale diagnostics the client may still show.
+                    let uri_owned = uri.to_string();
+                    self.send_notification(
+                        "textDocument/publishDiagnostics",
+                        json!({ "uri": uri_owned, "diagnostics": [] }),
+                    );
                 }
                 None
             }
@@ -3117,12 +3194,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Parse JSON-RPC request
         if let Ok(request) = serde_json::from_str::<Value>(&content) {
-            if let Some(response) = lsp.handle_request(request) {
+            let response = lsp.handle_request(request);
+            if let Some(response) = response {
                 let response_str = serde_json::to_string(&response)?;
                 let response_len = response_str.len();
 
                 // Write LSP response with headers
                 write!(stdout, "Content-Length: {}\r\n\r\n{}", response_len, response_str)?;
+                stdout.flush()?;
+            }
+            // Drain any notifications queued by the handler (e.g.
+            // `textDocument/publishDiagnostics` emitted from `parse_document`).
+            // Written after the response so request/response ordering stays
+            // intact; stdout is single-writer so framing is never interleaved.
+            for notification in lsp.drain_notifications() {
+                let msg = serde_json::to_string(&notification)?;
+                let msg_len = msg.len();
+                write!(stdout, "Content-Length: {}\r\n\r\n{}", msg_len, msg)?;
                 stdout.flush()?;
             }
         }
