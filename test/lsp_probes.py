@@ -1927,12 +1927,55 @@ def run_completion_probes(client: LspClient, results: Results):
         )
 
 
+DIAGNOSTICS_PROBES: list[dict] = [
+    # Task 2: undefined-reference errors against test/haproxy.conf fixtures
+    # appended below the `# --- regression: undefined-reference diagnostics` marker.
+    # Range tuple: (line, start_char, end_char). Severity 1 = Error.
+    {
+        "desc": "conf: undefined-backend on `use_backend diag_missing_backend`",
+        "code": "undefined-backend",
+        "severity": 1,
+        "range": (181, 14, 181, 34),
+        "message_contains": "diag_missing_backend",
+    },
+    {
+        "desc": "conf: undefined-backend on `default_backend diag_missing_backend2`",
+        "code": "undefined-backend",
+        "severity": 1,
+        "range": (182, 18, 182, 39),
+        "message_contains": "diag_missing_backend2",
+    },
+    {
+        "desc": "conf: undefined-acl on `if diag_missing_acl`",
+        "code": "undefined-acl",
+        "severity": 1,
+        "range": (183, 33, 183, 49),
+        "message_contains": "diag_missing_acl",
+    },
+    {
+        "desc": "conf: undefined-server on `use_server diag_missing_srv`",
+        "code": "undefined-server",
+        "severity": 1,
+        "range": (188, 13, 188, 29),
+        "message_contains": "diag_missing_srv",
+    },
+]
+
+
+def _diag_range_tuple(diag: dict) -> tuple:
+    r = diag.get("range") or {}
+    s = r.get("start") or {}
+    e = r.get("end") or {}
+    return (s.get("line"), s.get("character"), e.get("line"), e.get("character"))
+
+
 def run_diagnostics_probes(client: LspClient, results: Results):
     """Drive `textDocument/publishDiagnostics` and assert observed payloads.
 
-    Task 1 baseline: every clean file must publish an empty diagnostics
-    array so stale marks clear on the client. Tasks 2 and 3 will extend
-    this with undefined-reference, unused-symbol, and structural probes.
+    Task 1 baseline: every clean file publishes an empty diagnostics array.
+    Task 2 adds undefined-reference assertions against test/haproxy.conf
+    — each probe matches by (code, severity, range, message substring).
+    Task 3 will extend this with unused-symbol and structural probes.
     """
     # Use an inline minimal config so this probe stays stable even as the
     # on-disk fixtures gain intentionally-broken lines in later tasks.
@@ -1963,6 +2006,74 @@ def run_diagnostics_probes(client: LspClient, results: Results):
     ok = diags == []
     detail = "empty array as expected" if ok else f"unexpected diagnostics: {diags!r}"
     results.record("diagnostics", "clean file publishes empty array", ok, detail)
+
+    # Task 2: fixture-driven undefined-reference probes.
+    if not DIAGNOSTICS_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record(
+            "diagnostics", "fixture present", False, f"missing: {HAPROXY_CONF}"
+        )
+        return
+
+    conf_uri = path_to_uri(HAPROXY_CONF)
+    prev_version = client.diagnostics_version(conf_uri)
+    client.did_open(conf_uri, HAPROXY_CONF.read_text())
+    try:
+        conf_diags = client.wait_for_diagnostics(conf_uri, min_version=prev_version + 1)
+    except TimeoutError as exc:
+        results.record("diagnostics", "conf fixture publish", False, str(exc))
+        return
+
+    for probe in DIAGNOSTICS_PROBES:
+        expected_range = probe["range"]
+        match = None
+        for d in conf_diags:
+            if d.get("code") != probe["code"]:
+                continue
+            if d.get("severity") != probe["severity"]:
+                continue
+            if _diag_range_tuple(d) != expected_range:
+                continue
+            if "message_contains" in probe:
+                msg = d.get("message") or ""
+                if probe["message_contains"] not in msg:
+                    continue
+            match = d
+            break
+
+        if match is not None:
+            src = match.get("source")
+            ok = src == "haproxy-lsp"
+            detail = (
+                f"matched code={probe['code']} range={expected_range} source={src!r}"
+                if ok
+                else f"matched but source={src!r} (expected 'haproxy-lsp')"
+            )
+            results.record("diagnostics", probe["desc"], ok, detail)
+        else:
+            candidates = [
+                (d.get("code"), _diag_range_tuple(d)) for d in conf_diags
+            ]
+            results.record(
+                "diagnostics",
+                probe["desc"],
+                False,
+                f"no match for code={probe['code']} range={expected_range}; got {candidates}",
+            )
+
+    # Assert `TRUE` built-in ACL (line 188) is NOT flagged as undefined-acl.
+    true_flagged = any(
+        d.get("code") == "undefined-acl"
+        and (d.get("range") or {}).get("start", {}).get("line") == 188
+        for d in conf_diags
+    )
+    results.record(
+        "diagnostics",
+        "conf: built-in `TRUE` ACL is not flagged as undefined",
+        not true_flagged,
+        "not flagged" if not true_flagged else "unexpectedly flagged",
+    )
 
 
 def run_declaration_probes(client: LspClient, results: Results):

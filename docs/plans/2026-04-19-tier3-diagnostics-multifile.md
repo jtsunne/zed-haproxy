@@ -57,11 +57,11 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 - Modify: `test/haproxy.conf`
 - Modify: `test/lsp_probes.py`
 
-- [ ] implement diagnostic rules for undefined references: `use_backend X` / `default_backend X` where `X` is not a backend; `if X` / `unless X` where `X` is not a defined ACL (skip ACL expression keywords like `{`, `||`, `&&`); `use_server X` where `X` is not a server in the enclosing backend
-- [ ] each diagnostic: `severity: 1` (Error), `source: "haproxy-lsp"`, `code: "undefined-backend" | "undefined-acl" | "undefined-server"`, precise range on the identifier token
-- [ ] add fixture lines to `test/haproxy.conf` (inside a comment-guarded block) exercising all three undefined cases
-- [ ] add `DIAGNOSTICS_PROBES` entries asserting each undefined-ref diagnostic is emitted with correct code, severity, and range
-- [ ] run `./build.sh && python3 test/lsp_probes.py` — new probes pass, prior probes unchanged
+- [x] implement diagnostic rules for undefined references: `use_backend X` / `default_backend X` where `X` is not a backend; `if X` / `unless X` where `X` is not a defined ACL (skip ACL expression keywords like `{`, `||`, `&&`); `use_server X` where `X` is not a server in the enclosing backend
+- [x] each diagnostic: `severity: 1` (Error), `source: "haproxy-lsp"`, `code: "undefined-backend" | "undefined-acl" | "undefined-server"`, precise range on the identifier token
+- [x] add fixture lines to `test/haproxy.conf` (inside a comment-guarded block) exercising all three undefined cases
+- [x] add `DIAGNOSTICS_PROBES` entries asserting each undefined-ref diagnostic is emitted with correct code, severity, and range
+- [x] run `./build.sh && python3 test/lsp_probes.py` — new probes pass, prior probes unchanged
 
 ### Task 3: Unused-symbol and duplicate/structural diagnostics (warnings + errors)
 

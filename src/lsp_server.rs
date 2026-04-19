@@ -402,6 +402,257 @@ fn ref_context_has_precise_position(ctx: &ReferenceContext) -> bool {
     matches!(ctx, ReferenceContext::StickTable)
 }
 
+/// HAProxy built-in anonymous ACL keywords. These are not user-defined ACLs
+/// and therefore must not trigger `undefined-acl` diagnostics when referenced
+/// in an `if` / `unless` condition. List mirrors the HAProxy docs "ACL anchors
+/// and terminators" table plus the handful of anonymous predefined ACLs
+/// (`TRUE`, `FALSE`) widely used in production configs.
+const BUILTIN_ACL_NAMES: &[&str] = &[
+    "FALSE",
+    "TRUE",
+    "HTTP",
+    "HTTP_1.0",
+    "HTTP_1.1",
+    "HTTP_CONTENT",
+    "HTTP_URL_ABSOLUTE",
+    "HTTP_URL_SLASH",
+    "HTTP_URL_STAR",
+    "LOCALHOST",
+    "METH_CONNECT",
+    "METH_DELETE",
+    "METH_GET",
+    "METH_HEAD",
+    "METH_OPTIONS",
+    "METH_POST",
+    "METH_PUT",
+    "METH_TRACE",
+    "RDP_COOKIE",
+    "REQ_CONTENT",
+    "WAIT_END",
+];
+
+/// For a directive line whose first non-whitespace token is `keyword`, locate
+/// the immediate argument token and return `(name, start_col, end_col)` in
+/// byte offsets (which equal LSP character offsets for ASCII identifiers).
+/// Returns `None` when the keyword is absent, not at line start, or when the
+/// argument is missing / not a valid HAProxy identifier.
+fn find_leading_directive_arg(line: &str, keyword: &str) -> Option<(String, u32, u32)> {
+    let trimmed_start = line.len() - line.trim_start().len();
+    let after_ws = &line[trimmed_start..];
+    let rest = after_ws.strip_prefix(keyword)?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut i = trimmed_start + keyword.len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    let name = &line[start..i];
+    if !is_valid_identifier(name) {
+        return None;
+    }
+    Some((name.to_string(), start as u32, i as u32))
+}
+
+/// Scan `content` for references to symbols that aren't defined in
+/// `symbols`. Emits three diagnostic rules (severity `Error`):
+///
+///   - `undefined-backend` on `use_backend NAME [...]` and `default_backend
+///     NAME` where `NAME` is not a `Backend` symbol.
+///   - `undefined-acl` on `... if NAME` / `... unless NAME` where `NAME` is
+///     neither an ACL definition in this file nor a HAProxy built-in
+///     (`TRUE`, `FALSE`, `METH_GET`, ...).
+///   - `undefined-server` on `use_server NAME [...]` where `NAME` is not a
+///     `Server` symbol inside the enclosing backend/listen section. Server
+///     identity is section-scoped, so a `server` of the same name in an
+///     unrelated section does not silence the diagnostic.
+///
+/// Scope is tracked by walking section headers with `is_section_header`;
+/// comments and the section header line itself are skipped so a
+/// `# use_backend foo` sample config line doesn't trip rule #1.
+fn undefined_reference_diagnostics(content: &str, symbols: &[Symbol]) -> Vec<Diagnostic> {
+    use std::collections::HashSet;
+
+    let backend_names: HashSet<&str> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Backend)
+        .map(|s| s.name.as_str())
+        .collect();
+    let acl_names: HashSet<&str> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Acl)
+        .map(|s| s.name.as_str())
+        .collect();
+    let builtin_acls: HashSet<&str> = BUILTIN_ACL_NAMES.iter().copied().collect();
+    let mut servers_by_scope: HashMap<String, HashSet<&str>> = HashMap::new();
+    for s in symbols {
+        if s.kind == SymbolKind::Server {
+            if let Some(scope) = &s.scope {
+                servers_by_scope
+                    .entry(scope.clone())
+                    .or_default()
+                    .insert(s.name.as_str());
+            }
+        }
+    }
+
+    let mut diags = Vec::new();
+    let mut current_section: Option<String> = None;
+    for (line_num, raw_line) in content.lines().enumerate() {
+        let is_section = is_section_header(raw_line);
+        let trimmed = raw_line.trim();
+        let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+        if is_section {
+            match first_tok {
+                "backend" | "frontend" | "listen" | "peers" => {
+                    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                    current_section = tokens.get(1).map(|s| s.to_string());
+                }
+                "global" | "defaults" | "resolvers" | "userlist" | "mailers"
+                | "cache" | "program" | "ring" => {
+                    current_section = None;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        // Undefined backend: `use_backend NAME` and `default_backend NAME`.
+        for keyword in &["use_backend", "default_backend"] {
+            if let Some((name, start, end)) = find_leading_directive_arg(raw_line, keyword) {
+                if !backend_names.contains(name.as_str()) {
+                    diags.push(Diagnostic {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: start },
+                            end: Position { line: line_num as u32, character: end },
+                        },
+                        severity: 1,
+                        code: "undefined-backend",
+                        source: "haproxy-lsp",
+                        message: format!("Undefined backend: {}", name),
+                    });
+                }
+            }
+        }
+
+        // Undefined server: `use_server NAME` inside a backend/listen section.
+        if let Some((name, start, end)) = find_leading_directive_arg(raw_line, "use_server") {
+            let known = current_section
+                .as_ref()
+                .and_then(|s| servers_by_scope.get(s))
+                .map(|set| set.contains(name.as_str()))
+                .unwrap_or(false);
+            if !known {
+                diags.push(Diagnostic {
+                    range: Range {
+                        start: Position { line: line_num as u32, character: start },
+                        end: Position { line: line_num as u32, character: end },
+                    },
+                    severity: 1,
+                    code: "undefined-server",
+                    source: "haproxy-lsp",
+                    message: format!("Undefined server: {}", name),
+                });
+            }
+        }
+
+        // Undefined ACL: tokens in ` if ` / ` unless ` conditions that are
+        // neither user-defined ACLs in this file nor HAProxy built-ins.
+        for keyword in &["if", "unless"] {
+            for (name, start, end) in collect_acl_ref_positions(raw_line, keyword) {
+                if acl_names.contains(name.as_str())
+                    || builtin_acls.contains(name.as_str())
+                {
+                    continue;
+                }
+                diags.push(Diagnostic {
+                    range: Range {
+                        start: Position { line: line_num as u32, character: start },
+                        end: Position { line: line_num as u32, character: end },
+                    },
+                    severity: 1,
+                    code: "undefined-acl",
+                    source: "haproxy-lsp",
+                    message: format!("Undefined ACL: {}", name),
+                });
+            }
+        }
+    }
+
+    diags
+}
+
+/// Collect ACL identifier references on a line under an `if` / `unless`
+/// condition, with precise column ranges for each occurrence. Mirrors the
+/// token-filtering semantics of `extract_acl_names_from_condition`
+/// (brace-wrapped sample expressions skipped, operators `!` / `&&` / `||`
+/// dropped, leading `!` negation stripped) but preserves positions for
+/// diagnostic range reporting.
+fn collect_acl_ref_positions(line: &str, keyword: &str) -> Vec<(String, u32, u32)> {
+    let pattern = format!(" {} ", keyword);
+    let cond_start = match line.find(&pattern) {
+        Some(i) => i + pattern.len(),
+        None => return Vec::new(),
+    };
+    let cond_slice = strip_inline_comment(&line[cond_start..]);
+    let cond_end = cond_start + cond_slice.len();
+
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut brace_depth: u32 = 0;
+    let mut i = cond_start;
+    while i < cond_end {
+        while i < cond_end && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= cond_end {
+            break;
+        }
+        let tok_start = i;
+        while i < cond_end && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let tok_end = i;
+        let tok = &line[tok_start..tok_end];
+        if tok == "{" || tok == "!{" {
+            brace_depth += 1;
+            continue;
+        }
+        if tok == "}" {
+            brace_depth = brace_depth.saturating_sub(1);
+            continue;
+        }
+        if brace_depth > 0 {
+            continue;
+        }
+        if tok == "||" || tok == "&&" || tok == "!" {
+            continue;
+        }
+        let (name_start, name) = if let Some(stripped) = tok.strip_prefix('!') {
+            (tok_start + 1, stripped)
+        } else {
+            (tok_start, tok)
+        };
+        if name.is_empty() || !is_valid_identifier(name) {
+            continue;
+        }
+        out.push((name.to_string(), name_start as u32, tok_end as u32));
+    }
+    out
+}
+
 /// Byte offset just past the reference-context keyword on a reference line.
 /// For contexts without a fixed leading keyword (server references) the
 /// search starts at the first non-whitespace column, relying on the
@@ -856,10 +1107,16 @@ impl HaproxyLsp {
     // Build the diagnostics set for `uri` and publish it. Called at the tail
     // of `parse_document` after the per-URI caches are committed, so rule
     // handlers can rely on `self.symbols[uri]` / `self.documents[uri]`.
-    // Task 1 lays the plumbing with an empty ruleset; Tasks 2 and 3 add
-    // undefined-reference, unused-symbol, and structural rules.
+    // Task 2 adds undefined-reference rules; Task 3 will add unused-symbol
+    // and structural rules.
     fn collect_diagnostics(&mut self, uri: &str) {
-        let diags: Vec<Diagnostic> = Vec::new();
+        let mut diags: Vec<Diagnostic> = Vec::new();
+        if let (Some(content), Some(symbols)) = (
+            self.documents.get(uri).cloned(),
+            self.symbols.get(uri).cloned(),
+        ) {
+            diags.extend(undefined_reference_diagnostics(&content, &symbols));
+        }
         let diags_json: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
         self.diagnostics.insert(uri.to_string(), diags);
         self.send_notification(
