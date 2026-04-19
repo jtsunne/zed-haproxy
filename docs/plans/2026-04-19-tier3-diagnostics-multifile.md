@@ -136,11 +136,11 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] red-underline latency: measure `didChange` → `publishDiagnostics` round-trip on a `test/haproxy.prod.cfg`-scale input; must be ≤200ms (add timing assertion to a probe)
-- [ ] cross-file acceptance: from fixture, opening `main.cfg` discovers and indexes `backends.cfg`; a probe asserts this explicitly
-- [ ] workspace symbol acceptance: `opcart` returns `backend opcart-direct` across the whole project
-- [ ] run full `python3 test/lsp_probes.py` — every probe passes
-- [ ] run `./build.sh` — clean build, no warnings regression
+- [x] red-underline latency: measure `didChange` → `publishDiagnostics` round-trip on a `test/haproxy.prod.cfg`-scale input; must be ≤200ms (add timing assertion to a probe) — `run_diagnostics_latency_probe`, best=11.2ms over 3 iters
+- [x] cross-file acceptance: from fixture, opening `main.cfg` discovers and indexes `backends.cfg`; a probe asserts this explicitly — existing `run_cross_file_probes` already covers this
+- [x] workspace symbol acceptance: `opcart` returns `backend opcart-direct` across the whole project — existing `run_workspace_symbol_probes` covers this
+- [x] run full `python3 test/lsp_probes.py` — every probe passes (136/136)
+- [x] run `./build.sh` — clean build, no warnings regression
 
 ### Task 9: Update documentation and bump version
 

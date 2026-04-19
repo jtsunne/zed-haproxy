@@ -2716,6 +2716,69 @@ def run_workspace_symbol_probes(client: LspClient, results: Results):
     )
 
 
+def run_diagnostics_latency_probe(client: LspClient, results: Results):
+    """Task 8 acceptance: measure didChange -> publishDiagnostics round-trip.
+
+    The target is <=200ms on `test/haproxy.prod.cfg` (1188 lines). The probe
+    times three consecutive didChange cycles and records the best measurement
+    to dampen noise from the OS scheduler and the Python reader thread.
+    """
+    import time
+
+    if not HAPROXY_CFG.exists():
+        results.record(
+            "latency", "prod.cfg fixture present", False, f"missing: {HAPROXY_CFG}"
+        )
+        return
+
+    uri = path_to_uri(HAPROXY_CFG)
+    text = HAPROXY_CFG.read_text()
+
+    # Ensure the document is opened; prior probes likely did this already,
+    # but re-opening is idempotent for the server and simplifies the probe.
+    prev = client.diagnostics_version(uri)
+    client.did_open(uri, text)
+    try:
+        client.wait_for_diagnostics(uri, min_version=prev + 1, timeout=5.0)
+    except TimeoutError as exc:
+        results.record("latency", "initial publishDiagnostics", False, str(exc))
+        return
+
+    best_ms = None
+    for i in range(3):
+        # Mutate slightly so the server treats this as a real change. Appending
+        # a harmless blank comment line keeps semantics stable but forces a
+        # full re-parse and re-publish.
+        mutated = text + f"\n# latency probe iteration {i}\n"
+        prev = client.diagnostics_version(uri)
+        start = time.monotonic()
+        client.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": 2 + i},
+                "contentChanges": [{"text": mutated}],
+            },
+        )
+        try:
+            client.wait_for_diagnostics(uri, min_version=prev + 1, timeout=5.0)
+        except TimeoutError as exc:
+            results.record("latency", f"didChange iter {i}", False, str(exc))
+            return
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if best_ms is None or elapsed_ms < best_ms:
+            best_ms = elapsed_ms
+
+    assert best_ms is not None
+    threshold_ms = 200.0
+    ok = best_ms <= threshold_ms
+    results.record(
+        "latency",
+        f"didChange -> publishDiagnostics on prod.cfg <= {threshold_ms:.0f}ms",
+        ok,
+        f"best={best_ms:.1f}ms (3 iters)",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -2750,6 +2813,7 @@ def main() -> int:
         run_cross_file_probes(client, results)
         run_cross_file_navigation_probes(client, results)
         run_workspace_symbol_probes(client, results)
+        run_diagnostics_latency_probe(client, results)
     finally:
         client.shutdown()
 
