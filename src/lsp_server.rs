@@ -11,6 +11,12 @@ struct Symbol {
     range: Range,
     uri: String,
     references: Vec<Reference>,
+    // Enclosing section name for symbols whose identity is scoped to a
+    // section body (currently: `Server`). Two backends may both declare a
+    // `server web1`, and these are distinct entities — name matching alone
+    // would cross-link them. `None` means global identity (sections, ACLs,
+    // stick-tables).
+    scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,9 +24,14 @@ struct Reference {
     range: Range,
     uri: String,
     context: ReferenceContext,
+    // Enclosing section name for references whose target resolution depends
+    // on the call site's section (currently: `UseServer`). A `use_server
+    // web1` line in backend A refers to that backend's `web1`, not to any
+    // other backend's same-named server.
+    scope: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReferenceContext {
     UseBackend,
     DefaultBackend,
@@ -208,8 +219,14 @@ fn compute_folds(content: &str) -> Vec<FoldingRange> {
 ///
 /// Caller is expected to have trimmed leading whitespace and skipped comment
 /// lines so `#`-commented example text does not contribute references.
-fn collect_stick_table_references(line: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// Collect every stick-table reference on a line along with the byte offset
+/// of the table identifier. Callers persist the offset into
+/// `Reference.range.start.character` so later narrowing passes anchor directly
+/// on the call-site rather than scanning from column 0 (which would latch onto
+/// an unrelated same-name identifier appearing earlier on the line, e.g. an
+/// ACL `foo` preceding `sc0_http_req_rate(foo)`).
+fn collect_stick_table_references(line: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
     let bytes = line.as_bytes();
 
     // sc<digit>_<ident>(<first_arg>, ...)
@@ -234,10 +251,13 @@ fn collect_stick_table_references(line: &str) -> Vec<String> {
                     if !fn_slice.chars().any(char::is_whitespace) {
                         if let Some(close_rel) = line[paren_abs..].find(')') {
                             let close_abs = paren_abs + close_rel;
-                            let inside = &line[paren_abs + 1..close_abs];
-                            let first_arg = inside.split(',').next().unwrap_or("").trim();
+                            let inside_start = paren_abs + 1;
+                            let inside = &line[inside_start..close_abs];
+                            let first_arg_raw = inside.split(',').next().unwrap_or("");
+                            let lead_ws = first_arg_raw.len() - first_arg_raw.trim_start().len();
+                            let first_arg = first_arg_raw.trim();
                             if !first_arg.is_empty() && is_valid_identifier(first_arg) {
-                                out.push(first_arg.to_string());
+                                out.push((first_arg.to_string(), inside_start + lead_ws));
                             }
                             i = close_abs + 1;
                             continue;
@@ -249,23 +269,13 @@ fn collect_stick_table_references(line: &str) -> Vec<String> {
         i += 1;
     }
 
-    // `stick match X`, `stick store-request X`, `stick store-response X`.
-    // Note: per the plan, the token after `match`/`store-*` is treated as the
-    // table name. In real HAProxy configs this token is usually a sample
-    // expression (e.g. `src`), not a table — the explicit `table <name>`
-    // clause is what carries the name. Spurious names get filtered by the
-    // existence check in `add_reference_to_symbol`.
-    if let Some(rest) = line.strip_prefix("stick ") {
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let kw = parts[0];
-            if matches!(kw, "match" | "store-request" | "store-response") {
-                if is_valid_identifier(parts[1]) {
-                    out.push(parts[1].to_string());
-                }
-            }
-        }
-    }
+    // `stick match <sample> [table <tbl>]`, `stick store-request <sample> [table <tbl>]`,
+    // `stick store-response <sample> [table <tbl>]`. The token immediately
+    // after `match`/`store-*` is a sample expression (e.g. `src`), NOT the
+    // table name — per HAProxy's grammar the table is carried by the optional
+    // `table <name>` clause, handled below. Misparsing the sample as a table
+    // name produces false references whenever a table happens to share the
+    // name of a sample fetch (e.g. a table called `src`).
 
     // Generic ` table <name>` anywhere on the line.
     let mut search_from = 0usize;
@@ -274,7 +284,7 @@ fn collect_stick_table_references(line: &str) -> Vec<String> {
         let tail = &line[abs..];
         if let Some(name) = tail.split_whitespace().next() {
             if is_valid_identifier(name) {
-                out.push(name.to_string());
+                out.push((name.to_string(), abs));
             }
         }
         search_from = abs;
@@ -351,14 +361,26 @@ fn def_line_search_from(line: &str, kind: &SymbolKind) -> Option<usize> {
     Some(trimmed_start + skip.len())
 }
 
+/// Whether a reference context carries its own exact per-reference column.
+/// When true, callers should use the stored position directly and bypass the
+/// per-`(line, context)` floor that handles multi-occurrence disambiguation —
+/// the floor is only needed for contexts where every reference on a shared
+/// line currently anchors at column 0 (ACL chains, etc.).
+fn ref_context_has_precise_position(ctx: &ReferenceContext) -> bool {
+    matches!(ctx, ReferenceContext::StickTable)
+}
+
 /// Byte offset just past the reference-context keyword on a reference line.
-/// For contexts without a fixed leading keyword (server references,
-/// stick-table references) the search starts at the first non-whitespace
-/// column, relying on the word-bounded match in `find_identifier_range` to
-/// skip stray substring hits.
-fn ref_line_search_from(line: &str, ctx: &ReferenceContext) -> usize {
+/// For contexts without a fixed leading keyword (server references) the
+/// search starts at the first non-whitespace column, relying on the
+/// word-bounded match in `find_identifier_range` to skip stray substring
+/// hits. For stick-table references the offset comes from the reference's
+/// own stored column — a stick-table call-site can appear at any position on
+/// a line (e.g. after an ACL condition `if foo { sc0_*(foo) gt 10 }`), so
+/// scanning from column 0 would latch onto the unrelated identifier first.
+fn ref_line_search_from(line: &str, reference: &Reference) -> usize {
     let trimmed_start = line.len() - line.trim_start().len();
-    match ctx {
+    match reference.context {
         ReferenceContext::UseBackend => line
             .find("use_backend")
             .map(|p| p + "use_backend".len())
@@ -379,7 +401,7 @@ fn ref_line_search_from(line: &str, ctx: &ReferenceContext) -> usize {
             .find(" unless ")
             .map(|p| p + " unless ".len())
             .unwrap_or(trimmed_start),
-        ReferenceContext::StickTable => trimmed_start,
+        ReferenceContext::StickTable => reference.range.start.character as usize,
     }
 }
 
@@ -834,6 +856,7 @@ impl HaproxyLsp {
                         },
                         uri: uri.to_string(),
                         references: Vec::new(),
+                        scope: None,
                     });
                 }
             }
@@ -850,6 +873,7 @@ impl HaproxyLsp {
                         },
                         uri: uri.to_string(),
                         references: Vec::new(),
+                        scope: None,
                     });
                 }
             }
@@ -869,6 +893,7 @@ impl HaproxyLsp {
                         },
                         uri: uri.to_string(),
                         references: Vec::new(),
+                        scope: None,
                     });
                 }
             }
@@ -886,10 +911,13 @@ impl HaproxyLsp {
                         },
                         uri: uri.to_string(),
                         references: Vec::new(),
+                        scope: None,
                     });
                 }
             }
-            // Parse server definitions
+            // Parse server definitions. Servers are scoped to the enclosing
+            // backend/listen section — two sections may declare the same
+            // server name, and those are distinct entities.
             else if line.trim_start().starts_with("server ") {
                 let parts: Vec<&str> = line.trim_start().split_whitespace().collect();
                 if parts.len() >= 2 {
@@ -903,6 +931,7 @@ impl HaproxyLsp {
                         },
                         uri: uri.to_string(),
                         references: Vec::new(),
+                        scope: current_section_name.clone(),
                     });
                 }
             }
@@ -921,15 +950,37 @@ impl HaproxyLsp {
                         },
                         uri: uri.to_string(),
                         references: Vec::new(),
+                        scope: None,
                     });
                 }
             }
         }
         
-        // Second pass: collect references to symbols
+        // Second pass: collect references to symbols. Track the enclosing
+        // section name on this pass too so scoped references (currently
+        // `use_server`) can be resolved against the correct server definition
+        // even when two backends share a server name.
         let mut updated_symbols = symbols;
-        for (line_num, line) in content.lines().enumerate() {
-            let line = line.trim();
+        let mut ref_section_name: Option<String> = None;
+        for (line_num, raw_line) in content.lines().enumerate() {
+            let is_section_line = is_section_header(raw_line);
+            let trimmed = raw_line.trim();
+            let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+            if is_section_line {
+                match first_tok {
+                    "backend" | "frontend" | "listen" | "peers" => {
+                        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                        ref_section_name = tokens.get(1).map(|s| s.to_string());
+                    }
+                    "global" | "defaults" | "resolvers" | "userlist"
+                    | "mailers" | "cache" | "program" | "ring" => {
+                        ref_section_name = None;
+                    }
+                    _ => {}
+                }
+            }
+
+            let line = trimmed;
 
             // Skip comment lines so commented-out sample config doesn't
             // produce phantom references (which would inflate reference
@@ -941,7 +992,7 @@ impl HaproxyLsp {
             // Collect backend references
             if line.contains("use_backend") {
                 if let Some(backend_name) = self.extract_backend_from_use_backend(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend, 
+                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend,
                                               Reference {
                                                   range: Range {
                                                       start: Position { line: line_num as u32, character: 0 },
@@ -949,10 +1000,11 @@ impl HaproxyLsp {
                                                   },
                                                   uri: uri.to_string(),
                                                   context: ReferenceContext::UseBackend,
+                                                  scope: None,
                                               });
                 }
             }
-            
+
             if line.contains("default_backend") {
                 if let Some(backend_name) = self.extract_backend_from_default_backend(line) {
                     self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend,
@@ -963,6 +1015,7 @@ impl HaproxyLsp {
                                                   },
                                                   uri: uri.to_string(),
                                                   context: ReferenceContext::DefaultBackend,
+                                                  scope: None,
                                               });
                 }
             }
@@ -970,7 +1023,11 @@ impl HaproxyLsp {
             // Collect server references from `use_server NAME [if ACL]`.
             // Required for rename: Tier 2 lists servers as renameable, and
             // without this the definition line is rewritten but every call
-            // site is left stale, silently breaking the config.
+            // site is left stale, silently breaking the config. The
+            // reference carries the enclosing section as its scope so that
+            // `add_reference_to_symbol` attaches it only to the matching
+            // `server` definition in the SAME section — two backends that
+            // both define a `server shared` stay independent.
             if line.starts_with("use_server ") {
                 if let Some(server_name) = self.extract_server_from_use_server(line) {
                     self.add_reference_to_symbol(&mut updated_symbols, &server_name, SymbolKind::Server,
@@ -981,10 +1038,11 @@ impl HaproxyLsp {
                                                   },
                                                   uri: uri.to_string(),
                                                   context: ReferenceContext::UseServer,
+                                                  scope: ref_section_name.clone(),
                                               });
                 }
             }
-            
+
             // Collect ACL references
             if line.contains(" if ") {
                 if let Some(acl_names) = self.extract_acl_names_from_condition(line, "if") {
@@ -997,11 +1055,12 @@ impl HaproxyLsp {
                                                       },
                                                       uri: uri.to_string(),
                                                       context: ReferenceContext::AclCondition,
+                                                      scope: None,
                                                   });
                     }
                 }
             }
-            
+
             if line.contains(" unless ") {
                 if let Some(acl_names) = self.extract_acl_names_from_condition(line, "unless") {
                     for acl_name in acl_names {
@@ -1013,6 +1072,7 @@ impl HaproxyLsp {
                                                       },
                                                       uri: uri.to_string(),
                                                       context: ReferenceContext::AclUnlessCondition,
+                                                      scope: None,
                                                   });
                     }
                 }
@@ -1024,18 +1084,20 @@ impl HaproxyLsp {
             // on rename).
             let line_no_comment = strip_inline_comment(line);
             let stick_refs = collect_stick_table_references(line_no_comment);
-            for table_name in stick_refs {
+            for (table_name, start_col) in stick_refs {
+                let end_col = start_col + table_name.len();
                 self.add_reference_to_symbol(
                     &mut updated_symbols,
                     &table_name,
                     SymbolKind::StickTable,
                     Reference {
                         range: Range {
-                            start: Position { line: line_num as u32, character: 0 },
-                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                            start: Position { line: line_num as u32, character: start_col as u32 },
+                            end: Position { line: line_num as u32, character: end_col as u32 },
                         },
                         uri: uri.to_string(),
                         context: ReferenceContext::StickTable,
+                        scope: None,
                     },
                 );
             }
@@ -1114,18 +1176,10 @@ impl HaproxyLsp {
                 return self.find_symbol_by_name(uri, &word, SymbolKind::StickTable);
             }
         }
-        // Case C: `stick match <word>`, `stick store-request <word>`,
-        // `stick store-response <word>`. The plan treats the first positional
-        // token after these keywords as the stick-table name.
-        if prefix_tokens.len() >= 2 {
-            let last = prefix_tokens[prefix_tokens.len() - 1];
-            let prev = prefix_tokens[prefix_tokens.len() - 2];
-            if prev == "stick"
-                && matches!(last, "match" | "store-request" | "store-response")
-            {
-                return self.find_symbol_by_name(uri, &word, SymbolKind::StickTable);
-            }
-        }
+        // Note: we deliberately do NOT treat the first positional token after
+        // `stick match|store-request|store-response` as a stick-table name.
+        // Per HAProxy grammar that token is a sample expression; only the
+        // explicit `table <name>` clause (Case B above) carries the table.
 
         let kw_match = prefix_tokens.iter().enumerate().rev().find_map(|(idx, tok)| {
             match *tok {
@@ -1153,9 +1207,72 @@ impl HaproxyLsp {
             if !is_condition_kw && kw_idx + 1 != prefix_tokens.len() {
                 return None;
             }
+            // Inside an `if`/`unless` condition the cursor word may live in a
+            // `{ ... }` sample expression — those tokens are fetch names
+            // (`src`, `sc0_*`, `hdr(...)`, ...) or literal arguments, never
+            // ACL references. Only standalone brace tokens flip depth;
+            // HAProxy grammar requires whitespace around `{` / `}`, so braces
+            // embedded in other tokens (regex literals like `^/foo\{$`, PCRE
+            // quantifiers like `\d{3,}`) are content and must not register.
+            if is_condition_kw {
+                let mut depth: i32 = 0;
+                for tok in &prefix_tokens[kw_idx + 1..] {
+                    if *tok == "{" || *tok == "!{" {
+                        depth += 1;
+                    } else if *tok == "}" && depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                if depth > 0 {
+                    return None;
+                }
+            }
+            // Servers are section-scoped: resolve against the server declared
+            // in the enclosing backend/listen so that `use_server shared` in
+            // backend A doesn't navigate to a same-named server in backend B.
+            if matches!(kind, SymbolKind::Server) {
+                let enclosing = self.enclosing_section_name(content, line_idx);
+                if let Some(scope) = enclosing.as_deref() {
+                    return self.find_symbol_by_name_scoped(
+                        uri,
+                        &word,
+                        SymbolKind::Server,
+                        Some(scope),
+                    );
+                }
+                return None;
+            }
+            // ACL duplicates: multiple `acl NAME ...` lines define the same
+            // ACL. When the cursor is on a definition line, prefer the
+            // definition on THAT line so hover / jump / rename don't claim
+            // the first duplicate as the canonical one.
+            if matches!(kind, SymbolKind::Acl)
+                && matches!(prefix_tokens.get(kw_idx).copied(), Some("acl"))
+            {
+                if let Some(sym) = self.find_acl_symbol_at_line(uri, &word, line_idx as u32) {
+                    return Some(sym);
+                }
+            }
             return self.find_symbol_by_name(uri, &word, kind);
         }
 
+        None
+    }
+
+    /// Find an ACL symbol with `name` whose definition line matches
+    /// `line_idx`. Used to disambiguate the cursor-on-duplicate-declaration
+    /// case so hover/rename key off the actual declaration the cursor sits
+    /// on rather than the first lexical match.
+    fn find_acl_symbol_at_line(&self, uri: &str, name: &str, line_idx: u32) -> Option<Symbol> {
+        let symbols = self.symbols.get(uri)?;
+        for sym in symbols {
+            if sym.kind == SymbolKind::Acl
+                && sym.name == name
+                && sym.range.start.line == line_idx
+            {
+                return Some(sym.clone());
+            }
+        }
         None
     }
     
@@ -1194,10 +1311,22 @@ impl HaproxyLsp {
         // same applies to any duplicated definition. Attach the reference to
         // every matching symbol so that resolving from any definition line
         // (or via name lookup) returns the full reference set.
+        //
+        // Server symbols are scoped to their enclosing section — a
+        // `use_server web1` inside backend A must only attach to backend A's
+        // `server web1`, never to a backend B that happens to define a server
+        // of the same name. Scope-aware matching preserves section identity.
         for symbol in symbols.iter_mut() {
-            if symbol.name == symbol_name && symbol.kind == symbol_kind {
-                symbol.references.push(reference.clone());
+            if symbol.name != symbol_name || symbol.kind != symbol_kind {
+                continue;
             }
+            if symbol_kind == SymbolKind::Server
+                && reference.scope.is_some()
+                && symbol.scope != reference.scope
+            {
+                continue;
+            }
+            symbol.references.push(reference.clone());
         }
     }
     
@@ -1208,25 +1337,48 @@ impl HaproxyLsp {
 
         // Strip trailing line comments so words after `#` aren't recorded as
         // spurious ACL references (e.g. `use_backend foo if bar # production`
-        // would otherwise register `production` as an ACL name).
-        let condition_part = condition_part.split('#').next().unwrap_or(condition_part);
+        // would otherwise register `production` as an ACL name). Use the
+        // whitespace-aware helper so `#` embedded inside a token (e.g. a regex
+        // literal `^/foo#bar$`) isn't mistaken for a comment start.
+        let condition_part = strip_inline_comment(condition_part);
 
-        // Simple parsing: split by whitespace and filter out operators and logical keywords
+        // Simple parsing: split by whitespace and filter out operators and logical keywords.
+        // Track brace depth so that tokens inside inline sample expressions
+        // (`{ src 10.0.0.0/8 }`, `{ sc0_http_req_rate(foo) gt 10 }`) are NOT
+        // recorded as ACL references — those tokens are sample-fetch names or
+        // literal values, not ACLs.
+        //
+        // HAProxy grammar requires whitespace around the `{` / `}` sample
+        // expression delimiters, so only standalone brace tokens (plus the
+        // shorthand `!{` negated-open form) count toward depth. Braces
+        // embedded inside other tokens are content — typically regex
+        // literals such as `^/foo\{$` or PCRE quantifiers `\d{3,}` — and
+        // must not flip depth, otherwise post-`}` ACL references are lost.
         let parts: Vec<&str> = condition_part.split_whitespace().collect();
         let mut acl_names = Vec::new();
+        let mut brace_depth: u32 = 0;
 
         for part in parts {
-            // Skip HAProxy operators and keywords.
+            // Standalone brace tokens adjust depth and are skipped.
+            if part == "{" || part == "!{" {
+                brace_depth += 1;
+                continue;
+            }
+            if part == "}" {
+                brace_depth = brace_depth.saturating_sub(1);
+                continue;
+            }
+            // Inside a sample expression — skip every token until the closing brace.
+            if brace_depth > 0 {
+                continue;
+            }
+            // Skip HAProxy operators and logical keywords.
             // Note: do NOT skip tokens that merely *start* with `!` — those are
             // negated ACL references (`if !foo.bar`) and must flow through to
             // the `trim_start_matches('!')` path below so the bare name is
             // recorded as a reference.
-            if part == "||" || part == "&&" || part == "!" || part == "{" {
+            if part == "||" || part == "&&" || part == "!" {
                 continue;
-            }
-            // Stop at opening brace or other control characters
-            if part.contains('{') {
-                break;
             }
             // Remove negation prefix and add ACL name.
             // Grammar permits `.` in identifiers (`[a-zA-Z0-9_.-]+`), so
@@ -1291,17 +1443,66 @@ impl HaproxyLsp {
     }
 
     fn find_symbol_by_name(&self, uri: &str, name: &str, kind: SymbolKind) -> Option<Symbol> {
+        self.find_symbol_by_name_scoped(uri, name, kind, None)
+    }
+
+    /// Scoped symbol lookup. When `scope` is `Some`, only symbols whose
+    /// `scope` matches are returned — used for Server resolution so that
+    /// `use_server shared` in backend A does not cross-navigate to
+    /// backend B's same-named server. When `scope` is `None`, the first
+    /// matching symbol is returned (legacy behaviour).
+    fn find_symbol_by_name_scoped(
+        &self,
+        uri: &str,
+        name: &str,
+        kind: SymbolKind,
+        scope: Option<&str>,
+    ) -> Option<Symbol> {
         // Single-file scope: only resolve against the requesting document so
         // that two open files with the same backend/acl name don't silently
         // cross-navigate.
-        if let Some(symbols) = self.symbols.get(uri) {
-            for symbol in symbols {
-                if symbol.name == name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&kind) {
-                    return Some(symbol.clone());
+        let symbols = self.symbols.get(uri)?;
+        for symbol in symbols {
+            if symbol.name != name
+                || std::mem::discriminant(&symbol.kind) != std::mem::discriminant(&kind)
+            {
+                continue;
+            }
+            if let Some(want) = scope {
+                match symbol.scope.as_deref() {
+                    Some(have) if have == want => return Some(symbol.clone()),
+                    _ => continue,
                 }
             }
+            return Some(symbol.clone());
         }
         None
+    }
+
+    /// Walk up from `line_idx` to the enclosing section header and return
+    /// the section's name token (e.g. backend/frontend/listen name). Returns
+    /// `None` when the cursor sits inside `global`/`defaults` or before any
+    /// named section.
+    fn enclosing_section_name(&self, content: &str, line_idx: usize) -> Option<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        if line_idx >= lines.len() {
+            return None;
+        }
+        let mut i = line_idx;
+        loop {
+            if is_section_header(lines[i]) {
+                let tokens: Vec<&str> = lines[i].split_whitespace().collect();
+                let kw = tokens.first().copied().unwrap_or("");
+                if matches!(kw, "backend" | "frontend" | "listen" | "peers") {
+                    return tokens.get(1).map(|s| s.to_string());
+                }
+                return None;
+            }
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+        }
     }
 
     fn find_declaration(&self, uri: &str, position: &Position, content: &str) -> Option<Vec<Reference>> {
@@ -1354,12 +1555,20 @@ impl HaproxyLsp {
             }
         }
 
-        // Check if this line defines a server
+        // Check if this line defines a server. Scope the lookup to the
+        // enclosing backend/listen so two sections that each declare a
+        // same-named server keep independent reference sets.
         if line.trim().trim_start().starts_with("server ") {
             let parts: Vec<&str> = line.trim().trim_start().split_whitespace().collect();
             if parts.len() >= 2 {
                 let name = parts[1];
-                return self.find_references_to_symbol(uri, name, SymbolKind::Server);
+                let enclosing = self.enclosing_section_name(content, position.line as usize);
+                return self.find_references_to_symbol_scoped(
+                    uri,
+                    name,
+                    SymbolKind::Server,
+                    enclosing.as_deref(),
+                );
             }
         }
 
@@ -1422,7 +1631,29 @@ impl HaproxyLsp {
         if trimmed.starts_with("server ") {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 {
-                if let Some(sym) = self.find_symbol_by_name(uri, parts[1], SymbolKind::Server) {
+                // Server identity is section-scoped; resolve against the
+                // enclosing backend/listen so duplicate names across
+                // sections stay distinct.
+                let enclosing = self.enclosing_section_name(content, position.line as usize);
+                if let Some(sym) = self.find_symbol_by_name_scoped(
+                    uri,
+                    parts[1],
+                    SymbolKind::Server,
+                    enclosing.as_deref(),
+                ) {
+                    return Some(sym);
+                }
+            }
+        }
+        // ACL duplicates: prefer the declaration on the cursor line so a
+        // cursor-on-def-line references/hover/rename returns that specific
+        // declaration rather than the first lexical match.
+        if trimmed.starts_with("acl ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Some(sym) =
+                    self.find_acl_symbol_at_line(uri, parts[1], position.line)
+                {
                     return Some(sym);
                 }
             }
@@ -1524,30 +1755,19 @@ impl HaproxyLsp {
         let line = lines[line_idx];
         let (word, _word_start) = self.word_at_position(line, position.character as usize)?;
 
-        // Prefer cursor-aware resolution: `find_definition` uses the same
-        // keyword walk-back as Go-to-Definition, so `sc0_*(name)` routes to
-        // the StickTable kind even when a Backend of the same name exists
-        // (stick-tables are conventionally co-named with their enclosing
-        // backend). When it returns None, fall back to a by-name sweep
-        // across kinds for the bare identifier paths (e.g. hovering the
-        // backend name on its own header line, where the walk-back already
-        // handles it — this fallback exists for defensive coverage of any
-        // future call site that lacks a leading keyword).
+        // Cursor-aware resolution: `find_definition` uses the same keyword
+        // walk-back as Go-to-Definition. It already covers every navigable
+        // hover target (section headers, `use_backend`/`default_backend`
+        // references, `if`/`unless` ACL references, `server`/`use_server`,
+        // `sc<N>_*(name)` and `table <name>` stick-table call sites) and
+        // returns None for tokens the grammar treats as sample expressions
+        // (fetches inside `{ ... }`, `stick match <fetch>`). Do NOT fall
+        // back to an unconstrained by-name sweep here — that would
+        // reintroduce the same false positives `find_definition` was
+        // careful to exclude (e.g. hovering `src` inside `if { src ... }`
+        // resolving to an unrelated `backend src`).
         if let Some(sym) = self.find_definition(uri, position, content) {
             return Some(self.render_symbol_hover(content, &sym));
-        }
-
-        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::Backend) {
-            return Some(self.backend_hover_body(content, &sym));
-        }
-        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::Acl) {
-            return Some(self.line_hover_body(content, sym.range.start.line));
-        }
-        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::StickTable) {
-            return Some(self.line_hover_body(content, sym.range.start.line));
-        }
-        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::Server) {
-            return Some(self.line_hover_body(content, sym.range.start.line));
         }
 
         // Directive docs: only fire when the cursor word is the directive
@@ -1580,15 +1800,35 @@ impl HaproxyLsp {
     }
 
     fn find_references_to_symbol(&self, uri: &str, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
+        self.find_references_to_symbol_scoped(uri, symbol_name, symbol_kind, None)
+    }
+
+    fn find_references_to_symbol_scoped(
+        &self,
+        uri: &str,
+        symbol_name: &str,
+        symbol_kind: SymbolKind,
+        scope: Option<&str>,
+    ) -> Option<Vec<Reference>> {
         // Single-file scope: look only in the requesting document.
         let symbols = self.symbols.get(uri)?;
         for symbol in symbols {
-            if symbol.name == symbol_name && std::mem::discriminant(&symbol.kind) == std::mem::discriminant(&symbol_kind) {
-                if symbol.references.is_empty() {
-                    return None;
-                } else {
-                    return Some(symbol.references.clone());
+            if symbol.name != symbol_name
+                || std::mem::discriminant(&symbol.kind)
+                    != std::mem::discriminant(&symbol_kind)
+            {
+                continue;
+            }
+            if let Some(want) = scope {
+                match symbol.scope.as_deref() {
+                    Some(have) if have == want => {}
+                    _ => continue,
                 }
+            }
+            if symbol.references.is_empty() {
+                return None;
+            } else {
+                return Some(symbol.references.clone());
             }
         }
         None
@@ -1673,18 +1913,11 @@ impl HaproxyLsp {
             None
         };
 
-        // Case 2: `stick match|store-request|store-response <table>`.
-        if let Some(idx) = kw_idx {
-            if idx >= 1
-                && prefix_tokens[idx - 1] == "stick"
-                && matches!(
-                    prefix_tokens[idx],
-                    "match" | "store-request" | "store-response"
-                )
-            {
-                return self.complete_stick_tables(uri);
-            }
-        }
+        // Note: we deliberately do NOT offer stick-table completions after
+        // `stick match|store-request|store-response`. Per HAProxy grammar the
+        // next token is a sample expression, not a table name; the table is
+        // carried by the optional `table <name>` clause (handled by Case B
+        // in find_definition and by the ` table ` lookahead during parsing).
 
         // Cases 3 and 4: use_backend / default_backend / use_server.
         if let Some(idx) = kw_idx {
@@ -1720,17 +1953,18 @@ impl HaproxyLsp {
     }
 
     fn in_acl_condition(&self, tokens: &[&str]) -> bool {
+        // Only standalone `{` / `!{` / `}` tokens count as sample expression
+        // delimiters — HAProxy requires whitespace around them. Braces
+        // embedded in content tokens (regex literals like `^/foo\{$`,
+        // PCRE quantifiers like `\d{3,}`) must not flip depth, otherwise
+        // completion after a closing `}` would be silently dropped.
         let mut in_braces: i32 = 0;
         let mut saw_cond_kw = false;
         for tok in tokens {
-            for ch in tok.chars() {
-                if ch == '{' {
-                    in_braces += 1;
-                } else if ch == '}' {
-                    if in_braces > 0 {
-                        in_braces -= 1;
-                    }
-                }
+            if *tok == "{" || *tok == "!{" {
+                in_braces += 1;
+            } else if *tok == "}" && in_braces > 0 {
+                in_braces -= 1;
             }
             if in_braces == 0 && (*tok == "if" || *tok == "unless") {
                 saw_cond_kw = true;
@@ -2183,50 +2417,217 @@ impl HaproxyLsp {
                     // identifier can't be found in it.
                     let lines: Vec<&str> = content.lines().collect();
                     let mut locs: Vec<Value> = Vec::new();
-                    let narrow_reference = |line_num: u32,
-                                            stored_start: &Position,
-                                            stored_end: &Position,
-                                            search_from_hint: Option<usize>|
-                     -> Value {
+                    let mut seen_locs: std::collections::HashSet<(u32, u32)> =
+                        std::collections::HashSet::new();
+                    // Per-(line, context) next-search offset. A line may carry
+                    // the same symbol more than once (e.g. a stick-table
+                    // `... table rate ... sc0_*(rate) ...` or an ACL repeated
+                    // in a condition `if foo || foo`). Each recorded reference
+                    // must map to a distinct occurrence, so after every match
+                    // we advance the context-scoped search floor past its end.
+                    // Keying on context as well as line keeps independent
+                    // contexts on the same line (e.g. `use_backend foo if foo`)
+                    // from clobbering each other's offsets.
+                    let mut ref_search_floor: std::collections::HashMap<
+                        (u32, ReferenceContext),
+                        usize,
+                    > = std::collections::HashMap::new();
+                    let push_loc =
+                        |line_num: u32,
+                         start: u32,
+                         end: u32,
+                         locs: &mut Vec<Value>,
+                         seen: &mut std::collections::HashSet<(u32, u32)>| {
+                            if seen.insert((line_num, start)) {
+                                locs.push(json!({
+                                    "uri": sym.uri,
+                                    "range": {
+                                        "start": { "line": line_num, "character": start },
+                                        "end": { "line": line_num, "character": end },
+                                    }
+                                }));
+                            }
+                        };
+                    let push_narrow = |line_num: u32,
+                                           stored_start: &Position,
+                                           stored_end: &Position,
+                                           name: &str,
+                                           search_from_hint: Option<usize>,
+                                           locs: &mut Vec<Value>,
+                                           seen: &mut std::collections::HashSet<(u32, u32)>| {
                         let (start_char, end_char) = lines
                             .get(line_num as usize)
                             .and_then(|raw| {
                                 let start = search_from_hint.unwrap_or(0);
-                                find_identifier_range(raw, &sym.name, start)
+                                find_identifier_range(raw, name, start)
                             })
                             .unwrap_or((stored_start.character, stored_end.character));
-                        json!({
-                            "uri": sym.uri,
-                            "range": {
-                                "start": { "line": line_num, "character": start_char },
-                                "end": { "line": line_num, "character": end_char },
-                            }
-                        })
+                        push_loc(line_num, start_char, end_char, locs, seen);
                     };
+
+                    // Collect all definition lines with the same name/kind
+                    // (+scope for servers). Multiple ACL declarations share
+                    // the same name — every one of them is a declaration and
+                    // must surface when `includeDeclaration=true`.
+                    let matching_defs: Vec<Symbol> = self
+                        .symbols
+                        .get(uri)
+                        .map(|syms| {
+                            syms.iter()
+                                .filter(|s| {
+                                    s.name == sym.name
+                                        && s.kind == sym.kind
+                                        && (sym.kind != SymbolKind::Server
+                                            || s.scope == sym.scope)
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     if include_declaration {
-                        let def_line_idx = sym.range.start.line as usize;
-                        let search_from = lines
-                            .get(def_line_idx)
-                            .and_then(|raw| def_line_search_from(raw, &sym.kind));
-                        locs.push(narrow_reference(
-                            sym.range.start.line,
-                            &sym.range.start,
-                            &sym.range.end,
-                            search_from,
-                        ));
+                        for def in &matching_defs {
+                            let def_line_idx = def.range.start.line as usize;
+                            let search_from = lines
+                                .get(def_line_idx)
+                                .and_then(|raw| def_line_search_from(raw, &def.kind));
+                            push_narrow(
+                                def.range.start.line,
+                                &def.range.start,
+                                &def.range.end,
+                                &def.name,
+                                search_from,
+                                &mut locs,
+                                &mut seen_locs,
+                            );
+                        }
                     }
                     for r in &sym.references {
                         let ref_line_idx = r.range.start.line as usize;
-                        let search_from = lines
+                        let base_search_from = lines
                             .get(ref_line_idx)
-                            .map(|raw| ref_line_search_from(raw, &r.context));
-                        locs.push(narrow_reference(
+                            .map(|raw| ref_line_search_from(raw, r));
+                        let key = (r.range.start.line, r.context.clone());
+                        let precise = ref_context_has_precise_position(&r.context);
+                        let floor = if precise {
+                            None
+                        } else {
+                            ref_search_floor.get(&key).copied()
+                        };
+                        let search_from = match (base_search_from, floor) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        if let Some(raw) = lines.get(ref_line_idx) {
+                            if let Some((s, e)) = find_identifier_range(
+                                raw,
+                                &sym.name,
+                                search_from.unwrap_or(0),
+                            ) {
+                                push_loc(
+                                    r.range.start.line,
+                                    s,
+                                    e,
+                                    &mut locs,
+                                    &mut seen_locs,
+                                );
+                                if !precise {
+                                    ref_search_floor.insert(key, e as usize);
+                                }
+                                continue;
+                            }
+                        }
+                        push_narrow(
                             r.range.start.line,
                             &r.range.start,
                             &r.range.end,
+                            &sym.name,
                             search_from,
-                        ));
+                            &mut locs,
+                            &mut seen_locs,
+                        );
                     }
+
+                    // Cascade stick-table references into section symbols.
+                    // A backend/frontend/listen that owns a stick-table is
+                    // conceptually one name; references like `sc0_*(X)` and
+                    // `... table X` target the table, but operators expect
+                    // them to surface when asking for references on the
+                    // enclosing section of the same name.
+                    if matches!(
+                        sym.kind,
+                        SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
+                    ) {
+                        if let Some(table) =
+                            self.find_symbol_by_name(uri, &sym.name, SymbolKind::StickTable)
+                        {
+                            if include_declaration {
+                                let def_line_idx = table.range.start.line as usize;
+                                // Stick-table def line has no identifier to
+                                // anchor on; fall through to the stored range.
+                                push_loc(
+                                    table.range.start.line,
+                                    table.range.start.character,
+                                    lines
+                                        .get(def_line_idx)
+                                        .map(|l| l.len() as u32)
+                                        .unwrap_or(table.range.end.character),
+                                    &mut locs,
+                                    &mut seen_locs,
+                                );
+                            }
+                            for r in &table.references {
+                                let ref_line_idx = r.range.start.line as usize;
+                                let base_search_from = lines
+                                    .get(ref_line_idx)
+                                    .map(|raw| ref_line_search_from(raw, r));
+                                let key = (r.range.start.line, r.context.clone());
+                                let precise = ref_context_has_precise_position(&r.context);
+                                let floor = if precise {
+                                    None
+                                } else {
+                                    ref_search_floor.get(&key).copied()
+                                };
+                                let search_from = match (base_search_from, floor) {
+                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                    (Some(a), None) => Some(a),
+                                    (None, Some(b)) => Some(b),
+                                    (None, None) => None,
+                                };
+                                if let Some(raw) = lines.get(ref_line_idx) {
+                                    if let Some((s, e)) = find_identifier_range(
+                                        raw,
+                                        &table.name,
+                                        search_from.unwrap_or(0),
+                                    ) {
+                                        push_loc(
+                                            r.range.start.line,
+                                            s,
+                                            e,
+                                            &mut locs,
+                                            &mut seen_locs,
+                                        );
+                                        if !precise {
+                                            ref_search_floor.insert(key, e as usize);
+                                        }
+                                        continue;
+                                    }
+                                }
+                                push_narrow(
+                                    r.range.start.line,
+                                    &r.range.start,
+                                    &r.range.end,
+                                    &table.name,
+                                    search_from,
+                                    &mut locs,
+                                    &mut seen_locs,
+                                );
+                            }
+                        }
+                    }
+
                     locs
                 } else {
                     Vec::new()
@@ -2348,6 +2749,31 @@ impl HaproxyLsp {
                     }
                 };
 
+                // Mirror the prepareRename contract: the cursor word must equal
+                // the resolved symbol's name. `find_symbol_at_cursor` resolves
+                // by scanning the line for the definition token, so it would
+                // otherwise accept cursor positions on the keyword, address,
+                // or option fields of a definition line — which violates the
+                // safe-rename contract for clients that skip prepareRename.
+                let word_matches_symbol = {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let line_idx = position.line as usize;
+                    lines
+                        .get(line_idx)
+                        .and_then(|line| {
+                            self.word_at_position(line, position.character as usize)
+                        })
+                        .map(|(word, _)| word == symbol.name)
+                        .unwrap_or(false)
+                };
+                if !word_matches_symbol {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": Value::Null,
+                    }));
+                }
+
                 // Stick-tables are bound to the enclosing section name in
                 // HAProxy's grammar (one table per section), so renaming a
                 // stick-table independent of its section is not meaningful
@@ -2371,6 +2797,17 @@ impl HaproxyLsp {
                 // violates the LSP WorkspaceEdit invariant.
                 let mut seen: std::collections::HashSet<(u32, u32)> =
                     std::collections::HashSet::new();
+                // Per-(line, context) next-search offset. A line may carry
+                // the same symbol more than once (`... table rate ...
+                // sc0_*(rate) ...`, `if foo || foo`). Each recorded reference
+                // must map to its own occurrence; without advancing a
+                // per-context floor past the previous match, all duplicate
+                // same-name references on a line collapse onto the first
+                // occurrence and the second/third/… stay stale after rename.
+                let mut ref_search_floor: std::collections::HashMap<
+                    (u32, ReferenceContext),
+                    usize,
+                > = std::collections::HashMap::new();
                 let mut push_edit = |line: u32, start: u32, end: u32, edits: &mut Vec<Value>| {
                     if seen.insert((line, start)) {
                         edits.push(json!({
@@ -2387,13 +2824,20 @@ impl HaproxyLsp {
                 // lines for OR semantics, so rename must rewrite every same-
                 // name/kind definition, not just the one at the cursor — a
                 // partial rename would leave an orphan declaration and
-                // silently break the config.
+                // silently break the config. For servers the match also
+                // scope-filters by enclosing section so two backends with a
+                // same-named server stay independent.
                 let all_defs: Vec<(u32, String)> = self
                     .symbols
                     .get(uri)
                     .map(|syms| {
                         syms.iter()
-                            .filter(|s| s.name == symbol.name && s.kind == symbol.kind)
+                            .filter(|s| {
+                                s.name == symbol.name
+                                    && s.kind == symbol.kind
+                                    && (symbol.kind != SymbolKind::Server
+                                        || s.scope == symbol.scope)
+                            })
                             .map(|s| (s.range.start.line, s.name.clone()))
                             .collect()
                     })
@@ -2413,18 +2857,73 @@ impl HaproxyLsp {
                     }
                 }
 
-                // Reference edits.
+                // Reference edits. Advance per-(line, context) floor after
+                // each match so multiple same-context references on one line
+                // pick up successive occurrences instead of collapsing onto
+                // the first.
                 for r in &symbol.references {
                     let ref_line_idx = r.range.start.line as usize;
                     if ref_line_idx >= lines.len() {
                         continue;
                     }
                     let ref_line = lines[ref_line_idx];
-                    let search_from = ref_line_search_from(ref_line, &r.context);
+                    let base_search_from = ref_line_search_from(ref_line, r);
+                    let key = (r.range.start.line, r.context.clone());
+                    let precise = ref_context_has_precise_position(&r.context);
+                    let search_from = if precise {
+                        base_search_from
+                    } else {
+                        let floor = ref_search_floor.get(&key).copied().unwrap_or(0);
+                        base_search_from.max(floor)
+                    };
                     if let Some((s, e)) =
                         find_identifier_range(ref_line, &symbol.name, search_from)
                     {
                         push_edit(r.range.start.line, s, e, &mut edits);
+                        if !precise {
+                            ref_search_floor.insert(key, e as usize);
+                        }
+                    }
+                }
+
+                // Cascade stick-table references into section renames.
+                // The stick-table is bound to the enclosing section's name,
+                // so renaming the section must also rewrite every
+                // `sc*_*(X)` / `... table X` / `stick on ... table X`
+                // call-site that names the section's table. Without this,
+                // renaming the section silently leaves call-sites pointing
+                // at a non-existent table.
+                if matches!(
+                    symbol.kind,
+                    SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
+                ) {
+                    if let Some(table) =
+                        self.find_symbol_by_name(uri, &symbol.name, SymbolKind::StickTable)
+                    {
+                        for r in &table.references {
+                            let ref_line_idx = r.range.start.line as usize;
+                            if ref_line_idx >= lines.len() {
+                                continue;
+                            }
+                            let ref_line = lines[ref_line_idx];
+                            let base_search_from = ref_line_search_from(ref_line, r);
+                            let key = (r.range.start.line, r.context.clone());
+                            let precise = ref_context_has_precise_position(&r.context);
+                            let search_from = if precise {
+                                base_search_from
+                            } else {
+                                let floor = ref_search_floor.get(&key).copied().unwrap_or(0);
+                                base_search_from.max(floor)
+                            };
+                            if let Some((s, e)) =
+                                find_identifier_range(ref_line, &table.name, search_from)
+                            {
+                                push_edit(r.range.start.line, s, e, &mut edits);
+                                if !precise {
+                                    ref_search_floor.insert(key, e as usize);
+                                }
+                            }
+                        }
                     }
                 }
 

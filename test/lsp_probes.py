@@ -239,6 +239,55 @@ DEFINITION_PROBES = [
         "character": 40,
         "expected_def_line": 95,
     },
+    # --- regression (Codex review): servers are section-scoped ---
+    # Two backends each declare `server shared ...`. `use_server shared`
+    # inside scoped_a must resolve to scoped_a's own server (line 129), not
+    # cross-link to scoped_b's line 134 server.
+    {
+        "desc": "scoped server: use_server in backend A resolves to A's server",
+        "line": 130,
+        "character": 13,
+        "expected_def_line": 129,
+    },
+    {
+        "desc": "scoped server: use_server in backend B resolves to B's server",
+        "line": 135,
+        "character": 13,
+        "expected_def_line": 134,
+    },
+    # --- regression (Codex review): stick match/store-* sample is not a table ---
+    # Per HAProxy grammar, the token after `stick match`/`stick store-*` is a
+    # sample expression, not a table name. Even though a stick-table named
+    # `src` exists (at line 138), the cursor on `src` here must NOT resolve.
+    {
+        "desc": "`stick match src` — sample expression, not a stick-table",
+        "line": 140,
+        "character": 15,
+        "expected_null": True,
+    },
+    {
+        "desc": "`stick store-request src` — sample expression, not a stick-table",
+        "line": 141,
+        "character": 23,
+        "expected_null": True,
+    },
+    # --- regression (Codex review): cursor on fetch inside `{ ... }` vs same-named ACL ---
+    # `use_backend ... if { src 10.0.0.0/8 } real_acl` has an ACL named `src`
+    # and an ACL named `real_acl`. Cursor on `src` inside braces must NOT
+    # resolve to the same-named ACL (it's a sample fetch, not a reference),
+    # while cursor on `real_acl` after the closing brace must still resolve.
+    {
+        "desc": "fetch token inside `{ ... }` must not resolve to same-named ACL",
+        "line": 169,
+        "character": 40,
+        "expected_null": True,
+    },
+    {
+        "desc": "ACL reference after closing brace still resolves",
+        "line": 169,
+        "character": 58,
+        "expected_def_line": 168,
+    },
 ]
 
 # Folding probes verify `textDocument/foldingRange` output against fixture files.
@@ -315,10 +364,16 @@ FOLDING_PROBES: list[dict] = [
         "expected": {"startLine": 98, "endLine": 105, "kind": "region"},
     },
     {
-        "desc": "conf: final `frontend dup_acl_caller` fold reaches EOF",
+        "desc": "conf: `frontend dup_acl_caller` fold runs up to the next section",
         "fixture": "conf",
         "match": "contains",
-        "expected": {"startLine": 118, "endLine": 123, "kind": "region"},
+        "expected": {"startLine": 118, "endLine": 126, "kind": "region"},
+    },
+    {
+        "desc": "conf: `backend src` section fold ends before next frontend",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 137, "endLine": 144, "kind": "region"},
     },
     # --- haproxy.prod.cfg: the real 1190-line fixture ---
     {
@@ -568,14 +623,14 @@ REFERENCES_PROBES: list[dict] = [
         "line": 33,
         "character": 20,
         "include_declaration": False,
-        "expected_lines": {33, 43, 123},
+        "expected_lines": {33, 43, 123, 156},
     },
     {
         "desc": "backend name on `use_backend` line (include declaration)",
         "line": 33,
         "character": 20,
         "include_declaration": True,
-        "expected_lines": {33, 43, 50, 123},
+        "expected_lines": {33, 43, 50, 123, 156},
     },
     {
         "desc": "ACL in `if` condition (exclude declaration)",
@@ -596,21 +651,21 @@ REFERENCES_PROBES: list[dict] = [
         "line": 102,
         "character": 65,
         "include_declaration": False,
-        "expected_lines": {101, 102, 116},
+        "expected_lines": {101, 102, 116, 148},
     },
     {
         "desc": "stick-table in `sc0_*(name)` (include declaration)",
         "line": 102,
         "character": 65,
         "include_declaration": True,
-        "expected_lines": {95, 101, 102, 116},
+        "expected_lines": {95, 101, 102, 116, 148},
     },
     {
         "desc": "stick-table after ` table ` keyword (exclude declaration)",
         "line": 101,
         "character": 40,
         "include_declaration": False,
-        "expected_lines": {101, 102, 116},
+        "expected_lines": {101, 102, 116, 148},
     },
     {
         "desc": "server `use_server` call-sites listed (exclude declaration)",
@@ -627,25 +682,32 @@ REFERENCES_PROBES: list[dict] = [
         "expected_lines": {108, 110},
     },
     {
-        "desc": "duplicate ACL references attach only once per call-site",
+        "desc": "duplicate ACL references attach only once per call-site; both declaration lines surface",
         "line": 123,
         "character": 48,
         "include_declaration": True,
-        "expected_lines": {121, 123},
+        "expected_lines": {121, 122, 123},
     },
     {
         "desc": "backend name on definition line (include declaration)",
         "line": 50,
         "character": 15,
         "include_declaration": True,
-        "expected_lines": {33, 43, 50, 123},
+        "expected_lines": {33, 43, 50, 123, 156},
     },
     {
         "desc": "backend name on definition line (exclude declaration)",
         "line": 50,
         "character": 15,
         "include_declaration": False,
-        "expected_lines": {33, 43, 123},
+        "expected_lines": {33, 43, 123, 156},
+    },
+    {
+        "desc": "ACL after inline sample whose regex has unbalanced literal brace",
+        "line": 156,
+        "character": 70,
+        "include_declaration": True,
+        "expected_lines": {155, 156},
     },
 ]
 
@@ -704,7 +766,7 @@ RENAME_PROBES: list[dict] = [
         "line": 33,
         "character": 20,
         "new_name": "newBackend",
-        "expected_edits": {(50, 8, 36), (33, 14, 42), (43, 14, 42), (123, 14, 42)},
+        "expected_edits": {(50, 8, 36), (33, 14, 42), (43, 14, 42), (123, 14, 42), (156, 14, 42)},
     },
     {
         "desc": "rename ACL updates definition + every if-condition reference",
@@ -756,6 +818,59 @@ RENAME_PROBES: list[dict] = [
         "character": 15,
         "new_name": "srv_renamed",
         "expected_edits": {(108, 9, 18), (110, 13, 22)},
+    },
+    # --- regression (Codex): scoped server rename only touches own section ---
+    # Renaming `server shared` in backend scoped_a must rewrite the two
+    # shared references in scoped_a only (lines 129, 130). The same-named
+    # server in scoped_b (lines 134, 135) must be left alone.
+    {
+        "desc": "rename server scoped to enclosing backend (does not touch duplicate in other backend)",
+        "type": "rename",
+        "line": 129,
+        "character": 11,
+        "new_name": "shared_a",
+        "expected_edits": {(129, 9, 15), (130, 13, 19)},
+    },
+    # --- regression (Codex): section rename cascades to stick-table call sites ---
+    # Renaming backend `st_ratelimit` must rewrite the backend header,
+    # the stick-table ` table st_ratelimit` ref (line 101), the
+    # `sc0_http_req_rate(st_ratelimit)` ref (line 102), and the
+    # `table st_ratelimit # ...` ref in the second fixture (line 116).
+    {
+        "desc": "rename section with stick-table cascades to sc*_*/table call-sites",
+        "type": "rename",
+        "line": 94,
+        "character": 12,
+        "new_name": "rl_renamed",
+        "expected_edits": {
+            (94, 8, 20),
+            (101, 35, 47),
+            (102, 59, 71),
+            (116, 35, 47),
+            (148, 35, 47),
+            (148, 71, 83),
+        },
+    },
+    # --- regression (Codex): direct rename skipping prepareRename must not
+    # accept cursor positions that would have been rejected by prepareRename.
+    # Cursor on the `backend` keyword (column 2) of a definition line must
+    # return null, matching the prepareRename guard instead of silently
+    # renaming the whole symbol.
+    {
+        "desc": "rename on `backend` keyword of definition line returns null",
+        "type": "rename",
+        "line": 50,
+        "character": 2,
+        "new_name": "renamed",
+        "expected_null": True,
+    },
+    {
+        "desc": "rename on `use_backend` keyword returns null",
+        "type": "rename",
+        "line": 33,
+        "character": 5,
+        "new_name": "renamed",
+        "expected_null": True,
     },
 ]
 
@@ -832,6 +947,18 @@ HOVER_PROBES: list[dict] = [
         "desc": "hover on whitespace returns null",
         "line": 1,
         "character": 0,
+        "expected_null": True,
+    },
+    # --- regression (Codex): hover on a fetch token inside `{ ... }` must
+    # NOT leak through to an unconstrained by-name lookup. The
+    # `use_backend brace_cursor_target if { src 10.0.0.0/8 } real_acl` line
+    # has a fetch `src` inside the brace group; a backend named `src` also
+    # exists elsewhere in the fixture. Hover on the fetch must return null
+    # (same contract as find_definition).
+    {
+        "desc": "hover on fetch inside `{ ... }` does not resolve to same-named backend",
+        "line": 169,
+        "character": 40,
         "expected_null": True,
     },
     {
@@ -1006,6 +1133,16 @@ def run_definition_probes(client: LspClient, results: Results):
             continue
 
         result = resp.get("result")
+        # Some probes assert that the cursor resolves to NOTHING (e.g. a
+        # sample expression after `stick match` must not cross-link to a
+        # same-named stick-table). Accept both `null` and `[]` as "no
+        # definition found" per LSP spec.
+        if probe.get("expected_null"):
+            ok = result is None or result == []
+            detail = "null as expected" if ok else f"unexpected result: {result!r}"
+            results.record("definition", probe["desc"], ok, detail)
+            continue
+
         if result is None:
             results.record(
                 "definition",
@@ -1491,6 +1628,22 @@ def run_rename_probes(client: LspClient, results: Results):
                 continue
 
             result = resp.get("result")
+            if probe.get("expected_null"):
+                if result is None:
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        True,
+                        "null as expected",
+                    )
+                else:
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        False,
+                        f"expected null, got {result!r}",
+                    )
+                continue
             if not isinstance(result, dict):
                 results.record(
                     "rename",
