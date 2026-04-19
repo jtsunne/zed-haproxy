@@ -215,6 +215,30 @@ DEFINITION_PROBES = [
         "character": 10,
         "expected_def_line": 78,
     },
+    # --- stick-table kind (Task 1) ---
+    # The stick-table is bound to the enclosing section `st_ratelimit`
+    # (line 94). Its definition range points at the `stick-table` directive
+    # line (95). References via sc<N>_*(...) and `table <name>` resolve to
+    # that directive line; the cursor on the section header still resolves
+    # to the Backend kind at line 94 (existing behavior).
+    {
+        "desc": "stick-table name on backend header (Backend kind self-ref)",
+        "line": 94,
+        "character": 12,
+        "expected_def_line": 94,
+    },
+    {
+        "desc": "stick-table reference inside `sc0_http_req_rate(...)` call",
+        "line": 102,
+        "character": 65,
+        "expected_def_line": 95,
+    },
+    {
+        "desc": "stick-table reference after ` table ` keyword",
+        "line": 101,
+        "character": 40,
+        "expected_def_line": 95,
+    },
 ]
 
 # Folding probes verify `textDocument/foldingRange` output against fixture files.
@@ -267,16 +291,28 @@ FOLDING_PROBES: list[dict] = [
         "expected": {"startLine": 82, "endLine": 85, "kind": "region"},
     },
     {
-        "desc": "conf: final `frontend dotted_caller` fold reaches EOF",
+        "desc": "conf: `frontend dotted_caller` fold ends before stick-table backend",
         "fixture": "conf",
         "match": "contains",
-        "expected": {"startLine": 86, "endLine": 92, "kind": "region"},
+        "expected": {"startLine": 86, "endLine": 93, "kind": "region"},
     },
     {
         "desc": "conf: BEGIN/END `dotted_names` region wraps new fixtures",
         "fixture": "conf",
         "match": "contains",
         "expected": {"startLine": 76, "endLine": 92, "kind": "region"},
+    },
+    {
+        "desc": "conf: `backend st_ratelimit` section fold",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 94, "endLine": 97, "kind": "region"},
+    },
+    {
+        "desc": "conf: final `frontend st_caller` fold reaches EOF",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 98, "endLine": 102, "kind": "region"},
     },
     # --- haproxy.prod.cfg: the real 1190-line fixture ---
     {

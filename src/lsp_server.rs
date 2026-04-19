@@ -25,6 +25,7 @@ enum ReferenceContext {
     AclCondition,
     AclUnlessCondition,
     ServerReference,
+    StickTable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +35,7 @@ enum SymbolKind {
     Listen,
     Acl,
     Server,
+    StickTable,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +192,99 @@ fn compute_folds(content: &str) -> Vec<FoldingRange> {
     out.extend(comment_folds);
     out.extend(region_folds);
     out
+}
+
+/// Extract every stick-table name referenced on a single line.
+///
+/// Recognised forms (deduplicated in caller since `add_reference_to_symbol`
+/// matches by name):
+///   - `sc<digit>_<ident>(<name>[, ...])` — counter accessor; first arg is the table.
+///   - `stick match <name>` / `stick store-request <name>` / `stick store-response <name>`.
+///   - Any occurrence of ` table <name>` (covers `stick on ... table X`,
+///     `http-request track-sc0 src table X`, etc.). False positives are
+///     absorbed by the symbol-existence check in `add_reference_to_symbol`.
+///
+/// Caller is expected to have trimmed leading whitespace and skipped comment
+/// lines so `#`-commented example text does not contribute references.
+fn collect_stick_table_references(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = line.as_bytes();
+
+    // sc<digit>_<ident>(<first_arg>, ...)
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        if bytes[i] == b's'
+            && bytes[i + 1] == b'c'
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3] == b'_'
+        {
+            // Left word boundary: previous char must not be an identifier char
+            // (avoids matching `foosc0_...` or `track-sc0`).
+            let left_boundary = i == 0 || {
+                let prev = bytes[i - 1];
+                !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.' || prev == b'-')
+            };
+            if left_boundary {
+                if let Some(paren_rel) = line[i..].find('(') {
+                    let paren_abs = i + paren_rel;
+                    // Function name must be a contiguous identifier up to `(`.
+                    let fn_slice = &line[i..paren_abs];
+                    if !fn_slice.chars().any(char::is_whitespace) {
+                        if let Some(close_rel) = line[paren_abs..].find(')') {
+                            let close_abs = paren_abs + close_rel;
+                            let inside = &line[paren_abs + 1..close_abs];
+                            let first_arg = inside.split(',').next().unwrap_or("").trim();
+                            if !first_arg.is_empty() && is_valid_identifier(first_arg) {
+                                out.push(first_arg.to_string());
+                            }
+                            i = close_abs + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // `stick match X`, `stick store-request X`, `stick store-response X`.
+    // Note: per the plan, the token after `match`/`store-*` is treated as the
+    // table name. In real HAProxy configs this token is usually a sample
+    // expression (e.g. `src`), not a table — the explicit `table <name>`
+    // clause is what carries the name. Spurious names get filtered by the
+    // existence check in `add_reference_to_symbol`.
+    if let Some(rest) = line.strip_prefix("stick ") {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let kw = parts[0];
+            if matches!(kw, "match" | "store-request" | "store-response") {
+                if is_valid_identifier(parts[1]) {
+                    out.push(parts[1].to_string());
+                }
+            }
+        }
+    }
+
+    // Generic ` table <name>` anywhere on the line.
+    let mut search_from = 0usize;
+    while let Some(rel) = line[search_from..].find(" table ") {
+        let abs = search_from + rel + " table ".len();
+        let tail = &line[abs..];
+        if let Some(name) = tail.split_whitespace().next() {
+            if is_valid_identifier(name) {
+                out.push(name.to_string());
+            }
+        }
+        search_from = abs;
+    }
+
+    out
+}
+
+fn is_valid_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 fn section_kind_for(keyword: &str) -> u8 {
@@ -532,10 +627,29 @@ impl HaproxyLsp {
     fn parse_document(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
         // For now, use simple regex-based parsing until tree-sitter integration is complete
         let mut symbols = Vec::new();
-        
+        // Track the enclosing named section so `stick-table` directives can
+        // be attributed to the correct backend/frontend/listen/peers name
+        // (HAProxy binds one table per section, keyed by the section name).
+        let mut current_section_name: Option<String> = None;
+
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
-            
+
+            // Update section tracker before per-directive parsing so that
+            // `stick-table` on a subsequent line attributes to this section.
+            let first_tok = line.split_whitespace().next().unwrap_or("");
+            match first_tok {
+                "backend" | "frontend" | "listen" | "peers" => {
+                    let tokens: Vec<&str> = line.split_whitespace().collect();
+                    current_section_name = tokens.get(1).map(|s| s.to_string());
+                }
+                "global" | "defaults" | "resolvers" | "userlist"
+                | "mailers" | "cache" | "program" | "ring" => {
+                    current_section_name = None;
+                }
+                _ => {}
+            }
+
             // Parse backend definitions
             if line.starts_with("backend ") {
                 // Grammar only permits a section_name token after the
@@ -625,6 +739,24 @@ impl HaproxyLsp {
                     });
                 }
             }
+            // Parse stick-table directives. HAProxy binds one stick-table per
+            // section, named after the enclosing section; the directive itself
+            // carries no name token. Only register when inside a named section
+            // body — stray `stick-table` in `global`/`defaults` is ignored.
+            else if line.starts_with("stick-table ") || line == "stick-table" {
+                if let Some(ref section_name) = current_section_name {
+                    symbols.push(Symbol {
+                        name: section_name.clone(),
+                        kind: SymbolKind::StickTable,
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        references: Vec::new(),
+                    });
+                }
+            }
         }
         
         // Second pass: collect references to symbols
@@ -693,6 +825,28 @@ impl HaproxyLsp {
                     }
                 }
             }
+
+            // Collect stick-table references. Skip comment lines so commented
+            // sample config in fixtures doesn't leak spurious references.
+            if line.starts_with('#') {
+                continue;
+            }
+            let stick_refs = collect_stick_table_references(line);
+            for table_name in stick_refs {
+                self.add_reference_to_symbol(
+                    &mut updated_symbols,
+                    &table_name,
+                    SymbolKind::StickTable,
+                    Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::StickTable,
+                    },
+                );
+            }
         }
         
         // Build fold/outline data into locals before any self.* write so a
@@ -737,6 +891,50 @@ impl HaproxyLsp {
         // identifier references (`if a && b || c`).
         let prefix = &line[..word_start];
         let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
+
+        // Stick-table context detection runs BEFORE the general keyword
+        // walk-back because the walk-back would otherwise latch onto a
+        // preceding `if`/`unless` (common in `... if { sc0_*(tbl) gt N }`)
+        // and mis-classify the cursor word as an ACL reference.
+        if let Some(last) = prefix_tokens.last().copied() {
+            // Case A: `sc<digit>_<ident>(` immediately before the cursor word.
+            // The last token carries the unmatched `(` which means the cursor
+            // sits inside the argument list.
+            if last.len() > 3
+                && last.starts_with("sc")
+                && last.as_bytes()[2].is_ascii_digit()
+                && last.as_bytes()[3] == b'_'
+                && last.contains('(')
+            {
+                let paren_pos = last.find('(').unwrap();
+                // Cursor is inside an unclosed sc<N>_*( call; treat the word
+                // as a stick-table name if it's the first positional arg
+                // (no comma between `(` and the word).
+                let after_paren = &last[paren_pos + 1..];
+                if !after_paren.contains(',') && !after_paren.contains(')') {
+                    return self.find_symbol_by_name(uri, &word, SymbolKind::StickTable);
+                }
+            }
+            // Case B: `... table <word>` — the immediate preceding token is
+            // the `table` keyword. Covers `stick on ... table X`,
+            // `http-request track-sc0 src table X`, etc.
+            if last == "table" {
+                return self.find_symbol_by_name(uri, &word, SymbolKind::StickTable);
+            }
+        }
+        // Case C: `stick match <word>`, `stick store-request <word>`,
+        // `stick store-response <word>`. The plan treats the first positional
+        // token after these keywords as the stick-table name.
+        if prefix_tokens.len() >= 2 {
+            let last = prefix_tokens[prefix_tokens.len() - 1];
+            let prev = prefix_tokens[prefix_tokens.len() - 2];
+            if prev == "stick"
+                && matches!(last, "match" | "store-request" | "store-response")
+            {
+                return self.find_symbol_by_name(uri, &word, SymbolKind::StickTable);
+            }
+        }
+
         let kw_match = prefix_tokens.iter().enumerate().rev().find_map(|(idx, tok)| {
             match *tok {
                 "use_backend" | "default_backend" | "backend" => Some((idx, SymbolKind::Backend)),
