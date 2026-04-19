@@ -717,6 +717,89 @@ RENAME_PROBES: list[dict] = [
 ]
 
 
+# Hover probes exercise `textDocument/hover` against test/haproxy.conf.
+# Each probe points at a cursor position and asserts the hover response is a
+# markdown MarkupContent whose `value` contains every listed substring
+# (order-independent). `expected_null` asserts a null hover instead.
+HOVER_PROBES: list[dict] = [
+    {
+        "desc": "hover on backend name in `use_backend` shows definition + servers",
+        "line": 33,
+        "character": 20,
+        "expected_contains": [
+            "backend accountCreationService_10000",
+            "mode http",
+            "balance roundrobin",
+            "151_256_250_151_35800",
+        ],
+    },
+    {
+        "desc": "hover on backend header itself shows backend summary",
+        "line": 50,
+        "character": 15,
+        "expected_contains": [
+            "backend accountCreationService_10000",
+            "server 151_256_250_151_35800",
+        ],
+    },
+    {
+        "desc": "hover on ACL reference shows ACL definition line",
+        "line": 33,
+        "character": 55,
+        "expected_contains": [
+            "acl app__accountCreationService",
+            "hdr(x-microservice-app-id)",
+        ],
+    },
+    {
+        "desc": "hover on stick-table reference shows stick-table directive",
+        "line": 102,
+        "character": 65,
+        "expected_contains": [
+            "stick-table type ip",
+            "http_req_rate(10s)",
+        ],
+    },
+    {
+        "desc": "hover on server name shows server directive line",
+        "line": 56,
+        "character": 15,
+        "expected_contains": [
+            "server 151_256_250_151_35800",
+            "151.256.250.151:35800",
+        ],
+    },
+    {
+        "desc": "hover on `use_backend` directive keyword shows docs snippet",
+        "line": 33,
+        "character": 5,
+        "expected_contains": [
+            "use_backend",
+        ],
+    },
+    {
+        "desc": "hover on `stick-table` directive keyword shows docs snippet",
+        "line": 95,
+        "character": 4,
+        "expected_contains": [
+            "stick-table",
+        ],
+    },
+    {
+        "desc": "hover on whitespace returns null",
+        "line": 1,
+        "character": 0,
+        "expected_null": True,
+    },
+    {
+        "desc": "hover on arbitrary non-symbol token returns null",
+        "line": 3,
+        "character": 3,
+        "expected_null": True,
+    },
+]
+
+
 DECLARATION_PROBES: list[dict] = [
     {
         "desc": "`!plain` in `if` condition yields declaration reference",
@@ -1341,6 +1424,74 @@ def run_rename_probes(client: LspClient, results: Results):
         results.record("rename", probe["desc"], False, f"unknown probe type: {probe_type}")
 
 
+def run_hover_probes(client: LspClient, results: Results):
+    if not HOVER_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record("hover", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    client.did_open(uri, HAPROXY_CONF.read_text())
+
+    for probe in HOVER_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/hover",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("hover", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if probe.get("expected_null"):
+            ok = result is None
+            detail = "null as expected" if ok else f"expected null, got {result!r}"
+            results.record("hover", probe["desc"], ok, detail)
+            continue
+
+        if not isinstance(result, dict):
+            results.record(
+                "hover",
+                probe["desc"],
+                False,
+                f"expected object, got {type(result).__name__}: {result!r}",
+            )
+            continue
+        contents = result.get("contents") or {}
+        if not isinstance(contents, dict) or contents.get("kind") != "markdown":
+            results.record(
+                "hover",
+                probe["desc"],
+                False,
+                f"expected markdown MarkupContent, got {contents!r}",
+            )
+            continue
+        value = contents.get("value") or ""
+        missing = [s for s in probe["expected_contains"] if s not in value]
+        if missing:
+            preview = value.replace("\n", "\\n")[:120]
+            results.record(
+                "hover",
+                probe["desc"],
+                False,
+                f"missing {missing!r} in {preview!r}",
+            )
+            continue
+        results.record(
+            "hover",
+            probe["desc"],
+            True,
+            f"matched {len(probe['expected_contains'])} substrings",
+        )
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -1410,6 +1561,7 @@ def main() -> int:
         run_declaration_probes(client, results)
         run_references_probes(client, results)
         run_rename_probes(client, results)
+        run_hover_probes(client, results)
     finally:
         client.shutdown()
 

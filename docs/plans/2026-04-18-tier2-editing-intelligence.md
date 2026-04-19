@@ -87,17 +87,17 @@ Single-file scope retained from Tier 1. Cross-file resolution is explicitly defe
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] create `src/docs.rs` with `pub fn directive_doc(name: &str) -> Option<&'static str>` backed by a `HashMap<&'static str, &'static str>` (~50 curated entries covering `bind`, `server`, `acl`, `use_backend`, `default_backend`, `mode`, `balance`, `timeout`, `option`, `http-request`, `http-response`, `tcp-request`, `stick-table`, `stick`, `stats`, `redirect`, `use_server`, `log`, `maxconn`, `retries`, `cookie`, `http-check`, `tcp-check`, `default-server`, `resolvers`, `nameserver`, `peers`, `peer`, `userlist`, `user`, `group`, `cache`, `listen`, `frontend`, `backend`, `global`, `defaults`, `compression`, `http-reuse`, `errorfile`, `description`, `bind-process`, `monitor-uri`, `rate-limit`, `filter`, `capture`, `http-after-response`, `use-service`, `http-send-name-header`, `hash-type`); each entry is plain markdown (bullet syntax + common flags) kept under 10 lines
-- [ ] add `textDocument/hover` handler returning `MarkupContent { kind: "markdown", value: ... }`; resolution order inside the handler:
+- [x] create `src/docs.rs` with `pub fn directive_doc(name: &str) -> Option<&'static str>` backed by a `HashMap<&'static str, &'static str>` (~50 curated entries covering `bind`, `server`, `acl`, `use_backend`, `default_backend`, `mode`, `balance`, `timeout`, `option`, `http-request`, `http-response`, `tcp-request`, `stick-table`, `stick`, `stats`, `redirect`, `use_server`, `log`, `maxconn`, `retries`, `cookie`, `http-check`, `tcp-check`, `default-server`, `resolvers`, `nameserver`, `peers`, `peer`, `userlist`, `user`, `group`, `cache`, `listen`, `frontend`, `backend`, `global`, `defaults`, `compression`, `http-reuse`, `errorfile`, `description`, `bind-process`, `monitor-uri`, `rate-limit`, `filter`, `capture`, `http-after-response`, `use-service`, `http-send-name-header`, `hash-type`); each entry is plain markdown (bullet syntax + common flags) kept under 10 lines
+- [x] add `textDocument/hover` handler returning `MarkupContent { kind: "markdown", value: ... }`; resolution order inside the handler:
   1. Word is a defined backend name → show definition line, `mode`, `balance`, and up to 5 server lines with `"…N more"` truncation
   2. Word is a defined ACL name → show the ACL's definition line
   3. Word is a defined stick-table → show the table type + store clauses
   4. Word is a defined server address context → show `host:port` plus flags (`check`, `backup`, `weight N`)
   5. Word is a known directive name (first token on the line and in the docs table) → show the docs snippet
   6. Otherwise → return `null` (Zed renders nothing)
-- [ ] advertise `hoverProvider: true` in `initialize`
-- [ ] add `HOVER_PROBES` covering each of the six resolution paths, asserting the `MarkupContent.value` contains expected substrings (backend name, server list, directive syntax keyword, etc.)
-- [ ] run `python3 test/lsp_probes.py` — full suite must PASS before Task 5
+- [x] advertise `hoverProvider: true` in `initialize`
+- [x] add `HOVER_PROBES` covering each of the six resolution paths, asserting the `MarkupContent.value` contains expected substrings (backend name, server list, directive syntax keyword, etc.)
+- [x] run `python3 test/lsp_probes.py` — full suite must PASS before Task 5 (pre-existing 3 prod.cfg fold failures unchanged; all 9 new hover probes plus all prior passing probes PASS)
 
 ### Task 5: Implement context-aware completion
 

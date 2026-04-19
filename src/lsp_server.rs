@@ -2,6 +2,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 
+mod docs;
+
 #[derive(Debug, Clone)]
 struct Symbol {
     name: String,
@@ -1298,6 +1300,154 @@ impl HaproxyLsp {
         self.find_definition(uri, position, content)
     }
 
+    /// Build a markdown hover body for a backend symbol: the definition line
+    /// followed by `mode`, `balance`, and up to 5 `server` lines. Surplus
+    /// servers are summarised as `… N more`. The body is wrapped in a fenced
+    /// code block so Zed renders it as HAProxy config.
+    fn backend_hover_body(&self, content: &str, sym: &Symbol) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let def_line_idx = sym.range.start.line as usize;
+        let def_line = lines.get(def_line_idx).copied().unwrap_or("").trim();
+
+        let mut mode: Option<String> = None;
+        let mut balance: Option<String> = None;
+        let mut servers: Vec<String> = Vec::new();
+        let mut extra_servers: usize = 0;
+
+        let mut i = def_line_idx + 1;
+        while i < lines.len() {
+            let raw = lines[i];
+            if is_section_header(raw) {
+                break;
+            }
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                i += 1;
+                continue;
+            }
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            match first {
+                "mode" if mode.is_none() => mode = Some(trimmed.to_string()),
+                "balance" if balance.is_none() => balance = Some(trimmed.to_string()),
+                "server" => {
+                    if servers.len() < 5 {
+                        servers.push(trimmed.to_string());
+                    } else {
+                        extra_servers += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        let mut body = String::new();
+        body.push_str("```haproxy\n");
+        body.push_str(def_line);
+        body.push('\n');
+        if let Some(m) = mode {
+            body.push_str("  ");
+            body.push_str(&m);
+            body.push('\n');
+        }
+        if let Some(b) = balance {
+            body.push_str("  ");
+            body.push_str(&b);
+            body.push('\n');
+        }
+        for s in &servers {
+            body.push_str("  ");
+            body.push_str(s);
+            body.push('\n');
+        }
+        if extra_servers > 0 {
+            body.push_str(&format!("  … {} more\n", extra_servers));
+        }
+        body.push_str("```");
+        body
+    }
+
+    /// Fenced code block rendering of the line at `line_idx` trimmed. Used for
+    /// ACL, stick-table, and server hover paths where the whole directive line
+    /// is the most useful summary.
+    fn line_hover_body(&self, content: &str, line_idx: u32) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let raw = lines
+            .get(line_idx as usize)
+            .copied()
+            .unwrap_or("")
+            .trim();
+        let mut body = String::new();
+        body.push_str("```haproxy\n");
+        body.push_str(raw);
+        body.push_str("\n```");
+        body
+    }
+
+    fn find_hover(&self, uri: &str, position: &Position, content: &str) -> Option<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        let line_idx = position.line as usize;
+        if line_idx >= lines.len() {
+            return None;
+        }
+        let line = lines[line_idx];
+        let (word, _word_start) = self.word_at_position(line, position.character as usize)?;
+
+        // Prefer cursor-aware resolution: `find_definition` uses the same
+        // keyword walk-back as Go-to-Definition, so `sc0_*(name)` routes to
+        // the StickTable kind even when a Backend of the same name exists
+        // (stick-tables are conventionally co-named with their enclosing
+        // backend). When it returns None, fall back to a by-name sweep
+        // across kinds for the bare identifier paths (e.g. hovering the
+        // backend name on its own header line, where the walk-back already
+        // handles it — this fallback exists for defensive coverage of any
+        // future call site that lacks a leading keyword).
+        if let Some(sym) = self.find_definition(uri, position, content) {
+            return Some(self.render_symbol_hover(content, &sym));
+        }
+
+        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::Backend) {
+            return Some(self.backend_hover_body(content, &sym));
+        }
+        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::Acl) {
+            return Some(self.line_hover_body(content, sym.range.start.line));
+        }
+        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::StickTable) {
+            return Some(self.line_hover_body(content, sym.range.start.line));
+        }
+        if let Some(sym) = self.find_symbol_by_name(uri, &word, SymbolKind::Server) {
+            return Some(self.line_hover_body(content, sym.range.start.line));
+        }
+
+        // Directive docs: only fire when the cursor word is the directive
+        // token (first whitespace-delimited token on the trimmed line) AND
+        // the docs table has an entry for it. This avoids showing
+        // directive documentation for positional argument words that happen
+        // to collide with a directive name (e.g. a server called `mode`).
+        let first_token = line.trim_start().split_whitespace().next().unwrap_or("");
+        if first_token == word {
+            if let Some(doc) = docs::directive_doc(&word) {
+                return Some(doc.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Dispatch a resolved `Symbol` to the right hover renderer. Backend
+    /// summaries include mode/balance/servers; everything else just shows
+    /// the symbol's own directive line verbatim.
+    fn render_symbol_hover(&self, content: &str, sym: &Symbol) -> String {
+        match sym.kind {
+            SymbolKind::Backend => self.backend_hover_body(content, sym),
+            SymbolKind::Acl
+            | SymbolKind::StickTable
+            | SymbolKind::Server
+            | SymbolKind::Frontend
+            | SymbolKind::Listen => self.line_hover_body(content, sym.range.start.line),
+        }
+    }
+
     fn find_references_to_symbol(&self, uri: &str, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
         // Single-file scope: look only in the requesting document.
         let symbols = self.symbols.get(uri)?;
@@ -1330,6 +1480,7 @@ impl HaproxyLsp {
                             "renameProvider": { "prepareProvider": true },
                             "foldingRangeProvider": true,
                             "documentSymbolProvider": true,
+                            "hoverProvider": true,
                             "textDocumentSync": {
                                 "openClose": true,
                                 "change": 1
@@ -1702,6 +1853,35 @@ impl HaproxyLsp {
                             uri: edits,
                         }
                     }
+                }))
+            }
+            "textDocument/hover" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let position = Position {
+                    line: params["position"]["line"].as_u64()? as u32,
+                    character: params["position"]["character"].as_u64()? as u32,
+                };
+
+                let result = self
+                    .documents
+                    .get(uri)
+                    .cloned()
+                    .and_then(|content| self.find_hover(uri, &position, &content))
+                    .map(|value| {
+                        json!({
+                            "contents": {
+                                "kind": "markdown",
+                                "value": value,
+                            }
+                        })
+                    })
+                    .unwrap_or(Value::Null);
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
                 }))
             }
             "textDocument/declaration" => {
