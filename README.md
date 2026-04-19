@@ -7,14 +7,19 @@ A Zed editor extension that provides syntax highlighting and **"Go to Definition
 - **Semantic Syntax Highlighting**: Directives are colored by category — section headers (`frontend`, `backend`, `listen`, `resolvers`, etc.) vs. identifier names, declaration directives (`bind`, `server`, `acl`, `peer`, `stick-table`) vs. action directives (`use_backend`, `default_backend`, `http-request`, `http-response`, `tcp-request`, `redirect`), settings directives (`timeout`, `maxconn`, `balance`, `stats`, `log`, etc.), option properties (`option httplog` → `httplog` as a property), enumerated types (`mode http`, `balance roundrobin`, `log-level info`), control keywords (`if`, `unless`, `!`, `||`, `&&`, and the TCP phase selectors `connection`/`content`/`session`), and value kinds (addresses, strings, numbers, time values). The coarse `@keyword`/`@function` coloring from older versions is gone.
 - **Code Folding**: Top-level sections collapse to one line (`global`, `defaults`, `frontend X`, `backend X`, `listen X`, `resolvers X`, `userlist`, `peers`, `mailers`, `cache`, `program`, `ring`). Multi-line comment banners (2+ consecutive `#`-prefixed lines) fold as comment regions. Paired `# BEGIN <name>` / `# END <name>` markers fold as explicit regions — a useful convention for grouping related directives inside a long section. Use `editor: fold all` / `Cmd+K Cmd+0` to collapse, `editor: unfold all` / `Cmd+K Cmd+J` to expand.
 - **Document Outline & Breadcrumbs**: The outline panel and breadcrumbs show a two-level tree — each section with its key children (ACLs under frontends/listens, servers under backends/listens, nameservers under resolvers). Section detail strings summarize relevant settings (e.g. a backend shows `<balance> · <mode> · N servers`, a resolvers block shows `N nameservers`, a frontend shows its `bind` addresses). `Cmd+Shift+O` jumps to any symbol by name; the selection range covers the identifier only, not the whole line.
-- **Go to Definition**: Cursor-aware — F12 on an ACL name inside `use_backend X if Y` jumps to the ACL, not to backend X. Works for backend, frontend, listen, ACL, and server references within the current file.
-- **Language Server Protocol**: `foldingRangeProvider`, `documentSymbolProvider`, `definitionProvider`, `declarationProvider`. Single-file scope.
+- **Go to Definition**: Cursor-aware — F12 on an ACL name inside `use_backend X if Y` jumps to the ACL, not to backend X. Works for backend, frontend, listen, ACL, server, and stick-table references within the current file.
+- **Find References**: `editor: find all references` (Shift+F12) lists every call-site of the symbol under the cursor — backends used by `use_backend`/`default_backend`, ACLs in `if`/`unless` conditions, stick-tables referenced by `sc0_*(...)` / `stick match` / `stick on ... table`. Works from both the definition and any reference line; toggle `includeDeclaration` to include the definition in results.
+- **Rename Symbol**: `editor: rename` (F2) renames a backend, ACL, server, frontend, or listen and updates every call-site in the file atomically. `prepareProvider` pre-fills the rename box with the current identifier; invalid names (empty, whitespace, or any character outside `[a-zA-Z0-9_.-]`) are rejected with a JSON-RPC error. Stick-tables are renamed by renaming their enclosing section (HAProxy binds one table per section).
+- **Hover**: Cursor on a backend name shows the definition line, `mode`, `balance`, and the first 5 server lines (`"…N more"` truncation). Cursor on an ACL shows the definition line. Cursor on a stick-table shows the type and store clauses. Cursor on a known directive (`bind`, `server`, `acl`, `http-request`, `stick-table`, …) shows a curated markdown snippet from `src/docs.rs`.
+- **Completion**: Context-aware. After `use_backend `/`default_backend ` → backend names. After `if `/`unless `/`! ` → ACL names. After `use_server ` → server names from the enclosing backend only. Inside `sc0_*(`, `sc1_*(`, `stick match `, `stick store-request ` → stick-table names. Start-of-line inside a section → the per-section directive allowlist. Items carry `detail` (e.g. backend mode + balance), `documentation` from `src/docs.rs`, and rank by in-file usage frequency (popular symbols float to the top) with alphabetical tie-break.
+- **Language Server Protocol**: `foldingRangeProvider`, `documentSymbolProvider`, `definitionProvider`, `declarationProvider`, `referencesProvider`, `renameProvider` (with `prepareProvider`), `hoverProvider`, `completionProvider`. Single-file scope.
 
 ### Supported Navigation
 
 - **Backend References**: `use_backend web_servers` → jumps to `backend web_servers`
 - **Default Backend**: `default_backend api` → jumps to `backend api`
 - **ACL References**: `if is_mobile` → jumps to `acl is_mobile`
+- **Stick-table References**: `sc0_http_req_rate(tbl)` → jumps to the backend defining `stick-table type ... size ... store ...`
 
 ## Installation
 
@@ -51,10 +56,12 @@ Zed requires a wasm *component*. Let Zed's builder handle it.
 ## Usage
 
 1. Open HAProxy configuration files (`.cfg`, `.conf`, `.haproxy`)
-2. Use **F12** or **"Go to Definition"** on:
-   - Backend names in `use_backend` statements
-   - Backend names in `default_backend` statements
-   - ACL names in conditional expressions
+2. Available actions on symbols (backends, frontends, listens, ACLs, servers, stick-tables):
+   - **F12** / Go to Definition — backend names in `use_backend`/`default_backend`, ACL names in `if`/`unless` conditions, stick-table names in `sc0_*(...)`/`stick match`/`stick on ... table`
+   - **Shift+F12** / Find All References — every call-site of the symbol under the cursor
+   - **F2** / Rename Symbol — backends, ACLs, servers, frontends, listens (stick-tables rename via their enclosing section)
+   - **Hover** — summaries for symbols and curated markdown docs for known directives
+   - **Completion** — context-aware suggestions after ` ` (space) or `(`, scoped by surrounding keyword
 
 ### Example
 
@@ -68,6 +75,32 @@ frontend main
   acl is_api path_beg /api   # ← DEFINITION
   use_backend api if is_api  # ← F12 on "is_api" jumps to ACL
 ```
+
+### Tier 2 capabilities in action
+
+Completion — typing `use_backend ` shows every defined backend in the file, ranked by usage frequency:
+
+```haproxy
+frontend main
+  use_backend web_servers     # start typing after the space
+  #             ^ completion lists: web_servers, api, static, …
+```
+
+Hover — F1 / cursor rest on a backend name shows a summary:
+
+```haproxy
+use_backend api
+#            ^ hover shows:
+#              backend api
+#              mode http
+#              balance roundrobin
+#              server api1 10.0.0.1:8080 check
+#              server api2 10.0.0.2:8080 check
+```
+
+References — Shift+F12 on a backend name lists every `use_backend` / `default_backend` referencing it. Toggle `includeDeclaration` to also show the `backend <name>` line itself.
+
+Rename — F2 on `api` renames the backend and every call-site atomically in one edit. Invalid names (`foo bar`, `bad@name`, empty) surface as a JSON-RPC error.
 
 ## Architecture
 
@@ -97,7 +130,8 @@ resulting plain wasm module won't load (Zed needs a wasm component).
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}' | ./bin/haproxy-lsp
 
 # Regression check — drives the LSP over stdio and asserts
-# definition/folding/documentSymbol responses against fixtures.
+# definition, declaration, folding, documentSymbol, references,
+# rename, hover, and completion responses against fixtures.
 python3 test/lsp_probes.py
 ```
 
@@ -107,7 +141,8 @@ python3 test/lsp_probes.py
 haproxy-zed/
 ├── src/
 │   ├── lib.rs           # Extension entry point
-│   └── lsp_server.rs    # LSP server implementation
+│   ├── lsp_server.rs    # LSP server implementation
+│   └── docs.rs          # Curated directive docs (used by hover + completion)
 ├── languages/haproxy/   # Language configuration
 ├── grammars/           # Tree-sitter grammar
 ├── extension.toml      # Extension metadata
@@ -122,8 +157,6 @@ haproxy-zed/
 ## Future Enhancements
 
 - Cross-file reference resolution (`-f path.cfg`, `include`)
-- Hover information and documentation
-- Auto-completion for backend/ACL/server names
 - Diagnostics for undefined references, unused sections, duplicate names
 - `haproxy -c` integration for real syntax errors
 - Full tree-sitter integration in the LSP

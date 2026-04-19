@@ -1,20 +1,24 @@
 # HAProxy Zed Extension — Roadmap
 
-Long-range plan for the extension's capabilities. Tier 1 (editor UX: semantic highlighting, folding, outline) has a detailed implementation plan at [`plans/20260418-tier1-editor-ux.md`](plans/20260418-tier1-editor-ux.md). This document covers everything that comes after.
+Long-range plan for the extension's capabilities. Tier 1 (editor UX: semantic highlighting, folding, outline) shipped as v0.2.0. Tier 2 (editing intelligence: completion, hover, references, rename, stick-table symbol kind) shipped as v0.3.0 — see [`plans/2026-04-18-tier2-editing-intelligence.md`](plans/2026-04-18-tier2-editing-intelligence.md).
 
-## Current state (v0.1.x)
+## Current state (v0.3.x)
 
-- Syntax highlighting (coarse — most directives share one color)
-- Go to Definition for `use_backend X` / `default_backend X` / `if <acl>` / `unless <acl>` (cursor-aware since v0.1.5)
-- Go to Declaration (find references) for definitions of backends, ACLs, frontends, listens, servers
+- Semantic syntax highlighting (directives colored by category)
+- Go to Definition / Declaration, cursor-aware, across backend/frontend/listen/ACL/server/stick-table
+- Folding (sections, comment banners, BEGIN/END markers)
+- Document outline + breadcrumbs
+- Find References (`textDocument/references`) with `includeDeclaration` handling
+- Rename (`textDocument/rename` with `prepareProvider`) for backends, ACLs, servers, frontends, listens
+- Hover (`textDocument/hover`) for backends, ACLs, stick-tables, servers, and ~50 curated directive docs
+- Completion (`textDocument/completion`) for backends, ACLs, servers, stick-tables, and per-section directive allowlists — ranked by in-file usage frequency
 - Single-file scope; regex-based parser in the LSP
-- No completion, hover, diagnostics, formatting, outline, or folding
 
-## Tier 1 — Editor UX (in progress)
+## Tier 1 — Editor UX (shipped as v0.2.0)
 
-Semantic highlighting, LSP foldingRange, LSP documentSymbol. See the detailed plan for specifics. Ships as v0.2.0.
+Semantic highlighting, LSP foldingRange, LSP documentSymbol.
 
-## Tier 2 — Editing intelligence
+## Tier 2 — Editing intelligence (shipped as v0.3.0)
 
 **Goal:** make the extension actively helpful while typing, not just correct while reading. After Tier 2 the user spends less time typing symbol names and less time jumping around to remember what a reference points at.
 

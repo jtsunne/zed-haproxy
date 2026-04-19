@@ -215,6 +215,79 @@ DEFINITION_PROBES = [
         "character": 10,
         "expected_def_line": 78,
     },
+    # --- stick-table kind (Task 1) ---
+    # The stick-table is bound to the enclosing section `st_ratelimit`
+    # (line 94). Its definition range points at the `stick-table` directive
+    # line (95). References via sc<N>_*(...) and `table <name>` resolve to
+    # that directive line; the cursor on the section header still resolves
+    # to the Backend kind at line 94 (existing behavior).
+    {
+        "desc": "stick-table name on backend header (Backend kind self-ref)",
+        "line": 94,
+        "character": 12,
+        "expected_def_line": 94,
+    },
+    {
+        "desc": "stick-table reference inside `sc0_http_req_rate(...)` call",
+        "line": 102,
+        "character": 65,
+        "expected_def_line": 95,
+    },
+    {
+        "desc": "stick-table reference after ` table ` keyword",
+        "line": 101,
+        "character": 40,
+        "expected_def_line": 95,
+    },
+    # --- regression (Codex review): servers are section-scoped ---
+    # Two backends each declare `server shared ...`. `use_server shared`
+    # inside scoped_a must resolve to scoped_a's own server (line 129), not
+    # cross-link to scoped_b's line 134 server.
+    {
+        "desc": "scoped server: use_server in backend A resolves to A's server",
+        "line": 130,
+        "character": 13,
+        "expected_def_line": 129,
+    },
+    {
+        "desc": "scoped server: use_server in backend B resolves to B's server",
+        "line": 135,
+        "character": 13,
+        "expected_def_line": 134,
+    },
+    # --- regression (Codex review): stick match/store-* sample is not a table ---
+    # Per HAProxy grammar, the token after `stick match`/`stick store-*` is a
+    # sample expression, not a table name. Even though a stick-table named
+    # `src` exists (at line 138), the cursor on `src` here must NOT resolve.
+    {
+        "desc": "`stick match src` — sample expression, not a stick-table",
+        "line": 140,
+        "character": 15,
+        "expected_null": True,
+    },
+    {
+        "desc": "`stick store-request src` — sample expression, not a stick-table",
+        "line": 141,
+        "character": 23,
+        "expected_null": True,
+    },
+    # --- regression (Codex review): cursor on fetch inside `{ ... }` vs same-named ACL ---
+    # `use_backend ... if { src 10.0.0.0/8 } real_acl` has an ACL named `src`
+    # and an ACL named `real_acl`. Cursor on `src` inside braces must NOT
+    # resolve to the same-named ACL (it's a sample fetch, not a reference),
+    # while cursor on `real_acl` after the closing brace must still resolve.
+    {
+        "desc": "fetch token inside `{ ... }` must not resolve to same-named ACL",
+        "line": 169,
+        "character": 40,
+        "expected_null": True,
+    },
+    {
+        "desc": "ACL reference after closing brace still resolves",
+        "line": 169,
+        "character": 58,
+        "expected_def_line": 168,
+    },
 ]
 
 # Folding probes verify `textDocument/foldingRange` output against fixture files.
@@ -267,10 +340,10 @@ FOLDING_PROBES: list[dict] = [
         "expected": {"startLine": 82, "endLine": 85, "kind": "region"},
     },
     {
-        "desc": "conf: final `frontend dotted_caller` fold reaches EOF",
+        "desc": "conf: `frontend dotted_caller` fold ends before stick-table backend",
         "fixture": "conf",
         "match": "contains",
-        "expected": {"startLine": 86, "endLine": 92, "kind": "region"},
+        "expected": {"startLine": 86, "endLine": 93, "kind": "region"},
     },
     {
         "desc": "conf: BEGIN/END `dotted_names` region wraps new fixtures",
@@ -278,24 +351,48 @@ FOLDING_PROBES: list[dict] = [
         "match": "contains",
         "expected": {"startLine": 76, "endLine": 92, "kind": "region"},
     },
+    {
+        "desc": "conf: `backend st_ratelimit` section fold",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 94, "endLine": 97, "kind": "region"},
+    },
+    {
+        "desc": "conf: `frontend st_caller` fold stops before next section",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 98, "endLine": 105, "kind": "region"},
+    },
+    {
+        "desc": "conf: `frontend dup_acl_caller` fold runs up to the next section",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 118, "endLine": 126, "kind": "region"},
+    },
+    {
+        "desc": "conf: `backend src` section fold ends before next frontend",
+        "fixture": "conf",
+        "match": "contains",
+        "expected": {"startLine": 137, "endLine": 144, "kind": "region"},
+    },
     # --- haproxy.prod.cfg: the real 1190-line fixture ---
     {
         "desc": "prod.cfg: section fold of `defaults`",
         "fixture": "cfg",
         "match": "contains",
-        "expected": {"startLine": 35, "endLine": 50, "kind": "region"},
+        "expected": {"startLine": 33, "endLine": 48, "kind": "region"},
     },
     {
         "desc": "prod.cfg: final section fold reaches last line",
         "fixture": "cfg",
         "match": "contains",
-        "expected": {"startLine": 1171, "endLine": 1189, "kind": "region"},
+        "expected": {"startLine": 1169, "endLine": 1187, "kind": "region"},
     },
     {
         "desc": "prod.cfg: BEGIN/END `Rate limit for login` region",
         "fixture": "cfg",
         "match": "contains",
-        "expected": {"startLine": 59, "endLine": 62, "kind": "region"},
+        "expected": {"startLine": 57, "endLine": 60, "kind": "region"},
     },
     # --- edge case: URI never opened returns [] ---
     {
@@ -514,6 +611,448 @@ DEFINITION_NULL_PROBES: list[dict] = [
 ]
 
 
+# References probes exercise `textDocument/references` against
+# test/haproxy.conf. Each probe drives the cursor-aware resolution path plus
+# the definition-line fallback. `include_declaration` toggles whether the
+# symbol's own definition range is prepended to the location list.
+# `expected_lines` is a set of 0-indexed line numbers each returned Location
+# must map to via `range.start.line`.
+REFERENCES_PROBES: list[dict] = [
+    {
+        "desc": "backend name on `use_backend` line (exclude declaration)",
+        "line": 33,
+        "character": 20,
+        "include_declaration": False,
+        "expected_lines": {33, 43, 123, 156},
+    },
+    {
+        "desc": "backend name on `use_backend` line (include declaration)",
+        "line": 33,
+        "character": 20,
+        "include_declaration": True,
+        "expected_lines": {33, 43, 50, 123, 156},
+    },
+    {
+        "desc": "ACL in `if` condition (exclude declaration)",
+        "line": 33,
+        "character": 55,
+        "include_declaration": False,
+        "expected_lines": {33},
+    },
+    {
+        "desc": "ACL in `if` condition (include declaration)",
+        "line": 33,
+        "character": 55,
+        "include_declaration": True,
+        "expected_lines": {31, 33},
+    },
+    {
+        "desc": "stick-table in `sc0_*(name)` (exclude declaration)",
+        "line": 102,
+        "character": 65,
+        "include_declaration": False,
+        "expected_lines": {101, 102, 116, 148},
+    },
+    {
+        "desc": "stick-table in `sc0_*(name)` (include declaration)",
+        "line": 102,
+        "character": 65,
+        "include_declaration": True,
+        "expected_lines": {95, 101, 102, 116, 148},
+    },
+    {
+        "desc": "stick-table after ` table ` keyword (exclude declaration)",
+        "line": 101,
+        "character": 40,
+        "include_declaration": False,
+        "expected_lines": {101, 102, 116, 148},
+    },
+    {
+        "desc": "server `use_server` call-sites listed (exclude declaration)",
+        "line": 110,
+        "character": 15,
+        "include_declaration": False,
+        "expected_lines": {110},
+    },
+    {
+        "desc": "server reference from definition line (include declaration)",
+        "line": 108,
+        "character": 12,
+        "include_declaration": True,
+        "expected_lines": {108, 110},
+    },
+    {
+        "desc": "duplicate ACL references attach only once per call-site; both declaration lines surface",
+        "line": 123,
+        "character": 48,
+        "include_declaration": True,
+        "expected_lines": {121, 122, 123},
+    },
+    {
+        "desc": "backend name on definition line (include declaration)",
+        "line": 50,
+        "character": 15,
+        "include_declaration": True,
+        "expected_lines": {33, 43, 50, 123, 156},
+    },
+    {
+        "desc": "backend name on definition line (exclude declaration)",
+        "line": 50,
+        "character": 15,
+        "include_declaration": False,
+        "expected_lines": {33, 43, 123, 156},
+    },
+    {
+        "desc": "ACL after inline sample whose regex has unbalanced literal brace",
+        "line": 156,
+        "character": 70,
+        "include_declaration": True,
+        "expected_lines": {155, 156},
+    },
+]
+
+
+# Rename probes exercise `textDocument/prepareRename` and `textDocument/rename`
+# against test/haproxy.conf. `type` selects the handler; identifier ranges are
+# computed from the on-disk fixture (identifiers are ASCII so char == byte).
+#   - prepare: asserts `result.range` and `result.placeholder`, or that
+#     the server returns `null` for non-renameable cursors.
+#   - rename: asserts the set of edits under `changes[uri]` as
+#     (line, start_char, end_char) tuples. A `new_name` field is required.
+#   - rename with `expect_error`: asserts a JSON-RPC error with the given
+#     `expected_error_code`.
+RENAME_PROBES: list[dict] = [
+    {
+        "desc": "prepareRename on backend reference returns identifier range",
+        "type": "prepare",
+        "line": 33,
+        "character": 20,
+        "expected_range": (33, 14, 42),
+        "expected_placeholder": "accountCreationService_10000",
+    },
+    {
+        "desc": "prepareRename on backend definition returns identifier range",
+        "type": "prepare",
+        "line": 50,
+        "character": 15,
+        "expected_range": (50, 8, 36),
+        "expected_placeholder": "accountCreationService_10000",
+    },
+    {
+        "desc": "prepareRename on ACL reference returns identifier range",
+        "type": "prepare",
+        "line": 33,
+        "character": 55,
+        "expected_range": (33, 46, 73),
+        "expected_placeholder": "app__accountCreationService",
+    },
+    {
+        "desc": "prepareRename on `use_backend` keyword returns null",
+        "type": "prepare",
+        "line": 33,
+        "character": 5,
+        "expected_null": True,
+    },
+    {
+        "desc": "prepareRename on `backend` keyword of definition line returns null",
+        "type": "prepare",
+        "line": 50,
+        "character": 3,
+        "expected_null": True,
+    },
+    {
+        "desc": "rename backend updates definition + every reference",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "newBackend",
+        "expected_edits": {(50, 8, 36), (33, 14, 42), (43, 14, 42), (123, 14, 42), (156, 14, 42)},
+    },
+    {
+        "desc": "rename ACL updates definition + every if-condition reference",
+        "type": "rename",
+        "line": 33,
+        "character": 55,
+        "new_name": "newAcl",
+        "expected_edits": {(31, 6, 33), (33, 46, 73)},
+    },
+    {
+        "desc": "rename with empty name returns -32602",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "",
+        "expect_error": True,
+        "expected_error_code": -32602,
+    },
+    {
+        "desc": "rename with whitespace in name returns -32602",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "bad name",
+        "expect_error": True,
+        "expected_error_code": -32602,
+    },
+    {
+        "desc": "rename with disallowed character returns -32602",
+        "type": "rename",
+        "line": 33,
+        "character": 20,
+        "new_name": "bad@name",
+        "expect_error": True,
+        "expected_error_code": -32602,
+    },
+    {
+        "desc": "prepareRename on server `use_server` reference returns identifier range",
+        "type": "prepare",
+        "line": 110,
+        "character": 15,
+        "expected_range": (110, 13, 22),
+        "expected_placeholder": "srv_alpha",
+    },
+    {
+        "desc": "rename server updates definition + every `use_server` reference",
+        "type": "rename",
+        "line": 110,
+        "character": 15,
+        "new_name": "srv_renamed",
+        "expected_edits": {(108, 9, 18), (110, 13, 22)},
+    },
+    # --- regression (Codex): scoped server rename only touches own section ---
+    # Renaming `server shared` in backend scoped_a must rewrite the two
+    # shared references in scoped_a only (lines 129, 130). The same-named
+    # server in scoped_b (lines 134, 135) must be left alone.
+    {
+        "desc": "rename server scoped to enclosing backend (does not touch duplicate in other backend)",
+        "type": "rename",
+        "line": 129,
+        "character": 11,
+        "new_name": "shared_a",
+        "expected_edits": {(129, 9, 15), (130, 13, 19)},
+    },
+    # --- regression (Codex): section rename cascades to stick-table call sites ---
+    # Renaming backend `st_ratelimit` must rewrite the backend header,
+    # the stick-table ` table st_ratelimit` ref (line 101), the
+    # `sc0_http_req_rate(st_ratelimit)` ref (line 102), and the
+    # `table st_ratelimit # ...` ref in the second fixture (line 116).
+    {
+        "desc": "rename section with stick-table cascades to sc*_*/table call-sites",
+        "type": "rename",
+        "line": 94,
+        "character": 12,
+        "new_name": "rl_renamed",
+        "expected_edits": {
+            (94, 8, 20),
+            (101, 35, 47),
+            (102, 59, 71),
+            (116, 35, 47),
+            (148, 35, 47),
+            (148, 71, 83),
+        },
+    },
+    # --- regression (Codex): direct rename skipping prepareRename must not
+    # accept cursor positions that would have been rejected by prepareRename.
+    # Cursor on the `backend` keyword (column 2) of a definition line must
+    # return null, matching the prepareRename guard instead of silently
+    # renaming the whole symbol.
+    {
+        "desc": "rename on `backend` keyword of definition line returns null",
+        "type": "rename",
+        "line": 50,
+        "character": 2,
+        "new_name": "renamed",
+        "expected_null": True,
+    },
+    {
+        "desc": "rename on `use_backend` keyword returns null",
+        "type": "rename",
+        "line": 33,
+        "character": 5,
+        "new_name": "renamed",
+        "expected_null": True,
+    },
+]
+
+
+# Hover probes exercise `textDocument/hover` against test/haproxy.conf.
+# Each probe points at a cursor position and asserts the hover response is a
+# markdown MarkupContent whose `value` contains every listed substring
+# (order-independent). `expected_null` asserts a null hover instead.
+HOVER_PROBES: list[dict] = [
+    {
+        "desc": "hover on backend name in `use_backend` shows definition + servers",
+        "line": 33,
+        "character": 20,
+        "expected_contains": [
+            "backend accountCreationService_10000",
+            "mode http",
+            "balance roundrobin",
+            "151_256_250_151_35800",
+        ],
+    },
+    {
+        "desc": "hover on backend header itself shows backend summary",
+        "line": 50,
+        "character": 15,
+        "expected_contains": [
+            "backend accountCreationService_10000",
+            "server 151_256_250_151_35800",
+        ],
+    },
+    {
+        "desc": "hover on ACL reference shows ACL definition line",
+        "line": 33,
+        "character": 55,
+        "expected_contains": [
+            "acl app__accountCreationService",
+            "hdr(x-microservice-app-id)",
+        ],
+    },
+    {
+        "desc": "hover on stick-table reference shows stick-table directive",
+        "line": 102,
+        "character": 65,
+        "expected_contains": [
+            "stick-table type ip",
+            "http_req_rate(10s)",
+        ],
+    },
+    {
+        "desc": "hover on server name shows server directive line",
+        "line": 56,
+        "character": 15,
+        "expected_contains": [
+            "server 151_256_250_151_35800",
+            "151.256.250.151:35800",
+        ],
+    },
+    {
+        "desc": "hover on `use_backend` directive keyword shows docs snippet",
+        "line": 33,
+        "character": 5,
+        "expected_contains": [
+            "use_backend",
+        ],
+    },
+    {
+        "desc": "hover on `stick-table` directive keyword shows docs snippet",
+        "line": 95,
+        "character": 4,
+        "expected_contains": [
+            "stick-table",
+        ],
+    },
+    {
+        "desc": "hover on whitespace returns null",
+        "line": 1,
+        "character": 0,
+        "expected_null": True,
+    },
+    # --- regression (Codex): hover on a fetch token inside `{ ... }` must
+    # NOT leak through to an unconstrained by-name lookup. The
+    # `use_backend brace_cursor_target if { src 10.0.0.0/8 } real_acl` line
+    # has a fetch `src` inside the brace group; a backend named `src` also
+    # exists elsewhere in the fixture. Hover on the fetch must return null
+    # (same contract as find_definition).
+    {
+        "desc": "hover on fetch inside `{ ... }` does not resolve to same-named backend",
+        "line": 169,
+        "character": 40,
+        "expected_null": True,
+    },
+    {
+        "desc": "hover on arbitrary non-symbol token returns null",
+        "line": 3,
+        "character": 3,
+        "expected_null": True,
+    },
+]
+
+
+# Completion probes exercise `textDocument/completion`. Each probe declares a
+# cursor position on a fixture plus a minimum set of expected labels (not an
+# exact-equality check, to keep the tests tolerant of future directive-list
+# changes). `expected_kind` (when set) asserts every matched item carries the
+# given CompletionItemKind; `expected_missing` asserts labels that MUST NOT
+# appear (used to prove a context is distinguished from another).
+COMPLETION_FIXTURE_USE_SERVER_URI = (
+    "file:///tmp/haproxy-lsp-completion-use-server-fixture.cfg"
+)
+COMPLETION_FIXTURE_USE_SERVER_TEXT = "\n".join(
+    [
+        "backend bk",                    # 0
+        "  server s1 10.0.0.1:1",        # 1
+        "  server s2 10.0.0.2:2",        # 2
+        "  use_server ",                 # 3: cursor at char 13 = right after `use_server `
+        "",                               # 4
+        "backend bk_other",               # 5
+        "  server elsewhere 10.9.9.9:9", # 6: must NOT appear in bk scope
+        "",
+    ]
+)
+
+COMPLETION_PROBES: list[dict] = [
+    {
+        "desc": "after `use_backend ` → backend names",
+        "fixture": "conf",
+        "line": 33,
+        "character": 14,
+        "expected_labels": {
+            "accountCreationService_10000",
+            "profileEditingService_20000",
+            "dotted.backend",
+            "st_ratelimit",
+        },
+        "expected_kind": 7,  # Class
+    },
+    {
+        "desc": "after `if ` → ACL names",
+        "fixture": "conf",
+        "line": 33,
+        "character": 46,
+        "expected_labels": {
+            "app__accountCreationService",
+            "app__profileEditingService",
+            "dotted.acl",
+        },
+        "expected_kind": 21,  # Constant
+    },
+    {
+        "desc": "inside `sc0_http_req_rate(` → stick-table names",
+        "fixture": "conf",
+        "line": 102,
+        "character": 60,
+        "expected_labels": {"st_ratelimit"},
+        "expected_kind": 22,  # Struct
+    },
+    {
+        "desc": "after `use_server ` → servers in enclosing backend only",
+        "fixture": "use_server",
+        "line": 3,
+        "character": 13,
+        "expected_labels": {"s1", "s2"},
+        "expected_kind": 6,  # Variable
+        "expected_missing": {"elsewhere"},
+    },
+    {
+        "desc": "start of line inside backend section → directive allowlist",
+        "fixture": "conf",
+        "line": 57,
+        "character": 0,
+        "expected_labels": {"server", "balance", "mode", "option", "http-request"},
+        "expected_kind": 14,  # Keyword
+    },
+    {
+        "desc": "prod.cfg: after `use_backend ` → ≥5 backend names",
+        "fixture": "cfg",
+        "line": 727,
+        "character": 16,
+        "expected_min_labels_of_kind": {"kind": 7, "min": 5},
+    },
+]
+
+
 DECLARATION_PROBES: list[dict] = [
     {
         "desc": "`!plain` in `if` condition yields declaration reference",
@@ -594,6 +1133,16 @@ def run_definition_probes(client: LspClient, results: Results):
             continue
 
         result = resp.get("result")
+        # Some probes assert that the cursor resolves to NOTHING (e.g. a
+        # sample expression after `stick match` must not cross-link to a
+        # same-named stick-table). Accept both `null` and `[]` as "no
+        # definition found" per LSP spec.
+        if probe.get("expected_null"):
+            ok = result is None or result == []
+            detail = "null as expected" if ok else f"unexpected result: {result!r}"
+            results.record("definition", probe["desc"], ok, detail)
+            continue
+
         if result is None:
             results.record(
                 "definition",
@@ -913,6 +1462,431 @@ def run_definition_null_probes(client: LspClient, results: Results):
         results.record("definition-null", probe["desc"], ok, detail)
 
 
+def run_references_probes(client: LspClient, results: Results):
+    if not REFERENCES_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record("references", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    client.did_open(uri, HAPROXY_CONF.read_text())
+
+    for probe in REFERENCES_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/references",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                    "context": {"includeDeclaration": probe["include_declaration"]},
+                },
+            )
+        except TimeoutError as exc:
+            results.record("references", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if not isinstance(result, list):
+            results.record(
+                "references",
+                probe["desc"],
+                False,
+                f"expected list, got {type(result).__name__}: {result!r}",
+            )
+            continue
+
+        actual_lines = {loc["range"]["start"]["line"] for loc in result}
+        expected = probe["expected_lines"]
+        ok = actual_lines == expected
+        if ok:
+            detail = f"lines {sorted(actual_lines)}"
+        else:
+            detail = f"expected {sorted(expected)}, got {sorted(actual_lines)}"
+        results.record("references", probe["desc"], ok, detail)
+
+
+def run_rename_probes(client: LspClient, results: Results):
+    if not RENAME_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record("rename", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    client.did_open(uri, HAPROXY_CONF.read_text())
+
+    for probe in RENAME_PROBES:
+        probe_type = probe["type"]
+        params = {
+            "textDocument": {"uri": uri},
+            "position": {
+                "line": probe["line"],
+                "character": probe["character"],
+            },
+        }
+
+        if probe_type == "prepare":
+            try:
+                resp = client.request("textDocument/prepareRename", params)
+            except TimeoutError as exc:
+                results.record("rename", probe["desc"], False, str(exc))
+                continue
+
+            result = resp.get("result")
+            if probe.get("expected_null"):
+                ok = result is None
+                detail = "null as expected" if ok else f"expected null, got {result!r}"
+                results.record("rename", probe["desc"], ok, detail)
+                continue
+
+            if not isinstance(result, dict):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected object, got {type(result).__name__}: {result!r}",
+                )
+                continue
+
+            rng = result.get("range") or {}
+            start = rng.get("start") or {}
+            end = rng.get("end") or {}
+            actual = (
+                start.get("line"),
+                start.get("character"),
+                end.get("character"),
+            )
+            if end.get("line") != start.get("line"):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"range spans multiple lines: {rng!r}",
+                )
+                continue
+            expected = probe["expected_range"]
+            if actual != expected:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected range {expected}, got {actual}",
+                )
+                continue
+            placeholder = result.get("placeholder")
+            if placeholder != probe["expected_placeholder"]:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"placeholder {placeholder!r} != {probe['expected_placeholder']!r}",
+                )
+                continue
+            results.record(
+                "rename",
+                probe["desc"],
+                True,
+                f"range={actual} placeholder={placeholder!r}",
+            )
+            continue
+
+        if probe_type == "rename":
+            params["newName"] = probe["new_name"]
+            try:
+                resp = client.request("textDocument/rename", params)
+            except TimeoutError as exc:
+                results.record("rename", probe["desc"], False, str(exc))
+                continue
+
+            if probe.get("expect_error"):
+                err = resp.get("error")
+                if not isinstance(err, dict):
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        False,
+                        f"expected error, got result={resp.get('result')!r}",
+                    )
+                    continue
+                code = err.get("code")
+                if code != probe["expected_error_code"]:
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        False,
+                        f"error code {code} != {probe['expected_error_code']}",
+                    )
+                    continue
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    True,
+                    f"error code {code}: {err.get('message')!r}",
+                )
+                continue
+
+            result = resp.get("result")
+            if probe.get("expected_null"):
+                if result is None:
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        True,
+                        "null as expected",
+                    )
+                else:
+                    results.record(
+                        "rename",
+                        probe["desc"],
+                        False,
+                        f"expected null, got {result!r}",
+                    )
+                continue
+            if not isinstance(result, dict):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected object, got {type(result).__name__}: {result!r}",
+                )
+                continue
+            changes = result.get("changes") or {}
+            edits = changes.get(uri)
+            if not isinstance(edits, list):
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"no edits for uri: changes={changes!r}",
+                )
+                continue
+            actual = set()
+            all_newtext_ok = True
+            for e in edits:
+                rng = e.get("range") or {}
+                s = rng.get("start") or {}
+                en = rng.get("end") or {}
+                if s.get("line") != en.get("line"):
+                    all_newtext_ok = False
+                    break
+                actual.add((s.get("line"), s.get("character"), en.get("character")))
+                if e.get("newText") != probe["new_name"]:
+                    all_newtext_ok = False
+                    break
+            if not all_newtext_ok:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"malformed edit in {edits!r}",
+                )
+                continue
+            expected = probe["expected_edits"]
+            if actual != expected:
+                results.record(
+                    "rename",
+                    probe["desc"],
+                    False,
+                    f"expected edits {sorted(expected)}, got {sorted(actual)}",
+                )
+                continue
+            results.record(
+                "rename",
+                probe["desc"],
+                True,
+                f"{len(actual)} edits at {sorted(actual)}",
+            )
+            continue
+
+        results.record("rename", probe["desc"], False, f"unknown probe type: {probe_type}")
+
+
+def run_hover_probes(client: LspClient, results: Results):
+    if not HOVER_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record("hover", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    client.did_open(uri, HAPROXY_CONF.read_text())
+
+    for probe in HOVER_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/hover",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("hover", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if probe.get("expected_null"):
+            ok = result is None
+            detail = "null as expected" if ok else f"expected null, got {result!r}"
+            results.record("hover", probe["desc"], ok, detail)
+            continue
+
+        if not isinstance(result, dict):
+            results.record(
+                "hover",
+                probe["desc"],
+                False,
+                f"expected object, got {type(result).__name__}: {result!r}",
+            )
+            continue
+        contents = result.get("contents") or {}
+        if not isinstance(contents, dict) or contents.get("kind") != "markdown":
+            results.record(
+                "hover",
+                probe["desc"],
+                False,
+                f"expected markdown MarkupContent, got {contents!r}",
+            )
+            continue
+        value = contents.get("value") or ""
+        missing = [s for s in probe["expected_contains"] if s not in value]
+        if missing:
+            preview = value.replace("\n", "\\n")[:120]
+            results.record(
+                "hover",
+                probe["desc"],
+                False,
+                f"missing {missing!r} in {preview!r}",
+            )
+            continue
+        results.record(
+            "hover",
+            probe["desc"],
+            True,
+            f"matched {len(probe['expected_contains'])} substrings",
+        )
+
+
+def run_completion_probes(client: LspClient, results: Results):
+    if not COMPLETION_PROBES:
+        return
+
+    opened_uris: dict[str, str] = {}
+    fixtures = {
+        "conf": HAPROXY_CONF,
+        "cfg": HAPROXY_CFG,
+    }
+    for key, path in fixtures.items():
+        if not any(p["fixture"] == key for p in COMPLETION_PROBES):
+            continue
+        if not path.exists():
+            results.record("completion", f"fixture present: {key}", False, f"missing: {path}")
+            continue
+        uri = path_to_uri(path)
+        client.did_open(uri, path.read_text())
+        opened_uris[key] = uri
+
+    # Inline fixture for the use_server scoping probe.
+    if any(p["fixture"] == "use_server" for p in COMPLETION_PROBES):
+        client.did_open(
+            COMPLETION_FIXTURE_USE_SERVER_URI,
+            COMPLETION_FIXTURE_USE_SERVER_TEXT,
+        )
+        opened_uris["use_server"] = COMPLETION_FIXTURE_USE_SERVER_URI
+
+    for probe in COMPLETION_PROBES:
+        uri = opened_uris.get(probe["fixture"])
+        if uri is None:
+            results.record("completion", probe["desc"], False, "fixture not opened")
+            continue
+
+        try:
+            resp = client.request(
+                "textDocument/completion",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("completion", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        # Spec allows either `CompletionList` or `CompletionItem[]`; we return
+        # the list form so unwrap `.items`.
+        items: list = []
+        if isinstance(result, dict):
+            items = result.get("items") or []
+        elif isinstance(result, list):
+            items = result
+
+        actual_labels = {item.get("label") for item in items}
+
+        if "expected_min_labels_of_kind" in probe:
+            spec = probe["expected_min_labels_of_kind"]
+            of_kind = [i for i in items if i.get("kind") == spec["kind"]]
+            ok = len(of_kind) >= spec["min"]
+            detail = (
+                f"{len(of_kind)} items of kind {spec['kind']} (need ≥{spec['min']})"
+            )
+            results.record("completion", probe["desc"], ok, detail)
+            continue
+
+        expected = probe["expected_labels"]
+        missing = expected - actual_labels
+        if missing:
+            preview = ", ".join(sorted(actual_labels))[:120]
+            results.record(
+                "completion",
+                probe["desc"],
+                False,
+                f"missing {sorted(missing)}; got {preview!r}",
+            )
+            continue
+
+        if "expected_missing" in probe:
+            forbidden = probe["expected_missing"] & actual_labels
+            if forbidden:
+                results.record(
+                    "completion",
+                    probe["desc"],
+                    False,
+                    f"forbidden labels leaked: {sorted(forbidden)}",
+                )
+                continue
+
+        if "expected_kind" in probe:
+            wanted = probe["expected_kind"]
+            mismatched = [
+                i.get("label")
+                for i in items
+                if i.get("label") in expected and i.get("kind") != wanted
+            ]
+            if mismatched:
+                results.record(
+                    "completion",
+                    probe["desc"],
+                    False,
+                    f"kind mismatch on {mismatched}: expected {wanted}",
+                )
+                continue
+
+        results.record(
+            "completion",
+            probe["desc"],
+            True,
+            f"{len(items)} items, {len(expected)} expected labels present",
+        )
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -980,6 +1954,10 @@ def main() -> int:
         run_folding_probes(client, results)
         run_document_symbol_probes(client, results)
         run_declaration_probes(client, results)
+        run_references_probes(client, results)
+        run_rename_probes(client, results)
+        run_hover_probes(client, results)
+        run_completion_probes(client, results)
     finally:
         client.shutdown()
 
