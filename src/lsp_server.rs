@@ -1156,6 +1156,71 @@ impl HaproxyLsp {
         None
     }
 
+    /// Resolve the symbol at the cursor for `textDocument/references`.
+    ///
+    /// Accepts both sides of a navigation:
+    ///   - Cursor on a definition line (e.g. `backend NAME`, `acl NAME ...`,
+    ///     `frontend NAME`, `listen NAME`, `server NAME ...`) — extract the
+    ///     name token and look up the cached Symbol directly. This works
+    ///     regardless of which column the cursor sits on (keyword, name, or
+    ///     trailing address/option tokens), matching how `find_declaration`
+    ///     behaves today.
+    ///   - Cursor on a reference site (e.g. `use_backend X`, `if acl`,
+    ///     `sc0_*(name)`, `... table X`) — delegate to the existing
+    ///     cursor-aware `find_definition` walk-back.
+    ///
+    /// Stick-tables are only reachable via the reference-site path; there is
+    /// no bare identifier on the `stick-table` directive line itself to key
+    /// off, so callers exercising references for stick-tables must put the
+    /// cursor on a call site (`sc0_*(name)` or `... table name`).
+    fn find_symbol_at_cursor(&self, uri: &str, position: &Position, content: &str) -> Option<Symbol> {
+        let lines: Vec<&str> = content.lines().collect();
+        if (position.line as usize) >= lines.len() {
+            return None;
+        }
+        let trimmed = lines[position.line as usize].trim();
+
+        if let Some(rest) = trimmed.strip_prefix("backend ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                if let Some(sym) = self.find_symbol_by_name(uri, name, SymbolKind::Backend) {
+                    return Some(sym);
+                }
+            }
+        }
+        if trimmed.starts_with("acl ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Some(sym) = self.find_symbol_by_name(uri, parts[1], SymbolKind::Acl) {
+                    return Some(sym);
+                }
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("frontend ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                if let Some(sym) = self.find_symbol_by_name(uri, name, SymbolKind::Frontend) {
+                    return Some(sym);
+                }
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("listen ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                if let Some(sym) = self.find_symbol_by_name(uri, name, SymbolKind::Listen) {
+                    return Some(sym);
+                }
+            }
+        }
+        if trimmed.starts_with("server ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Some(sym) = self.find_symbol_by_name(uri, parts[1], SymbolKind::Server) {
+                    return Some(sym);
+                }
+            }
+        }
+
+        self.find_definition(uri, position, content)
+    }
+
     fn find_references_to_symbol(&self, uri: &str, symbol_name: &str, symbol_kind: SymbolKind) -> Option<Vec<Reference>> {
         // Single-file scope: look only in the requesting document.
         let symbols = self.symbols.get(uri)?;
@@ -1184,6 +1249,7 @@ impl HaproxyLsp {
                         "capabilities": {
                             "definitionProvider": true,
                             "declarationProvider": true,
+                            "referencesProvider": true,
                             "foldingRangeProvider": true,
                             "documentSymbolProvider": true,
                             "textDocumentSync": {
@@ -1312,6 +1378,69 @@ impl HaproxyLsp {
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": syms,
+                }))
+            }
+            "textDocument/references" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let position = Position {
+                    line: params["position"]["line"].as_u64()? as u32,
+                    character: params["position"]["character"].as_u64()? as u32,
+                };
+                // LSP spec: `context.includeDeclaration` defaults to false
+                // when absent. Zed sends it explicitly, but other clients
+                // (including the test harness) may omit it.
+                let include_declaration = params["context"]["includeDeclaration"]
+                    .as_bool()
+                    .unwrap_or(false);
+
+                let symbol = self
+                    .documents
+                    .get(uri)
+                    .cloned()
+                    .and_then(|content| self.find_symbol_at_cursor(uri, &position, &content));
+
+                let locations: Vec<Value> = if let Some(sym) = symbol {
+                    let mut locs: Vec<Value> = Vec::new();
+                    if include_declaration {
+                        locs.push(json!({
+                            "uri": sym.uri,
+                            "range": {
+                                "start": {
+                                    "line": sym.range.start.line,
+                                    "character": sym.range.start.character,
+                                },
+                                "end": {
+                                    "line": sym.range.end.line,
+                                    "character": sym.range.end.character,
+                                },
+                            }
+                        }));
+                    }
+                    for r in &sym.references {
+                        locs.push(json!({
+                            "uri": r.uri,
+                            "range": {
+                                "start": {
+                                    "line": r.range.start.line,
+                                    "character": r.range.start.character,
+                                },
+                                "end": {
+                                    "line": r.range.end.line,
+                                    "character": r.range.end.character,
+                                },
+                            }
+                        }));
+                    }
+                    locs
+                } else {
+                    Vec::new()
+                };
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": locations,
                 }))
             }
             "textDocument/declaration" => {

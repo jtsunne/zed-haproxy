@@ -550,6 +550,79 @@ DEFINITION_NULL_PROBES: list[dict] = [
 ]
 
 
+# References probes exercise `textDocument/references` against
+# test/haproxy.conf. Each probe drives the cursor-aware resolution path plus
+# the definition-line fallback. `include_declaration` toggles whether the
+# symbol's own definition range is prepended to the location list.
+# `expected_lines` is a set of 0-indexed line numbers each returned Location
+# must map to via `range.start.line`.
+REFERENCES_PROBES: list[dict] = [
+    {
+        "desc": "backend name on `use_backend` line (exclude declaration)",
+        "line": 33,
+        "character": 20,
+        "include_declaration": False,
+        "expected_lines": {33, 43},
+    },
+    {
+        "desc": "backend name on `use_backend` line (include declaration)",
+        "line": 33,
+        "character": 20,
+        "include_declaration": True,
+        "expected_lines": {33, 43, 50},
+    },
+    {
+        "desc": "ACL in `if` condition (exclude declaration)",
+        "line": 33,
+        "character": 55,
+        "include_declaration": False,
+        "expected_lines": {33},
+    },
+    {
+        "desc": "ACL in `if` condition (include declaration)",
+        "line": 33,
+        "character": 55,
+        "include_declaration": True,
+        "expected_lines": {31, 33},
+    },
+    {
+        "desc": "stick-table in `sc0_*(name)` (exclude declaration)",
+        "line": 102,
+        "character": 65,
+        "include_declaration": False,
+        "expected_lines": {101, 102},
+    },
+    {
+        "desc": "stick-table in `sc0_*(name)` (include declaration)",
+        "line": 102,
+        "character": 65,
+        "include_declaration": True,
+        "expected_lines": {95, 101, 102},
+    },
+    {
+        "desc": "stick-table after ` table ` keyword (exclude declaration)",
+        "line": 101,
+        "character": 40,
+        "include_declaration": False,
+        "expected_lines": {101, 102},
+    },
+    {
+        "desc": "backend name on definition line (include declaration)",
+        "line": 50,
+        "character": 15,
+        "include_declaration": True,
+        "expected_lines": {33, 43, 50},
+    },
+    {
+        "desc": "backend name on definition line (exclude declaration)",
+        "line": 50,
+        "character": 15,
+        "include_declaration": False,
+        "expected_lines": {33, 43},
+    },
+]
+
+
 DECLARATION_PROBES: list[dict] = [
     {
         "desc": "`!plain` in `if` condition yields declaration reference",
@@ -949,6 +1022,52 @@ def run_definition_null_probes(client: LspClient, results: Results):
         results.record("definition-null", probe["desc"], ok, detail)
 
 
+def run_references_probes(client: LspClient, results: Results):
+    if not REFERENCES_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record("references", "fixture present", False, f"missing: {HAPROXY_CONF}")
+        return
+    uri = path_to_uri(HAPROXY_CONF)
+    client.did_open(uri, HAPROXY_CONF.read_text())
+
+    for probe in REFERENCES_PROBES:
+        try:
+            resp = client.request(
+                "textDocument/references",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                    "context": {"includeDeclaration": probe["include_declaration"]},
+                },
+            )
+        except TimeoutError as exc:
+            results.record("references", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        if not isinstance(result, list):
+            results.record(
+                "references",
+                probe["desc"],
+                False,
+                f"expected list, got {type(result).__name__}: {result!r}",
+            )
+            continue
+
+        actual_lines = {loc["range"]["start"]["line"] for loc in result}
+        expected = probe["expected_lines"]
+        ok = actual_lines == expected
+        if ok:
+            detail = f"lines {sorted(actual_lines)}"
+        else:
+            detail = f"expected {sorted(expected)}, got {sorted(actual_lines)}"
+        results.record("references", probe["desc"], ok, detail)
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -1016,6 +1135,7 @@ def main() -> int:
         run_folding_probes(client, results)
         run_document_symbol_probes(client, results)
         run_declaration_probes(client, results)
+        run_references_probes(client, results)
     finally:
         client.shutdown()
 

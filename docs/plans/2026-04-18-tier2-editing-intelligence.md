@@ -60,11 +60,11 @@ Single-file scope retained from Tier 1. Cross-file resolution is explicitly defe
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] advertise `referencesProvider: true` in the `initialize` capabilities block
-- [ ] add `textDocument/references` handler: reuse the cursor-aware keyword-walk-back from `find_definition` to resolve the symbol under the cursor, then return `Location[]` from `Symbol.references`; honor `context.includeDeclaration` by prepending the definition range when `true`
-- [ ] also handle the case of the cursor being on a definition line (re-use `find_declaration` logic) so references work from both sides
-- [ ] add `REFERENCES_PROBES` in `test/lsp_probes.py` covering: backend name on a `use_backend` line, ACL on a condition, stick-table in an `sc0_*(...)` call, includeDeclaration=true vs false
-- [ ] run `python3 test/lsp_probes.py` — full suite must PASS before Task 3
+- [x] advertise `referencesProvider: true` in the `initialize` capabilities block
+- [x] add `textDocument/references` handler: reuse the cursor-aware keyword-walk-back from `find_definition` to resolve the symbol under the cursor, then return `Location[]` from `Symbol.references`; honor `context.includeDeclaration` by prepending the definition range when `true`
+- [x] also handle the case of the cursor being on a definition line (re-use `find_declaration` logic) so references work from both sides
+- [x] add `REFERENCES_PROBES` in `test/lsp_probes.py` covering: backend name on a `use_backend` line, ACL on a condition, stick-table in an `sc0_*(...)` call, includeDeclaration=true vs false
+- [x] run `python3 test/lsp_probes.py` — full suite must PASS before Task 3 (pre-existing 3 prod.cfg fold failures unchanged; all 9 new references probes plus all prior passing probes PASS)
 
 ### Task 3: Implement rename with prepareProvider
 
