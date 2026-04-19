@@ -12,7 +12,38 @@ A Zed editor extension that provides syntax highlighting and **"Go to Definition
 - **Rename Symbol**: `editor: rename` (F2) renames a backend, ACL, server, frontend, or listen and updates every call-site in the file atomically. `prepareProvider` pre-fills the rename box with the current identifier; invalid names (empty, whitespace, or any character outside `[a-zA-Z0-9_.-]`) are rejected with a JSON-RPC error. Stick-tables are renamed by renaming their enclosing section (HAProxy binds one table per section).
 - **Hover**: Cursor on a backend name shows the definition line, `mode`, `balance`, and the first 5 server lines (`"…N more"` truncation). Cursor on an ACL shows the definition line. Cursor on a stick-table shows the type and store clauses. Cursor on a known directive (`bind`, `server`, `acl`, `http-request`, `stick-table`, …) shows a curated markdown snippet from `src/docs.rs`.
 - **Completion**: Context-aware. After `use_backend `/`default_backend ` → backend names. After `if `/`unless `/`! ` → ACL names. After `use_server ` → server names from the enclosing backend only. Inside `sc0_*(`, `sc1_*(`, `stick match `, `stick store-request ` → stick-table names. Start-of-line inside a section → the per-section directive allowlist. Items carry `detail` (e.g. backend mode + balance), `documentation` from `src/docs.rs`, and rank by in-file usage frequency (popular symbols float to the top) with alphabetical tie-break.
-- **Language Server Protocol**: `foldingRangeProvider`, `documentSymbolProvider`, `definitionProvider`, `declarationProvider`, `referencesProvider`, `renameProvider` (with `prepareProvider`), `hoverProvider`, `completionProvider`. Single-file scope.
+- **Diagnostics**: Static analysis runs on every `didOpen`/`didChange` and publishes `textDocument/publishDiagnostics`. Catches typos and dead code before `haproxy -c`. See the [Diagnostics rules](#diagnostics-rules) table below.
+- **Cross-file Resolution**: Follows `.include`, `.if`/`.elif`/`.else`/`.endif`, and `-f <path>` / `crt <path>` references to build a project-wide symbol index. Definition, declaration, references, rename, and diagnostics all resolve across files. F12 on the literal path in `.include <path>` navigates to the included file. Opt-in via `.zed/haproxy.toml` (see [Project configuration](#project-configuration) below).
+- **Workspace Symbols**: `Cmd+T` fuzzy-searches every backend, frontend, listen, ACL, server, and stick-table across every indexed file in the project. Case-insensitive substring match; empty query streams up to 1000 symbols.
+- **Language Server Protocol**: `foldingRangeProvider`, `documentSymbolProvider`, `definitionProvider`, `declarationProvider`, `referencesProvider`, `renameProvider` (with `prepareProvider`), `hoverProvider`, `completionProvider`, `workspaceSymbolProvider`. Cross-file scope for navigation, diagnostics, and rename when a project root is discovered; falls back to single-file scope otherwise.
+
+### Diagnostics rules
+
+| Rule | Severity | Code | Example |
+|---|---|---|---|
+| Undefined backend reference | Error | `undefined-backend` | `use_backend nope` when no `backend nope` exists |
+| Undefined ACL reference | Error | `undefined-acl` | `use_backend foo if undefined_acl` |
+| Undefined server in `use_server` | Error | `undefined-server` | `use_server nope if …` |
+| Unused backend | Warning | `unused-backend` | `backend orphan` never referenced |
+| Unused ACL | Warning | `unused-acl` | `acl orphan src 1.2.3.4` never referenced |
+| Duplicate section name | Error | `duplicate-section` | two `backend foo` sections |
+| Duplicate ACL in same section | Error | `duplicate-acl` | two `acl foo …` in one frontend/listen |
+| Missing `default_backend` | Warning | `missing-default-backend` | frontend/listen with `bind` but no `default_backend`/`use_backend` |
+
+All diagnostics include `source: "haproxy-lsp"` and a precise range on the offending identifier. Cross-file references are not flagged — if a backend is defined in `backends.cfg` and referenced from `main.cfg`, both files need to be in the same project index (see next section).
+
+### Project configuration
+
+For configs split across multiple files, drop a `.zed/haproxy.toml` at the project root:
+
+```toml
+[haproxy]
+project_root = "."              # relative to the .zed/ parent, or absolute
+follow_includes = true          # follow .include, .if/.elif/.else/.endif, -f, crt
+extra_files = ["conf.d/*.cfg"]  # literal paths or simple glob patterns
+```
+
+Discovery walks up from the opened file's directory looking for `.zed/haproxy.toml`. If none is found, the LSP defaults to `{ project_root: <dir of first opened file>, follow_includes: true, extra_files: [] }` — so most single-directory setups work without any config file. Only three keys are recognized; other TOML content is ignored.
 
 ### Supported Navigation
 
@@ -151,14 +182,14 @@ haproxy-zed/
 
 ## Known Limitations
 
-- **Single-file scope for navigation**: Go to Definition / references resolve within the currently open document. Folding and outline are single-file by design.
+- **Folding and outline are single-file**: Cross-file resolution covers definition, references, rename, diagnostics, and workspace symbols, but folding and outline are computed per-open-document.
 - **Regex-based LSP parsing**: The LSP analyzes configs line-by-line with regex rather than a full tree-sitter AST. Works well for the directive set it supports, but complex quoted-string edge cases may be missed. Tree-sitter migration is planned.
 
 ## Future Enhancements
 
-- Cross-file reference resolution (`-f path.cfg`, `include`)
-- Diagnostics for undefined references, unused sections, duplicate names
 - `haproxy -c` integration for real syntax errors
+- Code actions (quick-fixes for diagnostics)
+- Config formatter
 - Full tree-sitter integration in the LSP
 
 ## Troubleshooting

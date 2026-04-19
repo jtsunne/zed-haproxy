@@ -144,8 +144,8 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 
 ### Task 9: Update documentation and bump version
 
-- [ ] bump `extension.toml` `version` to `0.4.0`
-- [ ] update `README.md` with diagnostics rules table, cross-file config schema (`.zed/haproxy.toml`), and workspace symbol capability
-- [ ] update `CLAUDE.md` architecture notes: new `diagnostics` cache, `ProjectIndex`, `ProjectConfig`, notification sender, cross-file resolution flow; list new advertised capabilities
-- [ ] move `docs/plans/2026-04-19-tier3-diagnostics-multifile.md` to `docs/plans/completed/`
-- [ ] update `docs/roadmap.md` to mark Tier 3 as shipped in v0.4.0 (mirror the Tier 2 note style)
+- [x] bump `extension.toml` `version` to `0.4.0`
+- [x] update `README.md` with diagnostics rules table, cross-file config schema (`.zed/haproxy.toml`), and workspace symbol capability
+- [x] update `CLAUDE.md` architecture notes: new `diagnostics` cache, `ProjectIndex`, `ProjectConfig`, notification sender, cross-file resolution flow; list new advertised capabilities
+- [x] move `docs/plans/2026-04-19-tier3-diagnostics-multifile.md` to `docs/plans/completed/`
+- [x] update `docs/roadmap.md` to mark Tier 3 as shipped in v0.4.0 (mirror the Tier 2 note style)

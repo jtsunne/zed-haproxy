@@ -1,6 +1,6 @@
 id = "haproxy"
 name = "haproxy"
-version = "0.3.0"
+version = "0.4.0"
 schema_version = 1
 authors = ["Denys Miasnychenko <jtsunne@gmail.com>"]
 description = "HAproxy support"
