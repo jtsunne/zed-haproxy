@@ -47,6 +47,22 @@ struct Reference {
     scope: Option<String>,
 }
 
+// Project-wide raw reference record. Every reference observed during
+// `parse_single_file` is recorded here regardless of whether the referenced
+// symbol is defined in the same file. The cross-file handlers (definition,
+// references, rename, undefined-reference diagnostics) aggregate from this
+// cache across every URI in the project graph so a reference in file B
+// to a backend defined in file A is resolvable in both directions.
+#[derive(Debug, Clone)]
+struct RawReference {
+    name: String,
+    kind: SymbolKind,
+    range: Range,
+    uri: String,
+    context: ReferenceContext,
+    scope: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReferenceContext {
     UseBackend,
@@ -169,6 +185,14 @@ struct HaproxyLsp {
     // resolution handlers in later tasks (Task 6+) and by the
     // `$/haproxy/projectIndex` introspection request.
     project_indices: HashMap<String, ProjectIndex>,
+    // Per-URI raw reference records, populated during `parse_single_file`.
+    // Unlike `Symbol.references` (which only collects references whose
+    // target is defined in the same file), this list holds EVERY reference
+    // observed on the URI — including ones pointing at symbols defined in
+    // sibling include-graph files. Cross-file definition / references /
+    // rename / undefined-reference diagnostics walk this cache across every
+    // URI in the project graph.
+    raw_references: HashMap<String, Vec<RawReference>>,
 }
 
 // Aggregate symbol index for all files reachable from a single project root
@@ -871,30 +895,42 @@ fn find_leading_directive_arg(line: &str, keyword: &str) -> Option<(String, u32,
 /// Scope is tracked by walking section headers with `is_section_header`;
 /// comments and the section header line itself are skipped so a
 /// `# use_backend foo` sample config line doesn't trip rule #1.
-fn undefined_reference_diagnostics(content: &str, symbols: &[Symbol]) -> Vec<Diagnostic> {
+fn undefined_reference_diagnostics(
+    content: &str,
+    symbols: &[Symbol],
+    extra_backends: &HashSet<String>,
+    extra_servers_by_scope: &HashMap<String, HashSet<String>>,
+) -> Vec<Diagnostic> {
     use std::collections::HashSet;
 
-    let backend_names: HashSet<&str> = symbols
+    let mut backend_names: HashSet<String> = symbols
         .iter()
         .filter(|s| s.kind == SymbolKind::Backend)
-        .map(|s| s.name.as_str())
+        .map(|s| s.name.clone())
         .collect();
+    backend_names.extend(extra_backends.iter().cloned());
     let acl_names: HashSet<&str> = symbols
         .iter()
         .filter(|s| s.kind == SymbolKind::Acl)
         .map(|s| s.name.as_str())
         .collect();
     let builtin_acls: HashSet<&str> = BUILTIN_ACL_NAMES.iter().copied().collect();
-    let mut servers_by_scope: HashMap<String, HashSet<&str>> = HashMap::new();
+    let mut servers_by_scope: HashMap<String, HashSet<String>> = HashMap::new();
     for s in symbols {
         if s.kind == SymbolKind::Server {
             if let Some(scope) = &s.scope {
                 servers_by_scope
                     .entry(scope.clone())
                     .or_default()
-                    .insert(s.name.as_str());
+                    .insert(s.name.clone());
             }
         }
+    }
+    for (scope, names) in extra_servers_by_scope {
+        servers_by_scope
+            .entry(scope.clone())
+            .or_default()
+            .extend(names.iter().cloned());
     }
 
     let mut diags = Vec::new();
@@ -1198,11 +1234,20 @@ fn missing_default_backend_diagnostics(
 /// backend whose sole purpose is carrying a `stick-table` is still flagged —
 /// callers are expected to reference the backend via `use_backend` somewhere
 /// if they want the warning suppressed.
-fn unused_backend_diagnostics(content: &str, symbols: &[Symbol]) -> Vec<Diagnostic> {
+fn unused_backend_diagnostics(
+    content: &str,
+    symbols: &[Symbol],
+    cross_file_refs: &HashSet<(SymbolKind, String)>,
+) -> Vec<Diagnostic> {
     let lines: Vec<&str> = content.lines().collect();
     let mut diags = Vec::new();
     for s in symbols {
         if s.kind != SymbolKind::Backend || !s.references.is_empty() {
+            continue;
+        }
+        // A backend referenced from a sibling include file is still used,
+        // even if nothing in this file references it.
+        if cross_file_refs.contains(&(SymbolKind::Backend, s.name.clone())) {
             continue;
         }
         let line_idx = s.range.start.line as usize;
@@ -1791,6 +1836,7 @@ impl HaproxyLsp {
             included_files: HashMap::new(),
             explicitly_opened: HashSet::new(),
             project_indices: HashMap::new(),
+            raw_references: HashMap::new(),
         })
     }
 
@@ -1820,12 +1866,66 @@ impl HaproxyLsp {
             self.documents.get(uri).cloned(),
             self.symbols.get(uri).cloned(),
         ) {
-            diags.extend(undefined_reference_diagnostics(&content, &symbols));
+            // Gather cross-file symbol sets so undefined-reference rules
+            // don't flag names defined in an included sibling file. Only
+            // siblings — the current file's own symbols are already in
+            // `symbols`, and including them twice would be harmless but
+            // wasteful.
+            let mut extra_backends: HashSet<String> = HashSet::new();
+            let mut extra_servers_by_scope: HashMap<String, HashSet<String>> =
+                HashMap::new();
+            for u in self.project_uris_for(uri) {
+                if u == uri {
+                    continue;
+                }
+                if let Some(syms) = self.symbols.get(&u) {
+                    for s in syms {
+                        match s.kind {
+                            SymbolKind::Backend => {
+                                extra_backends.insert(s.name.clone());
+                            }
+                            SymbolKind::Server => {
+                                if let Some(scope) = &s.scope {
+                                    extra_servers_by_scope
+                                        .entry(scope.clone())
+                                        .or_default()
+                                        .insert(s.name.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            diags.extend(undefined_reference_diagnostics(
+                &content,
+                &symbols,
+                &extra_backends,
+                &extra_servers_by_scope,
+            ));
             let headers = collect_section_headers(&content);
             diags.extend(duplicate_section_diagnostics(&headers));
             diags.extend(duplicate_acl_diagnostics(&content, &headers));
             diags.extend(missing_default_backend_diagnostics(&content, &headers));
-            diags.extend(unused_backend_diagnostics(&content, &symbols));
+            // Gather cross-file references so an unused-backend warning
+            // doesn't fire for a backend defined in this file but referenced
+            // from a sibling include.
+            let cross_file_refs: HashSet<(SymbolKind, String)> = {
+                let mut set: HashSet<(SymbolKind, String)> = HashSet::new();
+                for u in self.project_uris_for(uri) {
+                    if u == uri {
+                        continue;
+                    }
+                    if let Some(raws) = self.raw_references.get(&u) {
+                        for r in raws {
+                            set.insert((r.kind.clone(), r.name.clone()));
+                        }
+                    }
+                }
+                set
+            };
+            diags.extend(unused_backend_diagnostics(&content, &symbols, &cross_file_refs));
             diags.extend(unused_acl_diagnostics(&content, &headers));
         }
         let diags_json: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
@@ -1849,6 +1949,14 @@ impl HaproxyLsp {
         let mut visited: HashSet<String> = HashSet::new();
         self.parse_graph_node(uri, Some(content), &mut visited)?;
         self.rebuild_project_index_for(uri);
+        // Emit diagnostics for every file in the project graph now that the
+        // project index is coherent. Cross-file undefined-reference rules
+        // consult the index to avoid flagging a reference whose target is
+        // defined in a sibling include.
+        let project_uris = self.project_uris_for(uri);
+        for u in project_uris {
+            self.collect_diagnostics(&u);
+        }
         Ok(())
     }
 
@@ -2002,30 +2110,27 @@ impl HaproxyLsp {
     }
 
     // Rebuild the project index rooted at the project_root of `seed_uri`.
-    // Reachability is computed by walking `self.included_files` forward from
-    // `seed_uri`; any URI reachable contributes its cached `self.symbols`
-    // entries into `symbols_by_name`. The resulting index replaces any prior
-    // index for the same project root.
+    //
+    // Membership is every URI in `self.project_configs` that resolved to the
+    // same `project_root`. Include-graph reachability from the seed is an
+    // insufficient cut for the cross-file handlers in Task 6: opening
+    // `backends.cfg` directly yields a forward graph of only
+    // `[backends.cfg]`, but `main.cfg` (previously opened or loaded via a
+    // sibling's include) holds a reverse reference we still need the index
+    // to expose for references / rename / diagnostics. Keying on project
+    // root gives a consistent bidirectional membership.
     fn rebuild_project_index_for(&mut self, seed_uri: &str) {
         let project_root = match self.project_configs.get(seed_uri) {
             Some(cfg) => cfg.project_root.clone(),
             None => return,
         };
 
-        let mut reachable: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut stack: Vec<String> = vec![seed_uri.to_string()];
-        while let Some(u) = stack.pop() {
-            if !seen.insert(u.clone()) {
-                continue;
-            }
-            reachable.push(u.clone());
-            if let Some(incs) = self.included_files.get(&u) {
-                for i in incs {
-                    stack.push(i.clone());
-                }
-            }
-        }
+        let mut reachable: Vec<String> = self
+            .project_configs
+            .iter()
+            .filter(|(_, cfg)| cfg.project_root == project_root)
+            .map(|(u, _)| u.clone())
+            .collect();
         reachable.sort();
 
         let mut symbols_by_name: HashMap<(SymbolKind, String), Vec<ProjectSymbolRef>> =
@@ -2054,6 +2159,106 @@ impl HaproxyLsp {
                 symbols_by_name,
             },
         );
+    }
+
+    // Return every URI reachable from `uri` via the include graph, including
+    // `uri` itself. Falls back to `vec![uri]` when no project index has been
+    // built yet (e.g. early in startup before any didOpen).
+    fn project_uris_for(&self, uri: &str) -> Vec<String> {
+        let project_root_key = match self.project_configs.get(uri) {
+            Some(cfg) => cfg.project_root.to_string_lossy().into_owned(),
+            None => return vec![uri.to_string()],
+        };
+        match self.project_indices.get(&project_root_key) {
+            Some(idx) if !idx.uris.is_empty() => idx.uris.clone(),
+            _ => vec![uri.to_string()],
+        }
+    }
+
+    // Aggregate references to `(name, kind, scope)` across every URI in the
+    // project graph, deduped by (uri, line, start, context). Drives cross-file
+    // `textDocument/references`, `textDocument/rename`, and the unused-symbol
+    // diagnostic rules.
+    fn project_references(
+        &self,
+        uri: &str,
+        name: &str,
+        kind: &SymbolKind,
+        scope: Option<&str>,
+    ) -> Vec<Reference> {
+        let mut out: Vec<Reference> = Vec::new();
+        let mut seen: HashSet<(String, u32, u32, ReferenceContext)> = HashSet::new();
+        for u in self.project_uris_for(uri) {
+            if let Some(raws) = self.raw_references.get(&u) {
+                for r in raws {
+                    if r.name != name
+                        || std::mem::discriminant(&r.kind)
+                            != std::mem::discriminant(kind)
+                    {
+                        continue;
+                    }
+                    if let Some(want) = scope {
+                        // Scope filter for section-scoped references (Server).
+                        // For unscoped kinds (Backend/Acl/StickTable) the
+                        // reference's own `scope` is `None` and must not be
+                        // matched against `want`.
+                        if *kind == SymbolKind::Server && r.scope.as_deref() != Some(want) {
+                            continue;
+                        }
+                    }
+                    let key = (
+                        r.uri.clone(),
+                        r.range.start.line,
+                        r.range.start.character,
+                        r.context.clone(),
+                    );
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    out.push(Reference {
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    // Find every defining symbol matching `(name, kind, scope)` across every
+    // URI in the project graph. Returned symbols carry their own file's
+    // same-file references only; cross-file references live in
+    // `project_references`.
+    fn project_symbols(
+        &self,
+        uri: &str,
+        name: &str,
+        kind: &SymbolKind,
+        scope: Option<&str>,
+    ) -> Vec<Symbol> {
+        let mut out: Vec<Symbol> = Vec::new();
+        for u in self.project_uris_for(uri) {
+            if let Some(syms) = self.symbols.get(&u) {
+                for s in syms {
+                    if s.name != name
+                        || std::mem::discriminant(&s.kind)
+                            != std::mem::discriminant(kind)
+                    {
+                        continue;
+                    }
+                    if let Some(want) = scope {
+                        match s.scope.as_deref() {
+                            Some(have) if have == want => {}
+                            _ => continue,
+                        }
+                    }
+                    out.push(s.clone());
+                }
+            }
+        }
+        out
     }
 
     fn parse_single_file(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -2213,6 +2418,7 @@ impl HaproxyLsp {
         // `use_server`) can be resolved against the correct server definition
         // even when two backends share a server name.
         let mut updated_symbols = symbols;
+        let mut raw_refs: Vec<RawReference> = Vec::new();
         let mut ref_section_name: Option<String> = None;
         for (line_num, raw_line) in content.lines().enumerate() {
             let is_section_line = is_section_header(raw_line);
@@ -2244,31 +2450,47 @@ impl HaproxyLsp {
             // Collect backend references
             if line.contains("use_backend") {
                 if let Some(backend_name) = self.extract_backend_from_use_backend(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend,
-                                              Reference {
-                                                  range: Range {
-                                                      start: Position { line: line_num as u32, character: 0 },
-                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                  },
-                                                  uri: uri.to_string(),
-                                                  context: ReferenceContext::UseBackend,
-                                                  scope: None,
-                                              });
+                    let r = Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::UseBackend,
+                        scope: None,
+                    };
+                    raw_refs.push(RawReference {
+                        name: backend_name.clone(),
+                        kind: SymbolKind::Backend,
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend, r);
                 }
             }
 
             if line.contains("default_backend") {
                 if let Some(backend_name) = self.extract_backend_from_default_backend(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend,
-                                              Reference {
-                                                  range: Range {
-                                                      start: Position { line: line_num as u32, character: 0 },
-                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                  },
-                                                  uri: uri.to_string(),
-                                                  context: ReferenceContext::DefaultBackend,
-                                                  scope: None,
-                                              });
+                    let r = Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::DefaultBackend,
+                        scope: None,
+                    };
+                    raw_refs.push(RawReference {
+                        name: backend_name.clone(),
+                        kind: SymbolKind::Backend,
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend, r);
                 }
             }
 
@@ -2282,16 +2504,24 @@ impl HaproxyLsp {
             // both define a `server shared` stay independent.
             if line.starts_with("use_server ") {
                 if let Some(server_name) = self.extract_server_from_use_server(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &server_name, SymbolKind::Server,
-                                              Reference {
-                                                  range: Range {
-                                                      start: Position { line: line_num as u32, character: 0 },
-                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                  },
-                                                  uri: uri.to_string(),
-                                                  context: ReferenceContext::UseServer,
-                                                  scope: ref_section_name.clone(),
-                                              });
+                    let r = Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::UseServer,
+                        scope: ref_section_name.clone(),
+                    };
+                    raw_refs.push(RawReference {
+                        name: server_name.clone(),
+                        kind: SymbolKind::Server,
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                    self.add_reference_to_symbol(&mut updated_symbols, &server_name, SymbolKind::Server, r);
                 }
             }
 
@@ -2299,16 +2529,24 @@ impl HaproxyLsp {
             if line.contains(" if ") {
                 if let Some(acl_names) = self.extract_acl_names_from_condition(line, "if") {
                     for acl_name in acl_names {
-                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl,
-                                                  Reference {
-                                                      range: Range {
-                                                          start: Position { line: line_num as u32, character: 0 },
-                                                          end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                      },
-                                                      uri: uri.to_string(),
-                                                      context: ReferenceContext::AclCondition,
-                                                      scope: None,
-                                                  });
+                        let r = Reference {
+                            range: Range {
+                                start: Position { line: line_num as u32, character: 0 },
+                                end: Position { line: line_num as u32, character: line.len() as u32 },
+                            },
+                            uri: uri.to_string(),
+                            context: ReferenceContext::AclCondition,
+                            scope: None,
+                        };
+                        raw_refs.push(RawReference {
+                            name: acl_name.clone(),
+                            kind: SymbolKind::Acl,
+                            range: r.range.clone(),
+                            uri: r.uri.clone(),
+                            context: r.context.clone(),
+                            scope: r.scope.clone(),
+                        });
+                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl, r);
                     }
                 }
             }
@@ -2316,16 +2554,24 @@ impl HaproxyLsp {
             if line.contains(" unless ") {
                 if let Some(acl_names) = self.extract_acl_names_from_condition(line, "unless") {
                     for acl_name in acl_names {
-                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl,
-                                                  Reference {
-                                                      range: Range {
-                                                          start: Position { line: line_num as u32, character: 0 },
-                                                          end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                      },
-                                                      uri: uri.to_string(),
-                                                      context: ReferenceContext::AclUnlessCondition,
-                                                      scope: None,
-                                                  });
+                        let r = Reference {
+                            range: Range {
+                                start: Position { line: line_num as u32, character: 0 },
+                                end: Position { line: line_num as u32, character: line.len() as u32 },
+                            },
+                            uri: uri.to_string(),
+                            context: ReferenceContext::AclUnlessCondition,
+                            scope: None,
+                        };
+                        raw_refs.push(RawReference {
+                            name: acl_name.clone(),
+                            kind: SymbolKind::Acl,
+                            range: r.range.clone(),
+                            uri: r.uri.clone(),
+                            context: r.context.clone(),
+                            scope: r.scope.clone(),
+                        });
+                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl, r);
                     }
                 }
             }
@@ -2338,23 +2584,32 @@ impl HaproxyLsp {
             let stick_refs = collect_stick_table_references(line_no_comment);
             for (table_name, start_col) in stick_refs {
                 let end_col = start_col + table_name.len();
+                let r = Reference {
+                    range: Range {
+                        start: Position { line: line_num as u32, character: start_col as u32 },
+                        end: Position { line: line_num as u32, character: end_col as u32 },
+                    },
+                    uri: uri.to_string(),
+                    context: ReferenceContext::StickTable,
+                    scope: None,
+                };
+                raw_refs.push(RawReference {
+                    name: table_name.clone(),
+                    kind: SymbolKind::StickTable,
+                    range: r.range.clone(),
+                    uri: r.uri.clone(),
+                    context: r.context.clone(),
+                    scope: r.scope.clone(),
+                });
                 self.add_reference_to_symbol(
                     &mut updated_symbols,
                     &table_name,
                     SymbolKind::StickTable,
-                    Reference {
-                        range: Range {
-                            start: Position { line: line_num as u32, character: start_col as u32 },
-                            end: Position { line: line_num as u32, character: end_col as u32 },
-                        },
-                        uri: uri.to_string(),
-                        context: ReferenceContext::StickTable,
-                        scope: None,
-                    },
+                    r,
                 );
             }
         }
-        
+
         // Build fold/outline data into locals before any self.* write so a
         // mid-parse panic cannot leave caches out of sync with each other.
         let folds = compute_folds(content);
@@ -2364,9 +2619,7 @@ impl HaproxyLsp {
         self.folds.insert(uri.to_string(), folds);
         self.outline.insert(uri.to_string(), outline);
         self.documents.insert(uri.to_string(), content.to_string());
-        // Always publish diagnostics (possibly empty) so stale marks clear on
-        // the client even when the file is now clean.
-        self.collect_diagnostics(uri);
+        self.raw_references.insert(uri.to_string(), raw_refs);
         Ok(())
     }
 
@@ -2377,6 +2630,14 @@ impl HaproxyLsp {
             return None;
         }
         let line = lines[line_idx];
+
+        // Cross-file: F12 on an include-directive path token jumps to the
+        // resolved file. We synthesise a Symbol whose URI points at the
+        // included file and whose range is `{0,0}-{0,0}` so the client
+        // navigates to the file's head.
+        if let Some(sym) = self.include_path_target(uri, line, position.character as usize) {
+            return Some(sym);
+        }
 
         // Resolve the word under the cursor and its byte offset on the line.
         let (word, word_start) = self.word_at_position(line, position.character as usize)?;
@@ -2701,11 +2962,112 @@ impl HaproxyLsp {
         self.find_symbol_by_name_scoped(uri, name, kind, None)
     }
 
+    /// If the cursor on `line` sits inside the path token of a `.include`,
+    /// `-f`, or `crt` directive, resolve that path against the same
+    /// include-graph rules as `extract_include_uris` and return a synthetic
+    /// `Symbol` whose URI points at the resolved file and whose range is
+    /// `{0,0}-{0,0}`. Returns `None` for any other line or cursor position.
+    fn include_path_target(
+        &self,
+        uri: &str,
+        line: &str,
+        char_pos: usize,
+    ) -> Option<Symbol> {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let line_no_comment = strip_inline_comment(trimmed);
+        let tokens: Vec<&str> = line_no_comment.split_whitespace().collect();
+        if tokens.is_empty() {
+            return None;
+        }
+
+        // Locate the byte offset of each token on the original `line` so we
+        // can check whether `char_pos` sits inside the path slot. Matching
+        // on `line` (not the trimmed slice) keeps the caller's cursor offset
+        // in the same coordinate space.
+        let mut search_from = 0usize;
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+        for tok in &tokens {
+            let found = line[search_from..].find(tok)?;
+            let start = search_from + found;
+            let end = start + tok.len();
+            positions.push((start, end));
+            search_from = end;
+        }
+
+        // char_pos is a char-index, not a byte offset — convert before
+        // comparing with token byte spans. HAProxy config is ASCII in
+        // practice, but stay defensive.
+        let byte_pos = line
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+
+        // Identify the token slot we care about for each directive.
+        let path_slot: Option<usize> = match tokens[0] {
+            ".include" if tokens.len() >= 2 => Some(1),
+            _ => {
+                let mut slot: Option<usize> = None;
+                for (i, tok) in tokens.iter().enumerate() {
+                    if (*tok == "-f" || *tok == "crt") && tokens.get(i + 1).is_some() {
+                        let (s, e) = positions[i + 1];
+                        if byte_pos >= s && byte_pos <= e {
+                            slot = Some(i + 1);
+                            break;
+                        }
+                    }
+                }
+                slot
+            }
+        };
+        let slot = path_slot?;
+        let (start, end) = positions[slot];
+        if byte_pos < start || byte_pos > end {
+            return None;
+        }
+        let path_tok = unquote_path_token(tokens[slot]);
+        let file_path = uri_to_path(uri)?;
+        let file_dir = file_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let project_root = self
+            .project_configs
+            .get(uri)
+            .map(|c| c.project_root.clone())
+            .unwrap_or_else(|| file_dir.clone());
+        let resolved = resolve_include_path(path_tok, &file_dir, &project_root)?;
+        if !resolved.is_file() {
+            return None;
+        }
+        let target_uri = path_to_file_uri(&resolved)?;
+        Some(Symbol {
+            name: path_tok.to_string(),
+            kind: SymbolKind::Backend,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            uri: target_uri,
+            references: Vec::new(),
+            scope: None,
+        })
+    }
+
     /// Scoped symbol lookup. When `scope` is `Some`, only symbols whose
     /// `scope` matches are returned — used for Server resolution so that
     /// `use_server shared` in backend A does not cross-navigate to
     /// backend B's same-named server. When `scope` is `None`, the first
     /// matching symbol is returned (legacy behaviour).
+    ///
+    /// Resolution first checks the requesting document, then falls back to
+    /// every URI in the project graph so cross-file definitions are
+    /// reachable. Server (scope-bearing) lookups stay within the section;
+    /// a server defined in another file's same-named section would be
+    /// conceptually a different symbol and is intentionally not matched.
     fn find_symbol_by_name_scoped(
         &self,
         uri: &str,
@@ -2713,23 +3075,48 @@ impl HaproxyLsp {
         kind: SymbolKind,
         scope: Option<&str>,
     ) -> Option<Symbol> {
-        // Single-file scope: only resolve against the requesting document so
-        // that two open files with the same backend/acl name don't silently
-        // cross-navigate.
-        let symbols = self.symbols.get(uri)?;
-        for symbol in symbols {
-            if symbol.name != name
-                || std::mem::discriminant(&symbol.kind) != std::mem::discriminant(&kind)
-            {
+        if let Some(symbols) = self.symbols.get(uri) {
+            for symbol in symbols {
+                if symbol.name != name
+                    || std::mem::discriminant(&symbol.kind) != std::mem::discriminant(&kind)
+                {
+                    continue;
+                }
+                if let Some(want) = scope {
+                    match symbol.scope.as_deref() {
+                        Some(have) if have == want => return Some(symbol.clone()),
+                        _ => continue,
+                    }
+                }
+                return Some(symbol.clone());
+            }
+        }
+        // Fall back to the project graph for cross-file definitions.
+        // Servers are section-scoped; cross-file server lookups would only
+        // make sense if the enclosing section also lived in the other file,
+        // which is the normal case when the file split follows section
+        // boundaries. Respect the scope filter either way.
+        for u in self.project_uris_for(uri) {
+            if u == uri {
                 continue;
             }
-            if let Some(want) = scope {
-                match symbol.scope.as_deref() {
-                    Some(have) if have == want => return Some(symbol.clone()),
-                    _ => continue,
+            if let Some(symbols) = self.symbols.get(&u) {
+                for symbol in symbols {
+                    if symbol.name != name
+                        || std::mem::discriminant(&symbol.kind)
+                            != std::mem::discriminant(&kind)
+                    {
+                        continue;
+                    }
+                    if let Some(want) = scope {
+                        match symbol.scope.as_deref() {
+                            Some(have) if have == want => return Some(symbol.clone()),
+                            _ => continue,
+                        }
+                    }
+                    return Some(symbol.clone());
                 }
             }
-            return Some(symbol.clone());
         }
         None
     }
@@ -3050,6 +3437,216 @@ impl HaproxyLsp {
         self.find_references_to_symbol_scoped(uri, symbol_name, symbol_kind, None)
     }
 
+    /// Build the `Location[]` response for `textDocument/references` given a
+    /// resolved cursor symbol. Aggregates definitions and references across
+    /// every URI in the project graph, narrowing each range to the identifier
+    /// token by scanning the corresponding file's cached content. When a
+    /// section symbol has a stick-table bound to its name, call-site
+    /// references to the table (`sc*_*(X)`, `... table X`) are cascaded into
+    /// the response so operators asking for references on the section see
+    /// every file-level usage.
+    fn build_references_locations(
+        &self,
+        uri: &str,
+        sym: &Symbol,
+        include_declaration: bool,
+    ) -> Vec<Value> {
+        let mut locs: Vec<Value> = Vec::new();
+        // Dedup across URIs — same file path resolved from different
+        // call-sites never collides because `uri` is part of the key.
+        let mut seen_locs: HashSet<(String, u32, u32)> = HashSet::new();
+        // Per-(uri, line, context) search-floor for narrowing successive
+        // same-name references on one line to distinct occurrences.
+        let mut ref_search_floor: HashMap<(String, u32, ReferenceContext), usize> =
+            HashMap::new();
+
+        let push_loc = |loc_uri: &str,
+                         line_num: u32,
+                         start: u32,
+                         end: u32,
+                         locs: &mut Vec<Value>,
+                         seen: &mut HashSet<(String, u32, u32)>| {
+            if seen.insert((loc_uri.to_string(), line_num, start)) {
+                locs.push(json!({
+                    "uri": loc_uri,
+                    "range": {
+                        "start": { "line": line_num, "character": start },
+                        "end": { "line": line_num, "character": end },
+                    }
+                }));
+            }
+        };
+
+        // Aggregate definitions from every URI in the project graph.
+        let scope = if sym.kind == SymbolKind::Server {
+            sym.scope.as_deref()
+        } else {
+            None
+        };
+        let matching_defs: Vec<Symbol> =
+            self.project_symbols(uri, &sym.name, &sym.kind, scope);
+
+        if include_declaration {
+            for def in &matching_defs {
+                let def_content = match self.documents.get(&def.uri) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let def_lines: Vec<&str> = def_content.lines().collect();
+                let def_line_idx = def.range.start.line as usize;
+                let search_from = def_lines
+                    .get(def_line_idx)
+                    .and_then(|raw| def_line_search_from(raw, &def.kind));
+                let (start_char, end_char) = def_lines
+                    .get(def_line_idx)
+                    .and_then(|raw| {
+                        find_identifier_range(raw, &def.name, search_from.unwrap_or(0))
+                    })
+                    .unwrap_or((def.range.start.character, def.range.end.character));
+                push_loc(
+                    &def.uri,
+                    def.range.start.line,
+                    start_char,
+                    end_char,
+                    &mut locs,
+                    &mut seen_locs,
+                );
+            }
+        }
+
+        // Aggregate references from every URI in the project graph.
+        let all_refs = self.project_references(uri, &sym.name, &sym.kind, scope);
+        for r in &all_refs {
+            let ref_content = match self.documents.get(&r.uri) {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            let ref_lines: Vec<&str> = ref_content.lines().collect();
+            let ref_line_idx = r.range.start.line as usize;
+            let base_search_from = ref_lines
+                .get(ref_line_idx)
+                .map(|raw| ref_line_search_from(raw, r));
+            let key = (r.uri.clone(), r.range.start.line, r.context.clone());
+            let precise = ref_context_has_precise_position(&r.context);
+            let floor = if precise {
+                None
+            } else {
+                ref_search_floor.get(&key).copied()
+            };
+            let search_from = match (base_search_from, floor) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(raw) = ref_lines.get(ref_line_idx) {
+                if let Some((s, e)) =
+                    find_identifier_range(raw, &sym.name, search_from.unwrap_or(0))
+                {
+                    push_loc(&r.uri, r.range.start.line, s, e, &mut locs, &mut seen_locs);
+                    if !precise {
+                        ref_search_floor.insert(key, e as usize);
+                    }
+                    continue;
+                }
+            }
+            push_loc(
+                &r.uri,
+                r.range.start.line,
+                r.range.start.character,
+                r.range.end.character,
+                &mut locs,
+                &mut seen_locs,
+            );
+        }
+
+        // Cascade stick-table references into section symbols. A
+        // backend/frontend/listen that owns a stick-table of the same name
+        // should surface call-site references when operators ask for
+        // references on the section itself.
+        if matches!(
+            sym.kind,
+            SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
+        ) {
+            let table_refs = self.project_references(uri, &sym.name, &SymbolKind::StickTable, None);
+            let table_defs = self.project_symbols(uri, &sym.name, &SymbolKind::StickTable, None);
+            if include_declaration {
+                for t in &table_defs {
+                    let t_content = match self.documents.get(&t.uri) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    let t_lines: Vec<&str> = t_content.lines().collect();
+                    let def_line_idx = t.range.start.line as usize;
+                    let end_char = t_lines
+                        .get(def_line_idx)
+                        .map(|l| l.len() as u32)
+                        .unwrap_or(t.range.end.character);
+                    push_loc(
+                        &t.uri,
+                        t.range.start.line,
+                        t.range.start.character,
+                        end_char,
+                        &mut locs,
+                        &mut seen_locs,
+                    );
+                }
+            }
+            for r in &table_refs {
+                let r_content = match self.documents.get(&r.uri) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let r_lines: Vec<&str> = r_content.lines().collect();
+                let ref_line_idx = r.range.start.line as usize;
+                let base_search_from = r_lines
+                    .get(ref_line_idx)
+                    .map(|raw| ref_line_search_from(raw, r));
+                let key = (r.uri.clone(), r.range.start.line, r.context.clone());
+                let precise = ref_context_has_precise_position(&r.context);
+                let floor = if precise {
+                    None
+                } else {
+                    ref_search_floor.get(&key).copied()
+                };
+                let search_from = match (base_search_from, floor) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                if let Some(raw) = r_lines.get(ref_line_idx) {
+                    if let Some((s, e)) =
+                        find_identifier_range(raw, &sym.name, search_from.unwrap_or(0))
+                    {
+                        push_loc(
+                            &r.uri,
+                            r.range.start.line,
+                            s,
+                            e,
+                            &mut locs,
+                            &mut seen_locs,
+                        );
+                        if !precise {
+                            ref_search_floor.insert(key, e as usize);
+                        }
+                        continue;
+                    }
+                }
+                push_loc(
+                    &r.uri,
+                    r.range.start.line,
+                    r.range.start.character,
+                    r.range.end.character,
+                    &mut locs,
+                    &mut seen_locs,
+                );
+            }
+        }
+
+        locs
+    }
+
     fn find_references_to_symbol_scoped(
         &self,
         uri: &str,
@@ -3057,28 +3654,16 @@ impl HaproxyLsp {
         symbol_kind: SymbolKind,
         scope: Option<&str>,
     ) -> Option<Vec<Reference>> {
-        // Single-file scope: look only in the requesting document.
-        let symbols = self.symbols.get(uri)?;
-        for symbol in symbols {
-            if symbol.name != symbol_name
-                || std::mem::discriminant(&symbol.kind)
-                    != std::mem::discriminant(&symbol_kind)
-            {
-                continue;
-            }
-            if let Some(want) = scope {
-                match symbol.scope.as_deref() {
-                    Some(have) if have == want => {}
-                    _ => continue,
-                }
-            }
-            if symbol.references.is_empty() {
-                return None;
-            } else {
-                return Some(symbol.references.clone());
-            }
+        // Project-wide scope: aggregate references from every URI in the
+        // include graph. `project_references` dedupes by (uri, line, col,
+        // context) so same-file references recorded on both
+        // `Symbol.references` and `raw_references` don't double-count.
+        let refs = self.project_references(uri, symbol_name, &symbol_kind, scope);
+        if refs.is_empty() {
+            None
+        } else {
+            Some(refs)
         }
-        None
     }
 
     /// Compute completion items for `textDocument/completion`.
@@ -3690,227 +4275,12 @@ impl HaproxyLsp {
                     .as_ref()
                     .and_then(|content| self.find_symbol_at_cursor(uri, &position, content));
 
-                let locations: Vec<Value> = if let (Some(sym), Some(content)) =
-                    (symbol, content_opt)
-                {
-                    // Narrow reference and declaration ranges to the identifier
-                    // token so clients like Zed highlight the symbol itself
-                    // rather than the whole line. Falls back to the stored
-                    // line-span range if the raw line can't be located or the
-                    // identifier can't be found in it.
-                    let lines: Vec<&str> = content.lines().collect();
-                    let mut locs: Vec<Value> = Vec::new();
-                    let mut seen_locs: std::collections::HashSet<(u32, u32)> =
-                        std::collections::HashSet::new();
-                    // Per-(line, context) next-search offset. A line may carry
-                    // the same symbol more than once (e.g. a stick-table
-                    // `... table rate ... sc0_*(rate) ...` or an ACL repeated
-                    // in a condition `if foo || foo`). Each recorded reference
-                    // must map to a distinct occurrence, so after every match
-                    // we advance the context-scoped search floor past its end.
-                    // Keying on context as well as line keeps independent
-                    // contexts on the same line (e.g. `use_backend foo if foo`)
-                    // from clobbering each other's offsets.
-                    let mut ref_search_floor: std::collections::HashMap<
-                        (u32, ReferenceContext),
-                        usize,
-                    > = std::collections::HashMap::new();
-                    let push_loc =
-                        |line_num: u32,
-                         start: u32,
-                         end: u32,
-                         locs: &mut Vec<Value>,
-                         seen: &mut std::collections::HashSet<(u32, u32)>| {
-                            if seen.insert((line_num, start)) {
-                                locs.push(json!({
-                                    "uri": sym.uri,
-                                    "range": {
-                                        "start": { "line": line_num, "character": start },
-                                        "end": { "line": line_num, "character": end },
-                                    }
-                                }));
-                            }
-                        };
-                    let push_narrow = |line_num: u32,
-                                           stored_start: &Position,
-                                           stored_end: &Position,
-                                           name: &str,
-                                           search_from_hint: Option<usize>,
-                                           locs: &mut Vec<Value>,
-                                           seen: &mut std::collections::HashSet<(u32, u32)>| {
-                        let (start_char, end_char) = lines
-                            .get(line_num as usize)
-                            .and_then(|raw| {
-                                let start = search_from_hint.unwrap_or(0);
-                                find_identifier_range(raw, name, start)
-                            })
-                            .unwrap_or((stored_start.character, stored_end.character));
-                        push_loc(line_num, start_char, end_char, locs, seen);
-                    };
-
-                    // Collect all definition lines with the same name/kind
-                    // (+scope for servers). Multiple ACL declarations share
-                    // the same name — every one of them is a declaration and
-                    // must surface when `includeDeclaration=true`.
-                    let matching_defs: Vec<Symbol> = self
-                        .symbols
-                        .get(uri)
-                        .map(|syms| {
-                            syms.iter()
-                                .filter(|s| {
-                                    s.name == sym.name
-                                        && s.kind == sym.kind
-                                        && (sym.kind != SymbolKind::Server
-                                            || s.scope == sym.scope)
-                                })
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    if include_declaration {
-                        for def in &matching_defs {
-                            let def_line_idx = def.range.start.line as usize;
-                            let search_from = lines
-                                .get(def_line_idx)
-                                .and_then(|raw| def_line_search_from(raw, &def.kind));
-                            push_narrow(
-                                def.range.start.line,
-                                &def.range.start,
-                                &def.range.end,
-                                &def.name,
-                                search_from,
-                                &mut locs,
-                                &mut seen_locs,
-                            );
-                        }
-                    }
-                    for r in &sym.references {
-                        let ref_line_idx = r.range.start.line as usize;
-                        let base_search_from = lines
-                            .get(ref_line_idx)
-                            .map(|raw| ref_line_search_from(raw, r));
-                        let key = (r.range.start.line, r.context.clone());
-                        let precise = ref_context_has_precise_position(&r.context);
-                        let floor = if precise {
-                            None
-                        } else {
-                            ref_search_floor.get(&key).copied()
-                        };
-                        let search_from = match (base_search_from, floor) {
-                            (Some(a), Some(b)) => Some(a.max(b)),
-                            (Some(a), None) => Some(a),
-                            (None, Some(b)) => Some(b),
-                            (None, None) => None,
-                        };
-                        if let Some(raw) = lines.get(ref_line_idx) {
-                            if let Some((s, e)) = find_identifier_range(
-                                raw,
-                                &sym.name,
-                                search_from.unwrap_or(0),
-                            ) {
-                                push_loc(
-                                    r.range.start.line,
-                                    s,
-                                    e,
-                                    &mut locs,
-                                    &mut seen_locs,
-                                );
-                                if !precise {
-                                    ref_search_floor.insert(key, e as usize);
-                                }
-                                continue;
-                            }
-                        }
-                        push_narrow(
-                            r.range.start.line,
-                            &r.range.start,
-                            &r.range.end,
-                            &sym.name,
-                            search_from,
-                            &mut locs,
-                            &mut seen_locs,
-                        );
-                    }
-
-                    // Cascade stick-table references into section symbols.
-                    // A backend/frontend/listen that owns a stick-table is
-                    // conceptually one name; references like `sc0_*(X)` and
-                    // `... table X` target the table, but operators expect
-                    // them to surface when asking for references on the
-                    // enclosing section of the same name.
-                    if matches!(
-                        sym.kind,
-                        SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
-                    ) {
-                        if let Some(table) =
-                            self.find_symbol_by_name(uri, &sym.name, SymbolKind::StickTable)
-                        {
-                            if include_declaration {
-                                let def_line_idx = table.range.start.line as usize;
-                                // Stick-table def line has no identifier to
-                                // anchor on; fall through to the stored range.
-                                push_loc(
-                                    table.range.start.line,
-                                    table.range.start.character,
-                                    lines
-                                        .get(def_line_idx)
-                                        .map(|l| l.len() as u32)
-                                        .unwrap_or(table.range.end.character),
-                                    &mut locs,
-                                    &mut seen_locs,
-                                );
-                            }
-                            for r in &table.references {
-                                let ref_line_idx = r.range.start.line as usize;
-                                let base_search_from = lines
-                                    .get(ref_line_idx)
-                                    .map(|raw| ref_line_search_from(raw, r));
-                                let key = (r.range.start.line, r.context.clone());
-                                let precise = ref_context_has_precise_position(&r.context);
-                                let floor = if precise {
-                                    None
-                                } else {
-                                    ref_search_floor.get(&key).copied()
-                                };
-                                let search_from = match (base_search_from, floor) {
-                                    (Some(a), Some(b)) => Some(a.max(b)),
-                                    (Some(a), None) => Some(a),
-                                    (None, Some(b)) => Some(b),
-                                    (None, None) => None,
-                                };
-                                if let Some(raw) = lines.get(ref_line_idx) {
-                                    if let Some((s, e)) = find_identifier_range(
-                                        raw,
-                                        &table.name,
-                                        search_from.unwrap_or(0),
-                                    ) {
-                                        push_loc(
-                                            r.range.start.line,
-                                            s,
-                                            e,
-                                            &mut locs,
-                                            &mut seen_locs,
-                                        );
-                                        if !precise {
-                                            ref_search_floor.insert(key, e as usize);
-                                        }
-                                        continue;
-                                    }
-                                }
-                                push_narrow(
-                                    r.range.start.line,
-                                    &r.range.start,
-                                    &r.range.end,
-                                    &table.name,
-                                    search_from,
-                                    &mut locs,
-                                    &mut seen_locs,
-                                );
-                            }
-                        }
-                    }
-
+                let locations: Vec<Value> = if let Some(sym) = symbol {
+                    let locs = self.build_references_locations(
+                        uri,
+                        &sym,
+                        include_declaration,
+                    );
                     locs
                 } else {
                     Vec::new()
@@ -4072,34 +4442,39 @@ impl HaproxyLsp {
                     }));
                 }
 
-                let lines: Vec<&str> = content.lines().collect();
-                let mut edits: Vec<Value> = Vec::new();
-                // Dedup by (line, start) so identical edits from duplicate
-                // reference entries (e.g. the same ACL appearing twice in a
-                // condition) don't produce overlapping TextEdits, which
-                // violates the LSP WorkspaceEdit invariant.
-                let mut seen: std::collections::HashSet<(u32, u32)> =
-                    std::collections::HashSet::new();
-                // Per-(line, context) next-search offset. A line may carry
-                // the same symbol more than once (`... table rate ...
-                // sc0_*(rate) ...`, `if foo || foo`). Each recorded reference
-                // must map to its own occurrence; without advancing a
-                // per-context floor past the previous match, all duplicate
-                // same-name references on a line collapse onto the first
-                // occurrence and the second/third/… stay stale after rename.
-                let mut ref_search_floor: std::collections::HashMap<
-                    (u32, ReferenceContext),
-                    usize,
-                > = std::collections::HashMap::new();
-                let mut push_edit = |line: u32, start: u32, end: u32, edits: &mut Vec<Value>| {
-                    if seen.insert((line, start)) {
-                        edits.push(json!({
-                            "range": {
-                                "start": { "line": line, "character": start },
-                                "end": { "line": line, "character": end },
-                            },
-                            "newText": new_name,
-                        }));
+                // Per-URI edit buckets so the resulting `WorkspaceEdit.changes`
+                // map has one entry per affected file. Definitions and
+                // references may live in separate include-graph files — each
+                // contributes its own `TextEdit[]` keyed by its URI.
+                let mut edits_by_uri: HashMap<String, Vec<Value>> = HashMap::new();
+                // Dedup by (uri, line, start) so identical edits from
+                // duplicate reference entries never produce overlapping
+                // TextEdits, violating the LSP WorkspaceEdit invariant.
+                let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+                // Per-(uri, line, context) next-search offset. A line may
+                // carry the same symbol more than once; each recorded
+                // reference must map to its own occurrence.
+                let mut ref_search_floor: HashMap<(String, u32, ReferenceContext), usize> =
+                    HashMap::new();
+
+                let new_name_owned = new_name.to_string();
+                let push_edit = |loc_uri: &str,
+                                      line: u32,
+                                      start: u32,
+                                      end: u32,
+                                      edits_by_uri: &mut HashMap<String, Vec<Value>>,
+                                      seen: &mut HashSet<(String, u32, u32)>| {
+                    if seen.insert((loc_uri.to_string(), line, start)) {
+                        edits_by_uri
+                            .entry(loc_uri.to_string())
+                            .or_default()
+                            .push(json!({
+                                "range": {
+                                    "start": { "line": line, "character": start },
+                                    "end": { "line": line, "character": end },
+                                },
+                                "newText": new_name_owned,
+                            }));
                     }
                 };
 
@@ -4109,49 +4484,58 @@ impl HaproxyLsp {
                 // partial rename would leave an orphan declaration and
                 // silently break the config. For servers the match also
                 // scope-filters by enclosing section so two backends with a
-                // same-named server stay independent.
-                let all_defs: Vec<(u32, String)> = self
-                    .symbols
-                    .get(uri)
-                    .map(|syms| {
-                        syms.iter()
-                            .filter(|s| {
-                                s.name == symbol.name
-                                    && s.kind == symbol.kind
-                                    && (symbol.kind != SymbolKind::Server
-                                        || s.scope == symbol.scope)
-                            })
-                            .map(|s| (s.range.start.line, s.name.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (def_line_num, _) in &all_defs {
-                    let def_line_idx = *def_line_num as usize;
-                    if def_line_idx >= lines.len() {
-                        continue;
-                    }
-                    let def_line = lines[def_line_idx];
+                // same-named server stay independent. With cross-file
+                // resolution, definitions may live in any project file.
+                let scope_for_match = if symbol.kind == SymbolKind::Server {
+                    symbol.scope.as_deref()
+                } else {
+                    None
+                };
+                let all_defs = self.project_symbols(uri, &symbol.name, &symbol.kind, scope_for_match);
+                for def in &all_defs {
+                    let def_content = match self.documents.get(&def.uri) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    let def_lines: Vec<&str> = def_content.lines().collect();
+                    let def_line_idx = def.range.start.line as usize;
+                    let def_line = match def_lines.get(def_line_idx) {
+                        Some(l) => *l,
+                        None => continue,
+                    };
                     if let Some(search_from) = def_line_search_from(def_line, &symbol.kind) {
                         if let Some((s, e)) =
                             find_identifier_range(def_line, &symbol.name, search_from)
                         {
-                            push_edit(*def_line_num, s, e, &mut edits);
+                            push_edit(
+                                &def.uri,
+                                def.range.start.line,
+                                s,
+                                e,
+                                &mut edits_by_uri,
+                                &mut seen,
+                            );
                         }
                     }
                 }
 
-                // Reference edits. Advance per-(line, context) floor after
-                // each match so multiple same-context references on one line
-                // pick up successive occurrences instead of collapsing onto
-                // the first.
-                for r in &symbol.references {
+                // Reference edits across all project files. Advance per-(uri,
+                // line, context) floor after each match so duplicates on the
+                // same line pick up successive occurrences.
+                let all_refs = self.project_references(uri, &symbol.name, &symbol.kind, scope_for_match);
+                for r in &all_refs {
+                    let ref_content = match self.documents.get(&r.uri) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    let ref_lines: Vec<&str> = ref_content.lines().collect();
                     let ref_line_idx = r.range.start.line as usize;
-                    if ref_line_idx >= lines.len() {
-                        continue;
-                    }
-                    let ref_line = lines[ref_line_idx];
+                    let ref_line = match ref_lines.get(ref_line_idx) {
+                        Some(l) => *l,
+                        None => continue,
+                    };
                     let base_search_from = ref_line_search_from(ref_line, r);
-                    let key = (r.range.start.line, r.context.clone());
+                    let key = (r.uri.clone(), r.range.start.line, r.context.clone());
                     let precise = ref_context_has_precise_position(&r.context);
                     let search_from = if precise {
                         base_search_from
@@ -4162,61 +4546,76 @@ impl HaproxyLsp {
                     if let Some((s, e)) =
                         find_identifier_range(ref_line, &symbol.name, search_from)
                     {
-                        push_edit(r.range.start.line, s, e, &mut edits);
+                        push_edit(
+                            &r.uri,
+                            r.range.start.line,
+                            s,
+                            e,
+                            &mut edits_by_uri,
+                            &mut seen,
+                        );
                         if !precise {
                             ref_search_floor.insert(key, e as usize);
                         }
                     }
                 }
 
-                // Cascade stick-table references into section renames.
-                // The stick-table is bound to the enclosing section's name,
-                // so renaming the section must also rewrite every
-                // `sc*_*(X)` / `... table X` / `stick on ... table X`
-                // call-site that names the section's table. Without this,
-                // renaming the section silently leaves call-sites pointing
-                // at a non-existent table.
+                // Cascade stick-table references into section renames. The
+                // stick-table is bound to the enclosing section's name, so
+                // renaming the section must also rewrite every call-site
+                // that names the section's table across every file.
                 if matches!(
                     symbol.kind,
                     SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
                 ) {
-                    if let Some(table) =
-                        self.find_symbol_by_name(uri, &symbol.name, SymbolKind::StickTable)
-                    {
-                        for r in &table.references {
-                            let ref_line_idx = r.range.start.line as usize;
-                            if ref_line_idx >= lines.len() {
-                                continue;
-                            }
-                            let ref_line = lines[ref_line_idx];
-                            let base_search_from = ref_line_search_from(ref_line, r);
-                            let key = (r.range.start.line, r.context.clone());
-                            let precise = ref_context_has_precise_position(&r.context);
-                            let search_from = if precise {
-                                base_search_from
-                            } else {
-                                let floor = ref_search_floor.get(&key).copied().unwrap_or(0);
-                                base_search_from.max(floor)
-                            };
-                            if let Some((s, e)) =
-                                find_identifier_range(ref_line, &table.name, search_from)
-                            {
-                                push_edit(r.range.start.line, s, e, &mut edits);
-                                if !precise {
-                                    ref_search_floor.insert(key, e as usize);
-                                }
+                    let table_refs = self.project_references(uri, &symbol.name, &SymbolKind::StickTable, None);
+                    for r in &table_refs {
+                        let ref_content = match self.documents.get(&r.uri) {
+                            Some(c) => c.clone(),
+                            None => continue,
+                        };
+                        let ref_lines: Vec<&str> = ref_content.lines().collect();
+                        let ref_line_idx = r.range.start.line as usize;
+                        let ref_line = match ref_lines.get(ref_line_idx) {
+                            Some(l) => *l,
+                            None => continue,
+                        };
+                        let base_search_from = ref_line_search_from(ref_line, r);
+                        let key = (r.uri.clone(), r.range.start.line, r.context.clone());
+                        let precise = ref_context_has_precise_position(&r.context);
+                        let search_from = if precise {
+                            base_search_from
+                        } else {
+                            let floor = ref_search_floor.get(&key).copied().unwrap_or(0);
+                            base_search_from.max(floor)
+                        };
+                        if let Some((s, e)) =
+                            find_identifier_range(ref_line, &symbol.name, search_from)
+                        {
+                            push_edit(
+                                &r.uri,
+                                r.range.start.line,
+                                s,
+                                e,
+                                &mut edits_by_uri,
+                                &mut seen,
+                            );
+                            if !precise {
+                                ref_search_floor.insert(key, e as usize);
                             }
                         }
                     }
                 }
 
+                let changes: serde_json::Map<String, Value> = edits_by_uri
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::Array(v)))
+                    .collect();
                 Some(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "changes": {
-                            uri: edits,
-                        }
+                        "changes": changes,
                     }
                 }))
             }

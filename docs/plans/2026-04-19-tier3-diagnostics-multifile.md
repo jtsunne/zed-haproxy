@@ -115,12 +115,12 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] update `find_definition`, `find_declaration`, `references` handler, and `rename` handler to consult the project index (not just the per-URI `symbols` cache); return `Location`s with the correct URI for out-of-file hits
-- [ ] `rename` returns a `WorkspaceEdit.changes` map keyed by every affected URI
-- [ ] F12 on a literal path in `.include <path>` or `-f <path>` returns a `Location` pointing to `{ uri: <resolved-file>, range: {0,0}-{0,0} }`
-- [ ] undefined-reference diagnostics now consult the project index — references resolved in another file are no longer flagged
-- [ ] add cross-file probes: definition on a `use_backend X` in `main.cfg` lands in `backends.cfg`; rename of `X` from `main.cfg` produces `TextEdit`s for both files; F12 on the `.include` path navigates to `backends.cfg`
-- [ ] run `./build.sh && python3 test/lsp_probes.py`
+- [x] update `find_definition`, `find_declaration`, `references` handler, and `rename` handler to consult the project index (not just the per-URI `symbols` cache); return `Location`s with the correct URI for out-of-file hits
+- [x] `rename` returns a `WorkspaceEdit.changes` map keyed by every affected URI
+- [x] F12 on a literal path in `.include <path>` or `-f <path>` returns a `Location` pointing to `{ uri: <resolved-file>, range: {0,0}-{0,0} }`
+- [x] undefined-reference diagnostics now consult the project index — references resolved in another file are no longer flagged
+- [x] add cross-file probes: definition on a `use_backend X` in `main.cfg` lands in `backends.cfg`; rename of `X` from `main.cfg` produces `TextEdit`s for both files; F12 on the `.include` path navigates to `backends.cfg`
+- [x] run `./build.sh && python3 test/lsp_probes.py`
 
 ### Task 7: Workspace symbol provider
 

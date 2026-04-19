@@ -2394,6 +2394,183 @@ def run_cross_file_probes(client: LspClient, results: Results):
         FRAGMENTS_BACKENDS.write_text(original_backends)
 
 
+def run_cross_file_navigation_probes(client: LspClient, results: Results):
+    """Exercise Task 6: cross-file definition, declaration, references,
+    rename, F12-on-include-path, and cross-file-aware undefined-reference
+    diagnostics.
+
+    Fixture layout:
+        test/fragments/main.cfg
+          0: global
+          1:     daemon
+          2:
+          3: defaults
+          4:     mode http
+          5:     timeout connect 5s
+          6:     timeout client  30s
+          7:     timeout server  30s
+          8:
+          9: .include backends.cfg
+         10:
+         11: frontend fe_main
+         12:     bind *:80
+         13:     default_backend be_web
+
+        test/fragments/backends.cfg
+          0: backend be_web
+          1:     mode http
+          2:     server web1 10.0.0.1:8080
+          3:     server web2 10.0.0.2:8080
+    """
+    if not FRAGMENTS_MAIN.exists() or not FRAGMENTS_BACKENDS.exists():
+        results.record(
+            "cross-file-nav",
+            "fragments fixture present",
+            False,
+            f"missing: {FRAGMENTS_MAIN} or {FRAGMENTS_BACKENDS}",
+        )
+        return
+
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    backends_uri = path_to_uri(FRAGMENTS_BACKENDS)
+
+    client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+    # 1. Cross-file definition: cursor on `be_web` in `default_backend be_web`
+    #    (main.cfg line 13 col 22) must jump to backends.cfg line 0.
+    try:
+        resp = client.request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": main_uri},
+                "position": {"line": 13, "character": 22},
+            },
+        )
+        loc = resp.get("result")
+        ok = (
+            isinstance(loc, dict)
+            and loc.get("uri") == backends_uri
+            and loc.get("range", {}).get("start", {}).get("line") == 0
+        )
+        results.record(
+            "cross-file-nav",
+            "definition on `default_backend be_web` lands in backends.cfg line 0",
+            ok,
+            f"got {loc!r}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "cross-file definition responds", False, str(exc))
+
+    # 2. F12 on `.include backends.cfg` path token (main.cfg line 9 col 12).
+    try:
+        resp = client.request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": main_uri},
+                "position": {"line": 9, "character": 12},
+            },
+        )
+        loc = resp.get("result")
+        ok = (
+            isinstance(loc, dict)
+            and loc.get("uri") == backends_uri
+            and loc.get("range", {}).get("start", {}).get("line") == 0
+            and loc.get("range", {}).get("start", {}).get("character") == 0
+        )
+        results.record(
+            "cross-file-nav",
+            "F12 on `.include backends.cfg` path jumps to backends.cfg {0,0}",
+            ok,
+            f"got {loc!r}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "include-path F12 responds", False, str(exc))
+
+    # 3. Cross-file rename: renaming `be_web` at backends.cfg line 0 col 10
+    #    must produce TextEdits in both backends.cfg and main.cfg.
+    client.did_open(backends_uri, FRAGMENTS_BACKENDS.read_text())
+    try:
+        resp = client.request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": backends_uri},
+                "position": {"line": 0, "character": 10},
+                "newName": "be_renamed",
+            },
+        )
+        changes = (resp.get("result") or {}).get("changes") or {}
+        main_edits = changes.get(main_uri) or []
+        backends_edits = changes.get(backends_uri) or []
+        main_ok = any(
+            e.get("newText") == "be_renamed"
+            and e.get("range", {}).get("start", {}).get("line") == 13
+            for e in main_edits
+        )
+        backends_ok = any(
+            e.get("newText") == "be_renamed"
+            and e.get("range", {}).get("start", {}).get("line") == 0
+            for e in backends_edits
+        )
+        results.record(
+            "cross-file-nav",
+            "rename of `be_web` produces edit in backends.cfg (definition)",
+            backends_ok,
+            f"backends.cfg edits: {backends_edits}",
+        )
+        results.record(
+            "cross-file-nav",
+            "rename of `be_web` produces edit in main.cfg (reference)",
+            main_ok,
+            f"main.cfg edits: {main_edits}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "cross-file rename responds", False, str(exc))
+
+    # 4. Cross-file references: cursor on the `be_web` DEFINITION in
+    #    backends.cfg must list the reference in main.cfg (and, with
+    #    includeDeclaration=true, the definition itself).
+    try:
+        resp = client.request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": backends_uri},
+                "position": {"line": 0, "character": 10},
+                "context": {"includeDeclaration": False},
+            },
+        )
+        locs = resp.get("result") or []
+        main_hits = [
+            l
+            for l in locs
+            if l.get("uri") == main_uri
+            and l.get("range", {}).get("start", {}).get("line") == 13
+        ]
+        results.record(
+            "cross-file-nav",
+            "references on `be_web` def includes main.cfg call-site",
+            bool(main_hits),
+            f"locations: {locs}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "cross-file references responds", False, str(exc))
+
+    # 5. Undefined-reference diagnostics: the `default_backend be_web`
+    #    line in main.cfg must NOT be flagged because `be_web` is defined in
+    #    backends.cfg.
+    diags = client._diagnostics.get(main_uri) or []
+    flagged = any(
+        d.get("code") == "undefined-backend"
+        and d.get("range", {}).get("start", {}).get("line") == 13
+        for d in diags
+    )
+    results.record(
+        "cross-file-nav",
+        "cross-file be_web not flagged as undefined in main.cfg",
+        not flagged,
+        f"diagnostics: {diags}",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -2426,6 +2603,7 @@ def main() -> int:
         run_diagnostics_probes(client, results)
         run_project_info_probes(client, results)
         run_cross_file_probes(client, results)
+        run_cross_file_navigation_probes(client, results)
     finally:
         client.shutdown()
 
