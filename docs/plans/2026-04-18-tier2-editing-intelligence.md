@@ -125,12 +125,12 @@ Single-file scope retained from Tier 1. Cross-file resolution is explicitly defe
 - Modify: `CLAUDE.md`
 - Modify: `docs/roadmap.md`
 
-- [ ] run `./build.sh` — the LSP binary must build clean with zero warnings for new code paths
-- [ ] run `python3 test/lsp_probes.py` — full suite (definition + declaration + folding + documentSymbol + references + rename + hover + completion) must PASS
-- [ ] bump `version` in `extension.toml` to `0.3.0`
-- [ ] update `README.md` with a Tier 2 capabilities section (completion, hover, references, rename) and a short demo example for each
-- [ ] update `CLAUDE.md` to list the new advertised capabilities, the new `StickTable` symbol kind, and the `src/docs.rs` docs table pattern
-- [ ] update `docs/roadmap.md`: mark Tier 2 as shipped; move this plan into `docs/plans/completed/` after manual Zed verification
+- [x] run `./build.sh` — the LSP binary must build clean with zero warnings for new code paths (removed pre-existing dead-code `ServerReference` variant that was surfaced as the only warning after Task 3 landed; build is now warning-free)
+- [x] run `python3 test/lsp_probes.py` — full suite (definition + declaration + folding + documentSymbol + references + rename + hover + completion) must PASS (78/81; the 3 unchanged failures are pre-existing prod.cfg fold probes documented throughout this plan)
+- [x] bump `version` in `extension.toml` to `0.3.0`
+- [x] update `README.md` with a Tier 2 capabilities section (completion, hover, references, rename) and a short demo example for each
+- [x] update `CLAUDE.md` to list the new advertised capabilities, the new `StickTable` symbol kind, and the `src/docs.rs` docs table pattern
+- [x] update `docs/roadmap.md`: mark Tier 2 as shipped (current-state section and the Tier 2 header reflect v0.3.0). Moving this plan into `docs/plans/completed/` is gated on manual Zed verification (Post-Completion section) and is left for the release step — skipped here as not automatable.
 
 ## Post-Completion
 

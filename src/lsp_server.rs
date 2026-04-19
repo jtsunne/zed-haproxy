@@ -26,7 +26,6 @@ enum ReferenceContext {
     DefaultBackend,
     AclCondition,
     AclUnlessCondition,
-    ServerReference,
     StickTable,
 }
 
@@ -362,7 +361,7 @@ fn ref_line_search_from(line: &str, ctx: &ReferenceContext) -> usize {
             .find(" unless ")
             .map(|p| p + " unless ".len())
             .unwrap_or(trimmed_start),
-        ReferenceContext::ServerReference | ReferenceContext::StickTable => trimmed_start,
+        ReferenceContext::StickTable => trimmed_start,
     }
 }
 
