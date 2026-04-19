@@ -366,6 +366,68 @@ fn ref_line_search_from(line: &str, ctx: &ReferenceContext) -> usize {
     }
 }
 
+/// Build a `sortText` from an in-file usage count and a label.
+///
+/// Higher `count` → lower prefix (zero-padded inverse), so frequently-used
+/// symbols rank first. Ties break alphabetically via the trailing label.
+fn frequency_sort_key(count: usize, label: &str) -> String {
+    let capped = count.min(999_999);
+    let inverse = 999_999 - capped;
+    format!("{:06}_{}", inverse, label)
+}
+
+/// Hard-coded directive allowlist per section keyword. Values overlap so
+/// each section's completion menu is self-contained; the lists are not
+/// exhaustive but cover the vast majority of real-world configs.
+fn directives_for_section(section: &str) -> &'static [&'static str] {
+    match section {
+        "global" => &[
+            "daemon", "log", "maxconn", "nbthread", "user", "group",
+            "pidfile", "chroot", "stats", "ssl-default-bind-ciphers",
+            "ssl-default-bind-options", "tune.ssl.default-dh-param",
+        ],
+        "defaults" => &[
+            "balance", "cookie", "default-server", "errorfile", "http-check",
+            "log", "maxconn", "mode", "option", "retries", "timeout",
+        ],
+        "frontend" => &[
+            "acl", "bind", "capture", "compression", "default_backend",
+            "description", "filter", "http-after-response", "http-request",
+            "http-response", "log", "maxconn", "mode", "monitor-uri",
+            "option", "rate-limit", "redirect", "stats", "tcp-request",
+            "tcp-response", "timeout", "use-service", "use_backend",
+        ],
+        "backend" => &[
+            "acl", "balance", "compression", "cookie", "default-server",
+            "description", "errorfile", "filter", "hash-type",
+            "http-after-response", "http-check", "http-request",
+            "http-response", "http-reuse", "http-send-name-header", "mode",
+            "option", "redirect", "retries", "server", "stick", "stick-table",
+            "tcp-check", "tcp-request", "tcp-response", "timeout", "use_server",
+        ],
+        "listen" => &[
+            "acl", "balance", "bind", "compression", "cookie",
+            "default-server", "default_backend", "description", "errorfile",
+            "filter", "hash-type", "http-check", "http-request",
+            "http-response", "http-reuse", "log", "maxconn", "mode", "option",
+            "redirect", "retries", "server", "stats", "stick", "stick-table",
+            "tcp-check", "tcp-request", "tcp-response", "timeout",
+            "use_backend",
+        ],
+        "resolvers" => &[
+            "accepted_payload_size", "hold", "nameserver", "resolve_retries",
+            "timeout",
+        ],
+        "userlist" => &["group", "user"],
+        "peers" => &["bind", "peer", "server", "table"],
+        "cache" => &["max-age", "max-object-size", "total-max-size"],
+        "mailers" => &["mailer", "timeout"],
+        "program" => &["command", "group", "option", "user"],
+        "ring" => &["format", "maxlen", "server", "size", "timeout"],
+        _ => &[],
+    }
+}
+
 fn section_kind_for(keyword: &str) -> u8 {
     match keyword {
         "global" | "defaults" => 3,           // Namespace
@@ -1463,6 +1525,402 @@ impl HaproxyLsp {
         None
     }
 
+    /// Compute completion items for `textDocument/completion`.
+    ///
+    /// Context resolution order:
+    /// 1. Cursor inside an unclosed `sc<N>_<ident>(` call (first positional
+    ///    arg) → stick-table names.
+    /// 2. Last effective keyword is `stick match`/`stick store-request`/
+    ///    `stick store-response` → stick-table names.
+    /// 3. Last effective keyword is `use_backend`/`default_backend` →
+    ///    backend names.
+    /// 4. Last effective keyword is `use_server` → server names from the
+    ///    enclosing backend/listen section body.
+    /// 5. Prefix contains `if`/`unless` outside `{}` groups → ACL names.
+    /// 6. Cursor is typing the first token on a line inside a known
+    ///    section body → directive allowlist for that section.
+    ///
+    /// Each item carries `sortText` derived from the symbol's in-file
+    /// usage frequency (higher reference count → earlier in the list);
+    /// directives use a fixed alphabetical ordering.
+    fn compute_completions(&self, uri: &str, position: &Position, content: &str) -> Vec<Value> {
+        let lines: Vec<&str> = content.lines().collect();
+        let line_idx = position.line as usize;
+        if line_idx >= lines.len() {
+            return Vec::new();
+        }
+        let line = lines[line_idx];
+        let char_pos = (position.character as usize).min(line.len());
+        let prefix = &line[..char_pos];
+
+        // Case 1: inside an unclosed sc<N>_*(...) call, first positional arg.
+        if let Some(open) = prefix.rfind('(') {
+            let after_open = &prefix[open + 1..];
+            if !after_open.contains(')') && !after_open.contains(',') {
+                let before_paren = &prefix[..open];
+                let fn_start = before_paren
+                    .rfind(|c: char| c.is_whitespace() || c == '{' || c == '[')
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                let fn_name = &before_paren[fn_start..];
+                let fb = fn_name.as_bytes();
+                if fb.len() > 3
+                    && fb[0] == b's'
+                    && fb[1] == b'c'
+                    && fb[2].is_ascii_digit()
+                    && fb[3] == b'_'
+                {
+                    return self.complete_stick_tables(uri);
+                }
+            }
+        }
+
+        let prefix_tokens: Vec<&str> = prefix.split_whitespace().collect();
+        let ends_with_whitespace = prefix.is_empty()
+            || prefix.ends_with(|c: char| c.is_whitespace());
+
+        // "Effective keyword" is the token the cursor sits immediately after.
+        // When the cursor is mid-word, that is the second-to-last token;
+        // otherwise it is the last token.
+        let kw_idx: Option<usize> = if ends_with_whitespace {
+            if prefix_tokens.is_empty() {
+                None
+            } else {
+                Some(prefix_tokens.len() - 1)
+            }
+        } else if prefix_tokens.len() >= 2 {
+            Some(prefix_tokens.len() - 2)
+        } else {
+            None
+        };
+
+        // Case 2: `stick match|store-request|store-response <table>`.
+        if let Some(idx) = kw_idx {
+            if idx >= 1
+                && prefix_tokens[idx - 1] == "stick"
+                && matches!(
+                    prefix_tokens[idx],
+                    "match" | "store-request" | "store-response"
+                )
+            {
+                return self.complete_stick_tables(uri);
+            }
+        }
+
+        // Cases 3 and 4: use_backend / default_backend / use_server.
+        if let Some(idx) = kw_idx {
+            match prefix_tokens[idx] {
+                "use_backend" | "default_backend" => {
+                    return self.complete_backends(uri, content);
+                }
+                "use_server" => {
+                    return self
+                        .complete_servers_in_enclosing_section(uri, content, line_idx);
+                }
+                _ => {}
+            }
+        }
+
+        // Case 5: ACL condition after `if`/`unless`, outside of `{...}` group.
+        if self.in_acl_condition(&prefix_tokens) {
+            return self.complete_acls(uri, content);
+        }
+
+        // Case 6: start-of-line directive completion.
+        // Triggered when the cursor sits inside the first token of the line
+        // (or at col 0 on an otherwise-empty line).
+        let is_first_token_context = prefix_tokens.is_empty()
+            || (prefix_tokens.len() == 1 && !ends_with_whitespace);
+        if is_first_token_context {
+            if let Some(section_kw) = self.find_enclosing_section_keyword(content, line_idx) {
+                return self.complete_directives(&section_kw);
+            }
+        }
+
+        Vec::new()
+    }
+
+    fn in_acl_condition(&self, tokens: &[&str]) -> bool {
+        let mut in_braces: i32 = 0;
+        let mut saw_cond_kw = false;
+        for tok in tokens {
+            for ch in tok.chars() {
+                if ch == '{' {
+                    in_braces += 1;
+                } else if ch == '}' {
+                    if in_braces > 0 {
+                        in_braces -= 1;
+                    }
+                }
+            }
+            if in_braces == 0 && (*tok == "if" || *tok == "unless") {
+                saw_cond_kw = true;
+            }
+        }
+        saw_cond_kw && in_braces == 0
+    }
+
+    /// Walk up from `line_idx` (inclusive of body lines, exclusive of the
+    /// header itself) to find the enclosing section keyword. Returns `None`
+    /// when the cursor is on the header line or before any section.
+    fn find_enclosing_section_keyword(
+        &self,
+        content: &str,
+        line_idx: usize,
+    ) -> Option<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        if line_idx >= lines.len() {
+            return None;
+        }
+        // If cursor line itself is a section header, do not offer directive
+        // completions (we'd be typing into the header, not the body).
+        if is_section_header(lines[line_idx]) {
+            return None;
+        }
+        let mut i = line_idx;
+        loop {
+            if is_section_header(lines[i]) {
+                let tokens: Vec<&str> = lines[i].split_whitespace().collect();
+                return tokens.first().map(|s| s.to_string());
+            }
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+        }
+    }
+
+    fn complete_backends(&self, uri: &str, content: &str) -> Vec<Value> {
+        let symbols = match self.symbols.get(uri) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut filtered: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymbolKind::Backend))
+            .collect();
+        filtered.sort_by(|a, b| {
+            b.references
+                .len()
+                .cmp(&a.references.len())
+                .then(a.name.cmp(&b.name))
+        });
+        filtered
+            .iter()
+            .map(|s| {
+                let def_line = lines
+                    .get(s.range.start.line as usize)
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                json!({
+                    "label": s.name,
+                    "kind": 7, // Class
+                    "detail": def_line.clone(),
+                    "documentation": {
+                        "kind": "markdown",
+                        "value": format!("```haproxy\n{}\n```", def_line),
+                    },
+                    "sortText": frequency_sort_key(s.references.len(), &s.name),
+                })
+            })
+            .collect()
+    }
+
+    fn complete_acls(&self, uri: &str, content: &str) -> Vec<Value> {
+        let symbols = match self.symbols.get(uri) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        // Deduplicate by name: an ACL name may appear on multiple lines
+        // (HAProxy allows multiple `acl NAME ...` declarations that OR
+        // together). Collapse them so completion does not emit duplicate
+        // labels.
+        let mut seen: HashMap<String, (usize, String)> = HashMap::new();
+        for s in symbols {
+            if !matches!(s.kind, SymbolKind::Acl) {
+                continue;
+            }
+            let def_line = lines
+                .get(s.range.start.line as usize)
+                .copied()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let entry = seen
+                .entry(s.name.clone())
+                .or_insert_with(|| (0, def_line.clone()));
+            entry.0 += s.references.len();
+        }
+        let mut items: Vec<(String, usize, String)> = seen
+            .into_iter()
+            .map(|(name, (count, line))| (name, count, line))
+            .collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        items
+            .into_iter()
+            .map(|(name, count, def_line)| {
+                json!({
+                    "label": name,
+                    "kind": 21, // Constant
+                    "detail": def_line.clone(),
+                    "documentation": {
+                        "kind": "markdown",
+                        "value": format!("```haproxy\n{}\n```", def_line),
+                    },
+                    "sortText": frequency_sort_key(count, &name),
+                })
+            })
+            .collect()
+    }
+
+    fn complete_stick_tables(&self, uri: &str) -> Vec<Value> {
+        let symbols = match self.symbols.get(uri) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let content = self.documents.get(uri).cloned().unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        let mut filtered: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymbolKind::StickTable))
+            .collect();
+        filtered.sort_by(|a, b| {
+            b.references
+                .len()
+                .cmp(&a.references.len())
+                .then(a.name.cmp(&b.name))
+        });
+        filtered
+            .iter()
+            .map(|s| {
+                let def_line = lines
+                    .get(s.range.start.line as usize)
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                json!({
+                    "label": s.name,
+                    "kind": 22, // Struct
+                    "detail": def_line.clone(),
+                    "documentation": {
+                        "kind": "markdown",
+                        "value": format!("```haproxy\n{}\n```", def_line),
+                    },
+                    "sortText": frequency_sort_key(s.references.len(), &s.name),
+                })
+            })
+            .collect()
+    }
+
+    fn complete_servers_in_enclosing_section(
+        &self,
+        uri: &str,
+        content: &str,
+        line_idx: usize,
+    ) -> Vec<Value> {
+        let lines: Vec<&str> = content.lines().collect();
+        if line_idx >= lines.len() {
+            return Vec::new();
+        }
+        // Walk up to the nearest section header; only backend/listen own
+        // server pools.
+        let mut section_start: Option<usize> = None;
+        let mut i = line_idx;
+        loop {
+            if is_section_header(lines[i]) {
+                let tokens: Vec<&str> = lines[i].split_whitespace().collect();
+                if let Some(kw) = tokens.first() {
+                    if *kw == "backend" || *kw == "listen" {
+                        section_start = Some(i);
+                    }
+                }
+                break;
+            }
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+        }
+        let Some(start) = section_start else {
+            return Vec::new();
+        };
+        let mut end = lines.len();
+        for (j, ln) in lines.iter().enumerate().skip(start + 1) {
+            if is_section_header(ln) {
+                end = j;
+                break;
+            }
+        }
+        let symbols = match self.symbols.get(uri) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let mut items: Vec<&Symbol> = Vec::new();
+        for s in symbols {
+            if !matches!(s.kind, SymbolKind::Server) {
+                continue;
+            }
+            let l = s.range.start.line as usize;
+            if l > start && l < end {
+                items.push(s);
+            }
+        }
+        items.sort_by(|a, b| {
+            b.references
+                .len()
+                .cmp(&a.references.len())
+                .then(a.name.cmp(&b.name))
+        });
+        items
+            .into_iter()
+            .map(|s| {
+                let def_line = lines
+                    .get(s.range.start.line as usize)
+                    .copied()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                json!({
+                    "label": s.name,
+                    "kind": 6, // Variable
+                    "detail": def_line.clone(),
+                    "documentation": {
+                        "kind": "markdown",
+                        "value": format!("```haproxy\n{}\n```", def_line),
+                    },
+                    "sortText": frequency_sort_key(s.references.len(), &s.name),
+                })
+            })
+            .collect()
+    }
+
+    fn complete_directives(&self, section_kw: &str) -> Vec<Value> {
+        let list = directives_for_section(section_kw);
+        let mut items: Vec<&&'static str> = list.iter().collect();
+        items.sort();
+        items
+            .into_iter()
+            .map(|name| {
+                let doc = docs::directive_doc(name).unwrap_or("");
+                json!({
+                    "label": name,
+                    "kind": 14, // Keyword
+                    "detail": format!("{} directive", section_kw),
+                    "documentation": {
+                        "kind": "markdown",
+                        "value": doc,
+                    },
+                    "sortText": format!("000000_{}", name),
+                })
+            })
+            .collect()
+    }
+
     fn handle_request(&mut self, request: Value) -> Option<Value> {
         let method = request["method"].as_str()?;
         let id = &request["id"];
@@ -1481,6 +1939,10 @@ impl HaproxyLsp {
                             "foldingRangeProvider": true,
                             "documentSymbolProvider": true,
                             "hoverProvider": true,
+                            "completionProvider": {
+                                "triggerCharacters": [" ", "("],
+                                "resolveProvider": false
+                            },
                             "textDocumentSync": {
                                 "openClose": true,
                                 "change": 1
@@ -1852,6 +2314,30 @@ impl HaproxyLsp {
                         "changes": {
                             uri: edits,
                         }
+                    }
+                }))
+            }
+            "textDocument/completion" => {
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str()?;
+                let position = Position {
+                    line: params["position"]["line"].as_u64()? as u32,
+                    character: params["position"]["character"].as_u64()? as u32,
+                };
+
+                let items: Vec<Value> = self
+                    .documents
+                    .get(uri)
+                    .cloned()
+                    .map(|content| self.compute_completions(uri, &position, &content))
+                    .unwrap_or_default();
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "isIncomplete": false,
+                        "items": items,
                     }
                 }))
             }

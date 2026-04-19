@@ -105,17 +105,17 @@ Single-file scope retained from Tier 1. Cross-file resolution is explicitly defe
 - Modify: `src/lsp_server.rs`
 - Modify: `test/lsp_probes.py`
 
-- [ ] advertise `completionProvider: { triggerCharacters: [" ", "("], resolveProvider: false }` in `initialize`
-- [ ] add `textDocument/completion` handler; context detection reuses the prefix-token walk from `find_definition` and the cursor line text:
+- [x] advertise `completionProvider: { triggerCharacters: [" ", "("], resolveProvider: false }` in `initialize`
+- [x] add `textDocument/completion` handler; context detection reuses the prefix-token walk from `find_definition` and the cursor line text:
   - After `use_backend`/`default_backend` → backend names (kind=7 Class)
   - After `if`/`unless`/`!` in a condition → ACL names (kind=21 Constant)
   - After `use_server` → server names scoped to the enclosing backend (walk up the line index to find the owning `backend` section header)
   - Inside `sc0_*(`, `sc1_*(`, `stick match `, `stick store-request ` → stick-table names
   - Start of line inside a known section → hard-coded per-section directive allowlist (keys pulled from `src/docs.rs`)
-- [ ] each `CompletionItem` carries `label`, `kind`, `detail` (e.g. backend mode + balance, ACL criterion summary), `documentation` (from `src/docs.rs` for directive completions, from the symbol's surrounding line for identifier completions), and `sortText` derived from in-file usage frequency (count references to rank popular symbols higher)
-- [ ] rank by frequency of use in the current file; stable secondary sort by alphabetical name
-- [ ] add `COMPLETION_PROBES` covering each of the five contexts on `test/haproxy.conf`; each probe asserts a minimum set of expected labels is present (not an exact-equality check, since directive allowlists may evolve); include one probe asserting ≥5 backend names under a `use_backend ` prefix on the real fixture `test/haproxy.prod.cfg`
-- [ ] run `python3 test/lsp_probes.py` — full suite must PASS before Task 6
+- [x] each `CompletionItem` carries `label`, `kind`, `detail` (e.g. backend mode + balance, ACL criterion summary), `documentation` (from `src/docs.rs` for directive completions, from the symbol's surrounding line for identifier completions), and `sortText` derived from in-file usage frequency (count references to rank popular symbols higher)
+- [x] rank by frequency of use in the current file; stable secondary sort by alphabetical name
+- [x] add `COMPLETION_PROBES` covering each of the five contexts on `test/haproxy.conf`; each probe asserts a minimum set of expected labels is present (not an exact-equality check, since directive allowlists may evolve); include one probe asserting ≥5 backend names under a `use_backend ` prefix on the real fixture `test/haproxy.prod.cfg`
+- [x] run `python3 test/lsp_probes.py` — full suite must PASS before Task 6 (pre-existing 3 prod.cfg fold failures unchanged; all 6 new completion probes plus all prior passing probes PASS: 78/81)
 
 ### Task 6: Verify acceptance, update docs, bump version
 

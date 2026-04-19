@@ -800,6 +800,89 @@ HOVER_PROBES: list[dict] = [
 ]
 
 
+# Completion probes exercise `textDocument/completion`. Each probe declares a
+# cursor position on a fixture plus a minimum set of expected labels (not an
+# exact-equality check, to keep the tests tolerant of future directive-list
+# changes). `expected_kind` (when set) asserts every matched item carries the
+# given CompletionItemKind; `expected_missing` asserts labels that MUST NOT
+# appear (used to prove a context is distinguished from another).
+COMPLETION_FIXTURE_USE_SERVER_URI = (
+    "file:///tmp/haproxy-lsp-completion-use-server-fixture.cfg"
+)
+COMPLETION_FIXTURE_USE_SERVER_TEXT = "\n".join(
+    [
+        "backend bk",                    # 0
+        "  server s1 10.0.0.1:1",        # 1
+        "  server s2 10.0.0.2:2",        # 2
+        "  use_server ",                 # 3: cursor at char 13 = right after `use_server `
+        "",                               # 4
+        "backend bk_other",               # 5
+        "  server elsewhere 10.9.9.9:9", # 6: must NOT appear in bk scope
+        "",
+    ]
+)
+
+COMPLETION_PROBES: list[dict] = [
+    {
+        "desc": "after `use_backend ` → backend names",
+        "fixture": "conf",
+        "line": 33,
+        "character": 14,
+        "expected_labels": {
+            "accountCreationService_10000",
+            "profileEditingService_20000",
+            "dotted.backend",
+            "st_ratelimit",
+        },
+        "expected_kind": 7,  # Class
+    },
+    {
+        "desc": "after `if ` → ACL names",
+        "fixture": "conf",
+        "line": 33,
+        "character": 46,
+        "expected_labels": {
+            "app__accountCreationService",
+            "app__profileEditingService",
+            "dotted.acl",
+        },
+        "expected_kind": 21,  # Constant
+    },
+    {
+        "desc": "inside `sc0_http_req_rate(` → stick-table names",
+        "fixture": "conf",
+        "line": 102,
+        "character": 60,
+        "expected_labels": {"st_ratelimit"},
+        "expected_kind": 22,  # Struct
+    },
+    {
+        "desc": "after `use_server ` → servers in enclosing backend only",
+        "fixture": "use_server",
+        "line": 3,
+        "character": 13,
+        "expected_labels": {"s1", "s2"},
+        "expected_kind": 6,  # Variable
+        "expected_missing": {"elsewhere"},
+    },
+    {
+        "desc": "start of line inside backend section → directive allowlist",
+        "fixture": "conf",
+        "line": 57,
+        "character": 0,
+        "expected_labels": {"server", "balance", "mode", "option", "http-request"},
+        "expected_kind": 14,  # Keyword
+    },
+    {
+        "desc": "prod.cfg: after `use_backend ` → ≥5 backend names",
+        "fixture": "cfg",
+        "line": 727,
+        "character": 16,
+        "expected_min_labels_of_kind": {"kind": 7, "min": 5},
+    },
+]
+
+
 DECLARATION_PROBES: list[dict] = [
     {
         "desc": "`!plain` in `if` condition yields declaration reference",
@@ -1492,6 +1575,122 @@ def run_hover_probes(client: LspClient, results: Results):
         )
 
 
+def run_completion_probes(client: LspClient, results: Results):
+    if not COMPLETION_PROBES:
+        return
+
+    opened_uris: dict[str, str] = {}
+    fixtures = {
+        "conf": HAPROXY_CONF,
+        "cfg": HAPROXY_CFG,
+    }
+    for key, path in fixtures.items():
+        if not any(p["fixture"] == key for p in COMPLETION_PROBES):
+            continue
+        if not path.exists():
+            results.record("completion", f"fixture present: {key}", False, f"missing: {path}")
+            continue
+        uri = path_to_uri(path)
+        client.did_open(uri, path.read_text())
+        opened_uris[key] = uri
+
+    # Inline fixture for the use_server scoping probe.
+    if any(p["fixture"] == "use_server" for p in COMPLETION_PROBES):
+        client.did_open(
+            COMPLETION_FIXTURE_USE_SERVER_URI,
+            COMPLETION_FIXTURE_USE_SERVER_TEXT,
+        )
+        opened_uris["use_server"] = COMPLETION_FIXTURE_USE_SERVER_URI
+
+    for probe in COMPLETION_PROBES:
+        uri = opened_uris.get(probe["fixture"])
+        if uri is None:
+            results.record("completion", probe["desc"], False, "fixture not opened")
+            continue
+
+        try:
+            resp = client.request(
+                "textDocument/completion",
+                {
+                    "textDocument": {"uri": uri},
+                    "position": {
+                        "line": probe["line"],
+                        "character": probe["character"],
+                    },
+                },
+            )
+        except TimeoutError as exc:
+            results.record("completion", probe["desc"], False, str(exc))
+            continue
+
+        result = resp.get("result")
+        # Spec allows either `CompletionList` or `CompletionItem[]`; we return
+        # the list form so unwrap `.items`.
+        items: list = []
+        if isinstance(result, dict):
+            items = result.get("items") or []
+        elif isinstance(result, list):
+            items = result
+
+        actual_labels = {item.get("label") for item in items}
+
+        if "expected_min_labels_of_kind" in probe:
+            spec = probe["expected_min_labels_of_kind"]
+            of_kind = [i for i in items if i.get("kind") == spec["kind"]]
+            ok = len(of_kind) >= spec["min"]
+            detail = (
+                f"{len(of_kind)} items of kind {spec['kind']} (need ≥{spec['min']})"
+            )
+            results.record("completion", probe["desc"], ok, detail)
+            continue
+
+        expected = probe["expected_labels"]
+        missing = expected - actual_labels
+        if missing:
+            preview = ", ".join(sorted(actual_labels))[:120]
+            results.record(
+                "completion",
+                probe["desc"],
+                False,
+                f"missing {sorted(missing)}; got {preview!r}",
+            )
+            continue
+
+        if "expected_missing" in probe:
+            forbidden = probe["expected_missing"] & actual_labels
+            if forbidden:
+                results.record(
+                    "completion",
+                    probe["desc"],
+                    False,
+                    f"forbidden labels leaked: {sorted(forbidden)}",
+                )
+                continue
+
+        if "expected_kind" in probe:
+            wanted = probe["expected_kind"]
+            mismatched = [
+                i.get("label")
+                for i in items
+                if i.get("label") in expected and i.get("kind") != wanted
+            ]
+            if mismatched:
+                results.record(
+                    "completion",
+                    probe["desc"],
+                    False,
+                    f"kind mismatch on {mismatched}: expected {wanted}",
+                )
+                continue
+
+        results.record(
+            "completion",
+            probe["desc"],
+            True,
+            f"{len(items)} items, {len(expected)} expected labels present",
+        )
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -1562,6 +1761,7 @@ def main() -> int:
         run_references_probes(client, results)
         run_rename_probes(client, results)
         run_hover_probes(client, results)
+        run_completion_probes(client, results)
     finally:
         client.shutdown()
 
