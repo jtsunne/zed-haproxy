@@ -7,13 +7,17 @@ mod docs;
 
 // Project-level configuration discovered from `.zed/haproxy.toml` (or defaults
 // when no config file is found). One config is resolved per opened document
-// and cached by URI. Future tasks (cross-file index, workspace symbols) will
-// consult `follow_includes` / `extra_files` to decide which sibling files to
-// pull into the project index.
+// and cached by URI. `follow_includes` gates the include-graph walk in
+// `extract_include_uris`; `extra_files` is reserved for a future glob-expansion
+// pass that will seed additional sibling files into the project index.
 #[derive(Debug, Clone)]
 struct ProjectConfig {
     project_root: PathBuf,
     follow_includes: bool,
+    // Reserved: glob patterns/paths relative to `project_root` that should be
+    // pulled into the include graph even when no `.include` reaches them.
+    // Currently parsed and surfaced via `$/haproxy/projectInfo` but not yet
+    // expanded into `included_files`.
     extra_files: Vec<String>,
     // Path to the `.zed/haproxy.toml` file that produced this config, if any.
     // `None` means defaults were used (no config discovered).
@@ -2049,6 +2053,13 @@ impl HaproxyLsp {
     // already treats conditional directives as ordinary content.
     fn extract_include_uris(&self, uri: &str, content: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        // Honor `follow_includes = false` in .zed/haproxy.toml — users with
+        // segmented projects can opt out of the graph walk entirely.
+        if let Some(cfg) = self.project_configs.get(uri) {
+            if !cfg.follow_includes {
+                return out;
+            }
+        }
         let file_path = match uri_to_path(uri) {
             Some(p) => p,
             None => return out,
@@ -2233,10 +2244,7 @@ impl HaproxyLsp {
         for u in self.project_uris_for(uri) {
             if let Some(raws) = self.raw_references.get(&u) {
                 for r in raws {
-                    if r.name != name
-                        || std::mem::discriminant(&r.kind)
-                            != std::mem::discriminant(kind)
-                    {
+                    if r.name != name || r.kind != *kind {
                         continue;
                     }
                     if let Some(want) = scope {
@@ -2284,10 +2292,7 @@ impl HaproxyLsp {
         for u in self.project_uris_for(uri) {
             if let Some(syms) = self.symbols.get(&u) {
                 for s in syms {
-                    if s.name != name
-                        || std::mem::discriminant(&s.kind)
-                            != std::mem::discriminant(kind)
-                    {
+                    if s.name != name || s.kind != *kind {
                         continue;
                     }
                     if let Some(want) = scope {
@@ -2837,17 +2842,17 @@ impl HaproxyLsp {
     fn extract_backend_from_use_backend(&self, line: &str) -> Option<String> {
         // Parse "use_backend BACKEND_NAME [if condition]"
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() >= 2 && parts[0] == "use_backend" {
+        if parts.len() >= 2 && parts[0] == "use_backend" && is_valid_identifier(parts[1]) {
             Some(parts[1].to_string())
         } else {
             None
         }
     }
-    
+
     fn extract_backend_from_default_backend(&self, line: &str) -> Option<String> {
         // Parse "default_backend BACKEND_NAME"
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() >= 2 && parts[0] == "default_backend" {
+        if parts.len() >= 2 && parts[0] == "default_backend" && is_valid_identifier(parts[1]) {
             Some(parts[1].to_string())
         } else {
             None
@@ -3119,9 +3124,7 @@ impl HaproxyLsp {
     ) -> Option<Symbol> {
         if let Some(symbols) = self.symbols.get(uri) {
             for symbol in symbols {
-                if symbol.name != name
-                    || std::mem::discriminant(&symbol.kind) != std::mem::discriminant(&kind)
-                {
+                if symbol.name != name || symbol.kind != kind {
                     continue;
                 }
                 if let Some(want) = scope {
@@ -3144,10 +3147,7 @@ impl HaproxyLsp {
             }
             if let Some(symbols) = self.symbols.get(&u) {
                 for symbol in symbols {
-                    if symbol.name != name
-                        || std::mem::discriminant(&symbol.kind)
-                            != std::mem::discriminant(&kind)
-                    {
+                    if symbol.name != name || symbol.kind != kind {
                         continue;
                     }
                     if let Some(want) = scope {
@@ -4185,11 +4185,19 @@ impl HaproxyLsp {
                 // unbounded as files are opened and closed.
                 let params = &request["params"];
                 if let Some(uri) = params["textDocument"]["uri"].as_str() {
+                    // Capture the project root before we drop the config so we
+                    // can rebuild any project index that referenced the closed
+                    // URI and refresh diagnostics for its siblings.
+                    let closed_root = self
+                        .project_configs
+                        .get(uri)
+                        .map(|c| c.project_root.clone());
                     self.symbols.remove(uri);
                     self.folds.remove(uri);
                     self.outline.remove(uri);
                     self.documents.remove(uri);
                     self.diagnostics.remove(uri);
+                    self.raw_references.remove(uri);
                     self.project_configs.remove(uri);
                     self.included_files.remove(uri);
                     self.explicitly_opened.remove(uri);
@@ -4199,6 +4207,30 @@ impl HaproxyLsp {
                         "textDocument/publishDiagnostics",
                         json!({ "uri": uri_owned, "diagnostics": [] }),
                     );
+
+                    // Rebuild the project index so it no longer advertises
+                    // symbols/references from the closed URI, and republish
+                    // diagnostics for surviving project members (an unused-
+                    // backend warning may now fire because a cross-file
+                    // reference just disappeared).
+                    if let Some(root) = closed_root {
+                        let key = root.to_string_lossy().into_owned();
+                        let surviving: Vec<String> = self
+                            .project_configs
+                            .iter()
+                            .filter(|(_, c)| c.project_root == root)
+                            .map(|(u, _)| u.clone())
+                            .collect();
+                        if let Some(seed) = surviving.first().cloned() {
+                            self.rebuild_project_index_for(&seed);
+                            for sibling in &surviving {
+                                self.collect_diagnostics(sibling);
+                            }
+                        } else {
+                            // No members remain — drop the stale index entry.
+                            self.project_indices.remove(&key);
+                        }
+                    }
                 }
                 None
             }

@@ -4,7 +4,7 @@
 
 Deliver Tier 3 of the roadmap as v0.4.0: catch config errors statically before running `haproxy -c`, and make the extension usable for projects whose configs are split across multiple files. Ships three LSP capabilities together:
 
-- Diagnostics (`textDocument/publishDiagnostics`) — 7 rule types covering undefined/unused/duplicate references and missing `default_backend`.
+- Diagnostics (`textDocument/publishDiagnostics`) — 8 rule types covering undefined/unused/duplicate references and missing `default_backend`.
 - Cross-file resolution — follow `.if` / `.include` preprocessor directives plus `-f` / `crt` external file references; build a project-wide URI-keyed symbol index so `textDocument/definition`, `references`, `rename`, and diagnostics all work across files.
 - Workspace symbols (`workspace/symbol`) — `Cmd+T` project-wide fuzzy symbol search.
 

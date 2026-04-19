@@ -1,5 +1,7 @@
 # Project-level HAProxy LSP configuration for the fragments test fixture.
 # Picked up by walking upward from any opened `.cfg` file.
+# `extra_files` is parsed but not yet expanded into the include graph; the
+# pattern below exercises the round-trip through `$/haproxy/projectInfo`.
 project_root = "."
 follow_includes = true
 extra_files = ["extras/*.cfg"]
