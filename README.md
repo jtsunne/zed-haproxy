@@ -56,10 +56,12 @@ Zed requires a wasm *component*. Let Zed's builder handle it.
 ## Usage
 
 1. Open HAProxy configuration files (`.cfg`, `.conf`, `.haproxy`)
-2. Use **F12** or **"Go to Definition"** on:
-   - Backend names in `use_backend` statements
-   - Backend names in `default_backend` statements
-   - ACL names in conditional expressions
+2. Available actions on symbols (backends, frontends, listens, ACLs, servers, stick-tables):
+   - **F12** / Go to Definition — backend names in `use_backend`/`default_backend`, ACL names in `if`/`unless` conditions, stick-table names in `sc0_*(...)`/`stick match`/`stick on ... table`
+   - **Shift+F12** / Find All References — every call-site of the symbol under the cursor
+   - **F2** / Rename Symbol — backends, ACLs, servers, frontends, listens (stick-tables rename via their enclosing section)
+   - **Hover** — summaries for symbols and curated markdown docs for known directives
+   - **Completion** — context-aware suggestions after ` ` (space) or `(`, scoped by surrounding keyword
 
 ### Example
 
@@ -128,7 +130,8 @@ resulting plain wasm module won't load (Zed needs a wasm component).
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}' | ./bin/haproxy-lsp
 
 # Regression check — drives the LSP over stdio and asserts
-# definition/folding/documentSymbol responses against fixtures.
+# definition, declaration, folding, documentSymbol, references,
+# rename, hover, and completion responses against fixtures.
 python3 test/lsp_probes.py
 ```
 
@@ -138,7 +141,8 @@ python3 test/lsp_probes.py
 haproxy-zed/
 ├── src/
 │   ├── lib.rs           # Extension entry point
-│   └── lsp_server.rs    # LSP server implementation
+│   ├── lsp_server.rs    # LSP server implementation
+│   └── docs.rs          # Curated directive docs (used by hover + completion)
 ├── languages/haproxy/   # Language configuration
 ├── grammars/           # Tree-sitter grammar
 ├── extension.toml      # Extension metadata

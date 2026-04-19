@@ -773,26 +773,34 @@ impl HaproxyLsp {
         // (HAProxy binds one table per section, keyed by the section name).
         let mut current_section_name: Option<String> = None;
 
-        for (line_num, line) in content.lines().enumerate() {
-            let line = line.trim();
+        for (line_num, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim();
+
+            // Section headers live at column 0; reject indented lines so
+            // typos like `  backend foo` don't register a phantom symbol
+            // whose range highlights the wrong column when the client
+            // navigates to the definition.
+            let is_section_line = is_section_header(raw_line);
 
             // Update section tracker before per-directive parsing so that
             // `stick-table` on a subsequent line attributes to this section.
             let first_tok = line.split_whitespace().next().unwrap_or("");
-            match first_tok {
-                "backend" | "frontend" | "listen" | "peers" => {
-                    let tokens: Vec<&str> = line.split_whitespace().collect();
-                    current_section_name = tokens.get(1).map(|s| s.to_string());
+            if is_section_line {
+                match first_tok {
+                    "backend" | "frontend" | "listen" | "peers" => {
+                        let tokens: Vec<&str> = line.split_whitespace().collect();
+                        current_section_name = tokens.get(1).map(|s| s.to_string());
+                    }
+                    "global" | "defaults" | "resolvers" | "userlist"
+                    | "mailers" | "cache" | "program" | "ring" => {
+                        current_section_name = None;
+                    }
+                    _ => {}
                 }
-                "global" | "defaults" | "resolvers" | "userlist"
-                | "mailers" | "cache" | "program" | "ring" => {
-                    current_section_name = None;
-                }
-                _ => {}
             }
 
             // Parse backend definitions
-            if line.starts_with("backend ") {
+            if is_section_line && line.starts_with("backend ") {
                 // Grammar only permits a section_name token after the
                 // keyword; take the first whitespace-delimited token so
                 // inline trailing data (if any) doesn't contaminate the
@@ -812,7 +820,7 @@ impl HaproxyLsp {
                 }
             }
             // Parse frontend definitions
-            else if line.starts_with("frontend ") {
+            else if is_section_line && line.starts_with("frontend ") {
                 let name = line["frontend ".len()..].split_whitespace().next().unwrap_or("");
                 if !name.is_empty() {
                     symbols.push(Symbol {
@@ -828,7 +836,7 @@ impl HaproxyLsp {
                 }
             }
             // Parse listen definitions
-            else if line.starts_with("listen ") {
+            else if is_section_line && line.starts_with("listen ") {
                 // `listen` accepts an optional inline bind address per
                 // grammar (`listen stats 127.0.0.1:9000`), so the name is
                 // the first token only — not the full remainder.
@@ -904,7 +912,14 @@ impl HaproxyLsp {
         let mut updated_symbols = symbols;
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
-            
+
+            // Skip comment lines so commented-out sample config doesn't
+            // produce phantom references (which would inflate reference
+            // listings and skew completion frequency ranking).
+            if line.starts_with('#') {
+                continue;
+            }
+
             // Collect backend references
             if line.contains("use_backend") {
                 if let Some(backend_name) = self.extract_backend_from_use_backend(line) {
@@ -967,11 +982,7 @@ impl HaproxyLsp {
                 }
             }
 
-            // Collect stick-table references. Skip comment lines so commented
-            // sample config in fixtures doesn't leak spurious references.
-            if line.starts_with('#') {
-                continue;
-            }
+            // Collect stick-table references.
             let stick_refs = collect_stick_table_references(line);
             for table_name in stick_refs {
                 self.add_reference_to_symbol(
@@ -2537,6 +2548,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(n) if n > 0 && n <= MAX_CONTENT_LENGTH => n,
             Some(n) if n > MAX_CONTENT_LENGTH => {
                 eprintln!("Content-Length {} exceeds cap {}; dropping frame", n, MAX_CONTENT_LENGTH);
+                // Drain the oversized body so the next read doesn't
+                // consume mid-JSON bytes as header bytes and desync the
+                // stream. Errors here are fatal (stream is already lost).
+                io::copy(&mut (&mut stdin).take(n as u64), &mut io::sink())?;
                 continue;
             }
             _ => continue, // missing/zero/invalid length: resync on next header block
