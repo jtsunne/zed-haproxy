@@ -8,6 +8,19 @@ impl zed::Extension for HaproxyExtension {
         HaproxyExtension
     }
 
+    fn language_server_initialization_options(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        worktree: &Worktree,
+    ) -> zed::Result<Option<zed::serde_json::Value>> {
+        // Forward the worktree root to the LSP. The server caps its upward
+        // walk for `.zed/haproxy.toml` at this path so configuration
+        // discovery stays within the opened worktree.
+        Ok(Some(zed::serde_json::json!({
+            "workspace_root": worktree.root_path(),
+        })))
+    }
+
     fn language_server_command(
         &mut self,
         language_server_id: &LanguageServerId,

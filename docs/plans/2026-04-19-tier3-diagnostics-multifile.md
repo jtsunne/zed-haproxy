@@ -89,13 +89,13 @@ Regex parser stays; tree-sitter migration is Tier 4. Config is opt-in via `.zed/
 - Create: `test/fragments/backends.cfg`
 - Modify: `test/lsp_probes.py`
 
-- [ ] define `ProjectConfig { project_root: PathBuf, follow_includes: bool, extra_files: Vec<String> }`; default to `{ project_root: <dir of first opened file>, follow_includes: true, extra_files: [] }`
-- [ ] on `initialize`, read `initializationOptions.workspace_root` if provided
-- [ ] on `didOpen`, walk up from the file's directory looking for `.zed/haproxy.toml`; parse with a tiny hand-rolled TOML reader (only 3 keys — no crate dep)
-- [ ] add `src/lib.rs` change to pass `worktree.root_path()` as `initializationOptions.workspace_root` in `language_server_command`
-- [ ] create fragment fixture: `main.cfg` with `.include backends.cfg`, `backends.cfg` with a backend definition
-- [ ] add a probe loading the fragment fixture and asserting the discovered project root matches expectations (expose via a custom `$/haproxy/projectInfo` request for test introspection)
-- [ ] run `./build.sh && python3 test/lsp_probes.py`
+- [x] define `ProjectConfig { project_root: PathBuf, follow_includes: bool, extra_files: Vec<String> }`; default to `{ project_root: <dir of first opened file>, follow_includes: true, extra_files: [] }`
+- [x] on `initialize`, read `initializationOptions.workspace_root` if provided
+- [x] on `didOpen`, walk up from the file's directory looking for `.zed/haproxy.toml`; parse with a tiny hand-rolled TOML reader (only 3 keys — no crate dep)
+- [x] add `src/lib.rs` change to pass `worktree.root_path()` as `initializationOptions.workspace_root` in `language_server_command`
+- [x] create fragment fixture: `main.cfg` with `.include backends.cfg`, `backends.cfg` with a backend definition
+- [x] add a probe loading the fragment fixture and asserting the discovered project root matches expectations (expose via a custom `$/haproxy/projectInfo` request for test introspection)
+- [x] run `./build.sh && python3 test/lsp_probes.py`
 
 ### Task 5: Cross-file include graph + project index
 

@@ -1,8 +1,24 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 
 mod docs;
+
+// Project-level configuration discovered from `.zed/haproxy.toml` (or defaults
+// when no config file is found). One config is resolved per opened document
+// and cached by URI. Future tasks (cross-file index, workspace symbols) will
+// consult `follow_includes` / `extra_files` to decide which sibling files to
+// pull into the project index.
+#[derive(Debug, Clone)]
+struct ProjectConfig {
+    project_root: PathBuf,
+    follow_includes: bool,
+    extra_files: Vec<String>,
+    // Path to the `.zed/haproxy.toml` file that produced this config, if any.
+    // `None` means defaults were used (no config discovered).
+    config_file: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 struct Symbol {
@@ -113,12 +129,280 @@ struct HaproxyLsp {
     // loop drains after `handle_request` returns so framed writes to stdout
     // stay serialized with the single optional response per request frame.
     pending_notifications: Vec<Value>,
+    // Workspace root supplied via `initializationOptions.workspace_root`
+    // (passed through from Zed's `worktree.root_path()`). Used to cap the
+    // upward walk when discovering `.zed/haproxy.toml` so we don't stray
+    // outside the opened worktree.
+    workspace_root: Option<PathBuf>,
+    // Per-URI resolved project configuration. Populated on `didOpen` by
+    // `resolve_project_config`; reused by `$/haproxy/projectInfo` and by
+    // cross-file resolution in subsequent tasks.
+    project_configs: HashMap<String, ProjectConfig>,
 }
 
 const SECTION_KEYWORDS: &[&str] = &[
     "global", "defaults", "frontend", "backend", "listen", "resolvers",
     "userlist", "peers", "mailers", "cache", "program", "ring",
 ];
+
+// Convert a `file://` URI to a filesystem path. Handles the common `file:///`
+// triple-slash form on Unix. Percent-decodes a few characters that routinely
+// appear in fixture paths (space → `%20`); non-file URIs and malformed inputs
+// return `None`. A lightweight decoder is enough here — the LSP only ever
+// sees URIs it previously minted or that Zed produced from on-disk paths.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // On Unix `file:///foo/bar` → path `/foo/bar`; on Windows a drive letter
+    // would follow. We only target Unix (Zed runs on macOS/Linux).
+    let decoded = percent_decode(rest);
+    Some(PathBuf::from(decoded))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Hand-rolled TOML reader supporting exactly the three keys we accept:
+// `project_root = "…"`, `follow_includes = true|false`, `extra_files = [..]`.
+// Blank lines and `#` comments are ignored. Unrecognized keys are silently
+// skipped so users can drop `[section]` headers or future keys without the
+// parser failing — keeps the config file forward-compatible.
+#[derive(Debug, Default)]
+struct RawProjectConfig {
+    project_root: Option<String>,
+    follow_includes: Option<bool>,
+    extra_files: Option<Vec<String>>,
+}
+
+fn parse_project_toml(content: &str) -> RawProjectConfig {
+    let mut raw = RawProjectConfig::default();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+            continue;
+        }
+        let (key, value) = match trimmed.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue,
+        };
+        // Strip a trailing line comment (`= "value" # note`). We only split
+        // on `#` when it's not inside a quoted string.
+        let value = strip_toml_inline_comment(value);
+        match key {
+            "project_root" => {
+                if let Some(s) = parse_toml_string(value) {
+                    raw.project_root = Some(s);
+                }
+            }
+            "follow_includes" => match value {
+                "true" => raw.follow_includes = Some(true),
+                "false" => raw.follow_includes = Some(false),
+                _ => {}
+            },
+            "extra_files" => {
+                if let Some(arr) = parse_toml_string_array(value) {
+                    raw.extra_files = Some(arr);
+                }
+            }
+            _ => {}
+        }
+    }
+    raw
+}
+
+fn strip_toml_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'#' if !in_string => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    value[..end].trim()
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return None;
+    }
+    // Only handle the minimal set of escapes likely to appear in paths.
+    let inner = &value[1..value.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn parse_toml_string_array(value: &str) -> Option<Vec<String>> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut items: Vec<String> = Vec::new();
+    // Split on top-level commas (strings here are simple — no nested arrays).
+    let mut buf = String::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for c in inner.chars() {
+        if escape {
+            buf.push(c);
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => {
+                buf.push(c);
+                escape = true;
+            }
+            '"' => {
+                buf.push(c);
+                in_string = !in_string;
+            }
+            ',' if !in_string => {
+                let token = buf.trim().to_string();
+                if !token.is_empty() {
+                    if let Some(s) = parse_toml_string(&token) {
+                        items.push(s);
+                    }
+                }
+                buf.clear();
+            }
+            _ => buf.push(c),
+        }
+    }
+    let token = buf.trim().to_string();
+    if !token.is_empty() {
+        if let Some(s) = parse_toml_string(&token) {
+            items.push(s);
+        }
+    }
+    Some(items)
+}
+
+// Walk up from `start_dir` looking for `.zed/haproxy.toml`. Stops at the
+// workspace root (exclusive: we still check the workspace root itself) or at
+// the filesystem root. Returns the first config file found, or `None`.
+fn discover_project_config_file(
+    start_dir: &Path,
+    workspace_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start_dir);
+    while let Some(dir) = cur {
+        let candidate = dir.join(".zed").join("haproxy.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Stop once we've checked the workspace root. Do *not* ascend above
+        // it — a user may have opened a worktree deeper than $HOME.
+        if let Some(root) = workspace_root {
+            if dir == root {
+                return None;
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+// Build a `ProjectConfig` for the file at `file_path`. `project_root` in the
+// config file is resolved relative to the config file's parent directory; if
+// absent (or no config file at all), it defaults to the file's own directory.
+fn resolve_project_config_for_path(
+    file_path: &Path,
+    workspace_root: Option<&Path>,
+) -> ProjectConfig {
+    let file_dir = file_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config_file = discover_project_config_file(&file_dir, workspace_root);
+
+    let (project_root, follow_includes, extra_files) = if let Some(cfg_path) = &config_file {
+        match std::fs::read_to_string(cfg_path) {
+            Ok(content) => {
+                let raw = parse_project_toml(&content);
+                let cfg_dir = cfg_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| file_dir.clone());
+                let root = match raw.project_root {
+                    Some(s) => {
+                        let p = PathBuf::from(&s);
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            cfg_dir.join(p)
+                        }
+                    }
+                    None => cfg_dir,
+                };
+                (
+                    root,
+                    raw.follow_includes.unwrap_or(true),
+                    raw.extra_files.unwrap_or_default(),
+                )
+            }
+            Err(_) => (file_dir.clone(), true, Vec::new()),
+        }
+    } else {
+        (file_dir.clone(), true, Vec::new())
+    };
+
+    ProjectConfig {
+        project_root,
+        follow_includes,
+        extra_files,
+        config_file,
+    }
+}
 
 fn diagnostic_to_json(d: &Diagnostic) -> Value {
     json!({
@@ -1393,6 +1677,8 @@ impl HaproxyLsp {
             documents: HashMap::new(),
             diagnostics: HashMap::new(),
             pending_notifications: Vec::new(),
+            workspace_root: None,
+            project_configs: HashMap::new(),
         })
     }
 
@@ -2876,6 +3162,16 @@ impl HaproxyLsp {
 
         match method {
             "initialize" => {
+                // Capture workspace root from `initializationOptions.workspace_root`.
+                // Zed's extension glue (see `src/lib.rs`) forwards
+                // `worktree.root_path()` there so the LSP knows where to stop
+                // when walking up looking for `.zed/haproxy.toml`.
+                let opts = &request["params"]["initializationOptions"];
+                if let Some(root) = opts.get("workspace_root").and_then(|v| v.as_str()) {
+                    if !root.is_empty() {
+                        self.workspace_root = Some(PathBuf::from(root));
+                    }
+                }
                 Some(json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -2904,11 +3200,22 @@ impl HaproxyLsp {
                 let params = &request["params"];
                 let uri = params["textDocument"]["uri"].as_str()?;
                 let content = params["textDocument"]["text"].as_str()?;
-                
+
+                // Resolve and cache the project configuration for this file
+                // before parsing. Cross-file resolution (Task 5+) will read
+                // from this cache to decide which sibling files to pull in.
+                if let Some(file_path) = uri_to_path(uri) {
+                    let cfg = resolve_project_config_for_path(
+                        &file_path,
+                        self.workspace_root.as_deref(),
+                    );
+                    self.project_configs.insert(uri.to_string(), cfg);
+                }
+
                 if let Err(_) = self.parse_document(uri, content) {
                     eprintln!("Failed to parse document: {}", uri);
                 }
-                
+
                 None // No response needed for notifications
             }
             "textDocument/didClose" => {
@@ -2921,6 +3228,7 @@ impl HaproxyLsp {
                     self.outline.remove(uri);
                     self.documents.remove(uri);
                     self.diagnostics.remove(uri);
+                    self.project_configs.remove(uri);
                     // Clear any stale diagnostics the client may still show.
                     let uri_owned = uri.to_string();
                     self.send_notification(
@@ -3676,6 +3984,29 @@ impl HaproxyLsp {
                         "result": []
                     }))
                 }
+            }
+            "$/haproxy/projectInfo" => {
+                // Introspection request used by the test harness to verify
+                // project-config discovery. Returns the cached `ProjectConfig`
+                // for the given URI, or a `null` result if the file was never
+                // opened / has been closed.
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                let result = match self.project_configs.get(uri) {
+                    Some(cfg) => json!({
+                        "project_root": cfg.project_root.to_string_lossy(),
+                        "follow_includes": cfg.follow_includes,
+                        "extra_files": cfg.extra_files,
+                        "config_file": cfg.config_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        "workspace_root": self.workspace_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    }),
+                    None => Value::Null,
+                };
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
             }
             _ => {
                 // LSP requests (those with a non-null `id`) require a response;

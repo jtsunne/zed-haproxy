@@ -26,6 +26,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BINARY = REPO_ROOT / "bin" / "haproxy-lsp"
 HAPROXY_CONF = REPO_ROOT / "test" / "haproxy.conf"
 HAPROXY_CFG = REPO_ROOT / "test" / "haproxy.prod.cfg"
+FRAGMENTS_DIR = REPO_ROOT / "test" / "fragments"
+FRAGMENTS_MAIN = FRAGMENTS_DIR / "main.cfg"
+FRAGMENTS_BACKENDS = FRAGMENTS_DIR / "backends.cfg"
+FRAGMENTS_TOML = FRAGMENTS_DIR / ".zed" / "haproxy.toml"
 
 
 def path_to_uri(path: Path) -> str:
@@ -160,8 +164,11 @@ class LspClient:
             f"No publishDiagnostics v>={min_version} for {uri} within {timeout}s"
         )
 
-    def initialize(self):
-        return self.request("initialize", {"capabilities": {}})
+    def initialize(self, workspace_root: str | None = None):
+        params: dict = {"capabilities": {}}
+        if workspace_root is not None:
+            params["initializationOptions"] = {"workspace_root": workspace_root}
+        return self.request("initialize", params)
 
     def initialized(self):
         self.notify("initialized", {})
@@ -2154,6 +2161,112 @@ def run_declaration_probes(client: LspClient, results: Results):
         results.record("declaration", probe["desc"], ok, detail)
 
 
+def run_project_info_probes(client: LspClient, results: Results):
+    """Exercise `$/haproxy/projectInfo` against the `test/fragments/` fixture.
+
+    Opening `main.cfg` must resolve the project root through the fixture's
+    `.zed/haproxy.toml`; the cached config must then be readable via the
+    introspection request. These assertions cover Task 4's discovery path;
+    Task 5+ will layer on cross-file index assertions over the same fixture.
+    """
+    if not FRAGMENTS_MAIN.exists():
+        results.record("project-info", "fragments fixture present", False, f"missing: {FRAGMENTS_MAIN}")
+        return
+
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+    try:
+        resp = client.request(
+            "$/haproxy/projectInfo",
+            {"textDocument": {"uri": main_uri}},
+        )
+    except TimeoutError as exc:
+        results.record("project-info", "projectInfo request returns", False, str(exc))
+        return
+
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        results.record(
+            "project-info",
+            "projectInfo payload is an object",
+            False,
+            f"got {type(result).__name__}: {result!r}",
+        )
+        return
+
+    # Project root resolves relative to the config file's parent (the
+    # fragments dir), with `project_root = "."` in the TOML.
+    expected_root = str(FRAGMENTS_DIR.resolve())
+    actual_root = Path(result.get("project_root", "")).resolve()
+    ok = str(actual_root) == expected_root
+    results.record(
+        "project-info",
+        "fragments project_root resolves to fragments dir",
+        ok,
+        f"got {actual_root}" if ok else f"expected {expected_root}, got {actual_root}",
+    )
+
+    results.record(
+        "project-info",
+        "fragments follow_includes == true",
+        result.get("follow_includes") is True,
+        f"got {result.get('follow_includes')!r}",
+    )
+
+    extra = result.get("extra_files") or []
+    ok_extra = extra == ["extras/*.cfg"]
+    results.record(
+        "project-info",
+        "fragments extra_files parsed from TOML",
+        ok_extra,
+        f"got {extra!r}",
+    )
+
+    expected_cfg = str(FRAGMENTS_TOML.resolve())
+    actual_cfg = result.get("config_file")
+    ok_cfg = isinstance(actual_cfg, str) and str(Path(actual_cfg).resolve()) == expected_cfg
+    results.record(
+        "project-info",
+        "fragments config_file points to .zed/haproxy.toml",
+        ok_cfg,
+        f"got {actual_cfg!r}",
+    )
+
+    # When no config file is discoverable, the defaults must apply and
+    # `project_root` falls back to the opened file's directory.
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / "loose.cfg"
+        tmp_path.write_text("backend loose\n    server s1 127.0.0.1:80\n")
+        loose_uri = path_to_uri(tmp_path)
+        client.did_open(loose_uri, tmp_path.read_text())
+        try:
+            loose_resp = client.request(
+                "$/haproxy/projectInfo",
+                {"textDocument": {"uri": loose_uri}},
+            )
+        except TimeoutError as exc:
+            results.record("project-info", "defaults projectInfo returns", False, str(exc))
+            return
+        loose_result = loose_resp.get("result") or {}
+        default_root = Path(loose_result.get("project_root", "")).resolve()
+        ok_def = default_root == Path(tmp).resolve()
+        results.record(
+            "project-info",
+            "no config -> project_root defaults to file's directory",
+            ok_def,
+            f"got {default_root}" if ok_def else f"expected {Path(tmp).resolve()}, got {default_root}",
+        )
+        ok_def_cfg = loose_result.get("config_file") is None
+        results.record(
+            "project-info",
+            "no config -> config_file is null",
+            ok_def_cfg,
+            f"got {loose_result.get('config_file')!r}",
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -2172,7 +2285,7 @@ def main() -> int:
     results = Results()
     client = LspClient(binary)
     try:
-        client.initialize()
+        client.initialize(workspace_root=str(REPO_ROOT))
         client.initialized()
         run_definition_probes(client, results)
         run_definition_null_probes(client, results)
@@ -2184,6 +2297,7 @@ def main() -> int:
         run_hover_probes(client, results)
         run_completion_probes(client, results)
         run_diagnostics_probes(client, results)
+        run_project_info_probes(client, results)
     finally:
         client.shutdown()
 
