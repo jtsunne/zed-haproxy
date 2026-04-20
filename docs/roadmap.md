@@ -1,18 +1,21 @@
 # HAProxy Zed Extension — Roadmap
 
-Long-range plan for the extension's capabilities. Tier 1 (editor UX: semantic highlighting, folding, outline) shipped as v0.2.0. Tier 2 (editing intelligence: completion, hover, references, rename, stick-table symbol kind) shipped as v0.3.0 — see [`plans/2026-04-18-tier2-editing-intelligence.md`](plans/2026-04-18-tier2-editing-intelligence.md).
+Long-range plan for the extension's capabilities. Tier 1 (editor UX: semantic highlighting, folding, outline) shipped as v0.2.0. Tier 2 (editing intelligence: completion, hover, references, rename, stick-table symbol kind) shipped as v0.3.0 — see [`plans/completed/2026-04-18-tier2-editing-intelligence.md`](plans/completed/2026-04-18-tier2-editing-intelligence.md). Tier 3 (diagnostics + multi-file resolution + workspace symbols) shipped as v0.4.0 — see [`plans/completed/2026-04-19-tier3-diagnostics-multifile.md`](plans/completed/2026-04-19-tier3-diagnostics-multifile.md).
 
-## Current state (v0.3.x)
+## Current state (v0.4.x)
 
 - Semantic syntax highlighting (directives colored by category)
-- Go to Definition / Declaration, cursor-aware, across backend/frontend/listen/ACL/server/stick-table
+- Go to Definition / Declaration, cursor-aware, across backend/frontend/listen/ACL/server/stick-table; cross-file when a project root is discovered
 - Folding (sections, comment banners, BEGIN/END markers)
 - Document outline + breadcrumbs
-- Find References (`textDocument/references`) with `includeDeclaration` handling
-- Rename (`textDocument/rename` with `prepareProvider`) for backends, ACLs, servers, frontends, listens
+- Find References (`textDocument/references`) with `includeDeclaration` handling, cross-file
+- Rename (`textDocument/rename` with `prepareProvider`) for backends, ACLs, servers, frontends, listens; `WorkspaceEdit` spans every affected file
 - Hover (`textDocument/hover`) for backends, ACLs, stick-tables, servers, and ~50 curated directive docs
 - Completion (`textDocument/completion`) for backends, ACLs, servers, stick-tables, and per-section directive allowlists — ranked by in-file usage frequency
-- Single-file scope; regex-based parser in the LSP
+- Diagnostics (`textDocument/publishDiagnostics`): 8 rules covering undefined/unused/duplicate references and missing `default_backend` (Tier 3.1)
+- Cross-file resolution: follows `.include` / `.if`-`.endif` / `-f` / `crt` references; opt-in via `.zed/haproxy.toml`
+- Workspace symbols (`workspace/symbol`) for `Cmd+T` project-wide fuzzy search
+- Regex-based parser in the LSP
 
 ## Tier 1 — Editor UX (shipped as v0.2.0)
 
@@ -83,7 +86,7 @@ Extend `test/lsp_probes.py` with:
 
 ---
 
-## Tier 3 — Diagnostics & multi-file
+## Tier 3 — Diagnostics & multi-file (shipped as v0.4.0)
 
 **Goal:** catch typos and dead code before the user runs `haproxy -c`, and make the extension useful for projects with fragmented configs. This is where the extension becomes opinionated — it starts telling the user things are wrong.
 

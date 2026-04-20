@@ -1,8 +1,30 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 
 mod docs;
+
+// Project-level configuration discovered from `.zed/haproxy.toml` (or defaults
+// when no config file is found). One config is resolved per opened document
+// and cached by URI. `follow_includes` gates the include-graph walk in
+// `extract_include_uris`; `extra_files` is reserved for a future glob-expansion
+// pass that will seed additional sibling files into the project index.
+#[derive(Debug, Clone)]
+struct ProjectConfig {
+    project_root: PathBuf,
+    follow_includes: bool,
+    // Glob patterns/paths relative to `project_root` that should be pulled
+    // into the include graph even when no `.include` directive reaches
+    // them. Expanded by `expand_glob` (supports `*`, `?`, `**`) at the tail
+    // of `extract_include_uris`; resolved files are added to the include
+    // graph with `entry_scope = None` since they're project-wide peers
+    // rather than section-body fragments.
+    extra_files: Vec<String>,
+    // Path to the `.zed/haproxy.toml` file that produced this config, if any.
+    // `None` means defaults were used (no config discovered).
+    config_file: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 struct Symbol {
@@ -31,6 +53,22 @@ struct Reference {
     scope: Option<String>,
 }
 
+// Project-wide raw reference record. Every reference observed during
+// `parse_single_file` is recorded here regardless of whether the referenced
+// symbol is defined in the same file. The cross-file handlers (definition,
+// references, rename, undefined-reference diagnostics) aggregate from this
+// cache across every URI in the project graph so a reference in file B
+// to a backend defined in file A is resolvable in both directions.
+#[derive(Debug, Clone)]
+struct RawReference {
+    name: String,
+    kind: SymbolKind,
+    range: Range,
+    uri: String,
+    context: ReferenceContext,
+    scope: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReferenceContext {
     UseBackend,
@@ -41,7 +79,7 @@ enum ReferenceContext {
     StickTable,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SymbolKind {
     Backend,
     Frontend,
@@ -49,6 +87,35 @@ enum SymbolKind {
     Acl,
     Server,
     StickTable,
+}
+
+// Serialize `SymbolKind` as a stable string for introspection endpoints.
+// Numeric `DocumentSymbol.kind` values are LSP-defined and reused elsewhere;
+// the project index speaks its own schema and benefits from legible names.
+fn symbol_kind_name(kind: &SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Backend => "Backend",
+        SymbolKind::Frontend => "Frontend",
+        SymbolKind::Listen => "Listen",
+        SymbolKind::Acl => "Acl",
+        SymbolKind::Server => "Server",
+        SymbolKind::StickTable => "StickTable",
+    }
+}
+
+// Map internal `SymbolKind` to the LSP-defined numeric `SymbolKind` used in
+// `SymbolInformation`/`WorkspaceSymbol` and `DocumentSymbol` payloads. Kept in
+// sync with the choices made in the per-section `documentSymbol` outliner
+// (`section_kind_for` + child push sites): Backend/Listen = Class,
+// Frontend = Interface, Acl = Property, Server = Field, StickTable = Struct.
+fn lsp_symbol_kind(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Backend | SymbolKind::Listen => 5,
+        SymbolKind::Frontend => 11,
+        SymbolKind::Acl => 7,
+        SymbolKind::Server => 8,
+        SymbolKind::StickTable => 23,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +135,17 @@ struct FoldingRange {
     start_line: u32,
     end_line: u32,
     kind: &'static str,
+}
+
+// LSP DiagnosticSeverity: 1=Error, 2=Warning, 3=Information, 4=Hint.
+// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#diagnostic
+#[derive(Debug, Clone)]
+struct Diagnostic {
+    range: Range,
+    severity: u8,
+    code: &'static str,
+    source: &'static str,
+    message: String,
 }
 
 // LSP numeric SymbolKind values. Kept as u8 for compactness; serialized as u32.
@@ -94,12 +172,560 @@ struct HaproxyLsp {
     folds: HashMap<String, Vec<FoldingRange>>,
     outline: HashMap<String, Vec<DocumentSymbol>>,
     documents: HashMap<String, String>,
+    // Per-URI diagnostics cache. Rebuilt at the tail of `parse_document` and
+    // published via a `textDocument/publishDiagnostics` notification; an
+    // empty Vec is still published so stale diagnostics clear on the client.
+    diagnostics: HashMap<String, Vec<Diagnostic>>,
+    // Pending outbound notifications. `send_notification` pushes; the main
+    // loop drains after `handle_request` returns so framed writes to stdout
+    // stay serialized with the single optional response per request frame.
+    pending_notifications: Vec<Value>,
+    // Workspace root supplied via `initializationOptions.workspace_root`
+    // (passed through from Zed's `worktree.root_path()`). Used to cap the
+    // upward walk when discovering `.zed/haproxy.toml` so we don't stray
+    // outside the opened worktree.
+    workspace_root: Option<PathBuf>,
+    // Per-URI resolved project configuration. Populated on `didOpen` by
+    // `resolve_project_config`; reused by `$/haproxy/projectInfo` and by
+    // cross-file resolution in subsequent tasks.
+    project_configs: HashMap<String, ProjectConfig>,
+    // Per-URI resolved include graph neighbours (file URIs). Populated during
+    // `parse_document` from `.include`, `-f`, and `crt` directives. Used to
+    // reach sibling files during the recursive graph walk and to aggregate
+    // the per-project symbol index.
+    included_files: HashMap<String, Vec<String>>,
+    // URIs the client has explicitly opened via `textDocument/didOpen`. Kept
+    // as a separate set from `self.documents` because the graph walk also
+    // caches sibling documents; when re-parsing the graph we want to trust
+    // only client-owned buffers for unsaved edits and re-read siblings from
+    // disk so edits made out-of-band (e.g. another editor) are picked up.
+    explicitly_opened: HashSet<String>,
+    // Per-project-root symbol index, keyed by the project-root path string.
+    // Populated at the tail of every top-level `parse_document` call after
+    // the include graph has been walked; consulted by the cross-file
+    // resolution handlers in later tasks (Task 6+) and by the
+    // `$/haproxy/projectIndex` introspection request.
+    project_indices: HashMap<String, ProjectIndex>,
+    // Per-URI raw reference records, populated during `parse_single_file`.
+    // Unlike `Symbol.references` (which only collects references whose
+    // target is defined in the same file), this list holds EVERY reference
+    // observed on the URI — including ones pointing at symbols defined in
+    // sibling include-graph files. Cross-file definition / references /
+    // rename / undefined-reference diagnostics walk this cache across every
+    // URI in the project graph.
+    raw_references: HashMap<String, Vec<RawReference>>,
+    // Per-URI enclosing-section scope active at the point of the parent
+    // `.include` / `-f` / `crt` directive that reached this file. Recorded
+    // by `parse_graph_node`; `None` for top-level documents and for files
+    // reached as project-wide peers via `extra_files`. Used by cross-file
+    // duplicate-acl detection to attribute ACL definitions in a header-less
+    // fragment to the parent section that transcludes it.
+    entry_scopes: HashMap<String, Option<String>>,
+}
+
+// Aggregate symbol index for all files reachable from a single project root
+// via `.include` / `-f` / `crt` resolution. Keyed per (SymbolKind, name) so
+// cross-file definition / references / rename lookups can enumerate every
+// occurrence without re-scanning per-URI maps.
+#[derive(Debug, Clone, Default)]
+struct ProjectIndex {
+    project_root: PathBuf,
+    uris: Vec<String>,
+    symbols_by_name: HashMap<(SymbolKind, String), Vec<ProjectSymbolRef>>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectSymbolRef {
+    uri: String,
+    range: Range,
+    scope: Option<String>,
 }
 
 const SECTION_KEYWORDS: &[&str] = &[
     "global", "defaults", "frontend", "backend", "listen", "resolvers",
     "userlist", "peers", "mailers", "cache", "program", "ring",
 ];
+
+// Convert a `file://` URI to a filesystem path. Handles the common `file:///`
+// triple-slash form on Unix. Percent-decodes a few characters that routinely
+// appear in fixture paths (space → `%20`); non-file URIs and malformed inputs
+// return `None`. A lightweight decoder is enough here — the LSP only ever
+// sees URIs it previously minted or that Zed produced from on-disk paths.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // On Unix `file:///foo/bar` → path `/foo/bar`; on Windows a drive letter
+    // would follow. We only target Unix (Zed runs on macOS/Linux).
+    let decoded = percent_decode(rest);
+    Some(PathBuf::from(decoded))
+}
+
+// Convert a filesystem path to a `file://` URI. Mirrors `uri_to_path` — the
+// canonicalized absolute path becomes the URI body with spaces percent-encoded
+// so the round-trip through `uri_to_path` stays lossless on the (rare) path
+// that contains them. Non-canonicalizable paths (does-not-exist, permission)
+// yield `None` so callers can skip them from the include graph.
+fn path_to_file_uri(p: &Path) -> Option<String> {
+    let canon = p.canonicalize().ok()?;
+    let s = canon.to_string_lossy();
+    let encoded = s.replace(' ', "%20");
+    Some(format!("file://{}", encoded))
+}
+
+// Strip a surrounding pair of `"` or `'` from an include path token if
+// present; otherwise return the slice unchanged. `.include "foo bar.cfg"`
+// is not exercised by our fixtures but appears in real configs, so the
+// defensive strip keeps us from treating the leading quote as part of the
+// filename and then failing to resolve it on disk.
+fn unquote_path_token(tok: &str) -> &str {
+    let bytes = tok.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &tok[1..tok.len() - 1]
+    } else {
+        tok
+    }
+}
+
+// Resolve an include-directive path token against the including file's
+// directory first, then the project root. Absolute paths must exist on
+// disk to be returned. Returns the resolved path as-is (not canonicalized
+// — that happens in `path_to_file_uri` to keep the include graph keyed on
+// canonical URIs).
+fn resolve_include_path(
+    path_tok: &str,
+    file_dir: &Path,
+    project_root: &Path,
+) -> Option<PathBuf> {
+    if path_tok.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(path_tok);
+    if p.is_absolute() {
+        if p.exists() {
+            return Some(p);
+        }
+        return None;
+    }
+    let candidate = file_dir.join(&p);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    let candidate = project_root.join(&p);
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    None
+}
+
+// Expand a glob `pattern` against `base`, returning every matching file path.
+// Supports `*` (any run of non-`/` chars), `?` (any single non-`/` char), and
+// `**` as a standalone path component (zero or more directory levels).
+// Character classes `[...]` are treated as literal bytes — callers who need
+// precise character-class semantics should fall back to literal paths for now.
+// Absolute patterns resolve from `/`; relative patterns resolve from `base`.
+//
+// The walk skips symlinks to guard against cycles, so a pathological
+// `extra_files = ["**/*.cfg"]` against a directory containing a self-
+// referential symlink can't trap the server in an infinite traversal.
+fn expand_glob(pattern: &str, base: &Path) -> Vec<PathBuf> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    let is_absolute = pattern.starts_with('/');
+    let components: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    let mut current: Vec<PathBuf> = if is_absolute {
+        vec![PathBuf::from("/")]
+    } else {
+        vec![base.to_path_buf()]
+    };
+
+    for (idx, comp) in components.iter().enumerate() {
+        let is_last = idx == components.len() - 1;
+        let mut next: Vec<PathBuf> = Vec::new();
+        for path in &current {
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() || !path.is_dir() {
+                continue;
+            }
+
+            if *comp == "**" {
+                // Recursive match: self plus every descendant directory, all
+                // eligible to satisfy either this component or subsequent
+                // ones. Iterative DFS with symlink skipping.
+                let mut stack = vec![path.clone()];
+                while let Some(p) = stack.pop() {
+                    next.push(p.clone());
+                    if let Ok(rd) = std::fs::read_dir(&p) {
+                        for entry in rd.flatten() {
+                            let ep = entry.path();
+                            if let Ok(ft) = entry.file_type() {
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                if ft.is_dir() {
+                                    stack.push(ep);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if component_has_glob(comp) {
+                if let Ok(rd) = std::fs::read_dir(path) {
+                    for entry in rd.flatten() {
+                        let ep = entry.path();
+                        let name = match ep.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n.to_string(),
+                            None => continue,
+                        };
+                        if !simple_glob_match(comp, &name) {
+                            continue;
+                        }
+                        let ft = match entry.file_type() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        if ft.is_symlink() {
+                            continue;
+                        }
+                        if is_last {
+                            if ft.is_file() {
+                                next.push(ep);
+                            }
+                        } else if ft.is_dir() {
+                            next.push(ep);
+                        }
+                    }
+                }
+            } else {
+                let joined = path.join(comp);
+                let meta = match std::fs::symlink_metadata(&joined) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if is_last {
+                    if meta.is_file() {
+                        next.push(joined);
+                    }
+                } else if meta.is_dir() {
+                    next.push(joined);
+                }
+            }
+        }
+        current = next;
+        if current.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    current
+}
+
+fn component_has_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?')
+}
+
+// Minimal glob matcher for a single path component. Supports `*` (zero or
+// more non-`/` chars) and `?` (exactly one non-`/` char). Everything else —
+// including `[...]` — matches literally. Backtracking implementation; the
+// typical extra_files pattern has at most one `*`, so worst-case work stays
+// bounded.
+fn simple_glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let mut pi = 0usize;
+    let mut ni = 0usize;
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((spi, sni)) = star {
+            pi = spi + 1;
+            ni = sni + 1;
+            star = Some((spi, ni));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Hand-rolled TOML reader supporting exactly the three keys we accept:
+// `project_root = "…"`, `follow_includes = true|false`, `extra_files = [..]`.
+// Blank lines and `#` comments are ignored. Unrecognized keys are silently
+// skipped so users can drop `[section]` headers or future keys without the
+// parser failing — keeps the config file forward-compatible.
+#[derive(Debug, Default)]
+struct RawProjectConfig {
+    project_root: Option<String>,
+    follow_includes: Option<bool>,
+    extra_files: Option<Vec<String>>,
+}
+
+fn parse_project_toml(content: &str) -> RawProjectConfig {
+    let mut raw = RawProjectConfig::default();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+            continue;
+        }
+        let (key, value) = match trimmed.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => continue,
+        };
+        // Strip a trailing line comment (`= "value" # note`). We only split
+        // on `#` when it's not inside a quoted string.
+        let value = strip_toml_inline_comment(value);
+        match key {
+            "project_root" => {
+                if let Some(s) = parse_toml_string(value) {
+                    raw.project_root = Some(s);
+                }
+            }
+            "follow_includes" => match value {
+                "true" => raw.follow_includes = Some(true),
+                "false" => raw.follow_includes = Some(false),
+                _ => {}
+            },
+            "extra_files" => {
+                if let Some(arr) = parse_toml_string_array(value) {
+                    raw.extra_files = Some(arr);
+                }
+            }
+            _ => {}
+        }
+    }
+    raw
+}
+
+fn strip_toml_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match b {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'#' if !in_string => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    value[..end].trim()
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return None;
+    }
+    // Only handle the minimal set of escapes likely to appear in paths.
+    let inner = &value[1..value.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
+fn parse_toml_string_array(value: &str) -> Option<Vec<String>> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut items: Vec<String> = Vec::new();
+    // Split on top-level commas (strings here are simple — no nested arrays).
+    let mut buf = String::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for c in inner.chars() {
+        if escape {
+            buf.push(c);
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => {
+                buf.push(c);
+                escape = true;
+            }
+            '"' => {
+                buf.push(c);
+                in_string = !in_string;
+            }
+            ',' if !in_string => {
+                let token = buf.trim().to_string();
+                if !token.is_empty() {
+                    if let Some(s) = parse_toml_string(&token) {
+                        items.push(s);
+                    }
+                }
+                buf.clear();
+            }
+            _ => buf.push(c),
+        }
+    }
+    let token = buf.trim().to_string();
+    if !token.is_empty() {
+        if let Some(s) = parse_toml_string(&token) {
+            items.push(s);
+        }
+    }
+    Some(items)
+}
+
+// Walk up from `start_dir` looking for `.zed/haproxy.toml`. Stops at the
+// workspace root (exclusive: we still check the workspace root itself) or at
+// the filesystem root. Returns the first config file found, or `None`.
+fn discover_project_config_file(
+    start_dir: &Path,
+    workspace_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let mut cur: Option<&Path> = Some(start_dir);
+    while let Some(dir) = cur {
+        let candidate = dir.join(".zed").join("haproxy.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Stop once we've checked the workspace root. Do *not* ascend above
+        // it — a user may have opened a worktree deeper than $HOME.
+        if let Some(root) = workspace_root {
+            if dir == root {
+                return None;
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+// Build a `ProjectConfig` for the file at `file_path`. `project_root` in the
+// config file is resolved relative to the config file's parent directory; if
+// absent (or no config file at all), it defaults to the file's own directory.
+fn resolve_project_config_for_path(
+    file_path: &Path,
+    workspace_root: Option<&Path>,
+) -> ProjectConfig {
+    let file_dir = file_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config_file = discover_project_config_file(&file_dir, workspace_root);
+
+    let (project_root, follow_includes, extra_files) = if let Some(cfg_path) = &config_file {
+        match std::fs::read_to_string(cfg_path) {
+            Ok(content) => {
+                let raw = parse_project_toml(&content);
+                let cfg_dir = cfg_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| file_dir.clone());
+                let root = match raw.project_root {
+                    Some(s) => {
+                        let p = PathBuf::from(&s);
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            cfg_dir.join(p)
+                        }
+                    }
+                    None => cfg_dir,
+                };
+                (
+                    root,
+                    raw.follow_includes.unwrap_or(true),
+                    raw.extra_files.unwrap_or_default(),
+                )
+            }
+            Err(_) => (file_dir.clone(), true, Vec::new()),
+        }
+    } else {
+        (file_dir.clone(), true, Vec::new())
+    };
+
+    ProjectConfig {
+        project_root,
+        follow_includes,
+        extra_files,
+        config_file,
+    }
+}
+
+fn diagnostic_to_json(d: &Diagnostic) -> Value {
+    json!({
+        "range": {
+            "start": { "line": d.range.start.line, "character": d.range.start.character },
+            "end": { "line": d.range.end.line, "character": d.range.end.character },
+        },
+        "severity": d.severity,
+        "code": d.code,
+        "source": d.source,
+        "message": d.message,
+    })
+}
 
 fn is_section_header(line: &str) -> bool {
     // Section headers live at column 0; any leading whitespace disqualifies.
@@ -368,6 +994,681 @@ fn def_line_search_from(line: &str, kind: &SymbolKind) -> Option<usize> {
 /// line currently anchors at column 0 (ACL chains, etc.).
 fn ref_context_has_precise_position(ctx: &ReferenceContext) -> bool {
     matches!(ctx, ReferenceContext::StickTable)
+}
+
+/// HAProxy built-in anonymous ACL keywords. These are not user-defined ACLs
+/// and therefore must not trigger `undefined-acl` diagnostics when referenced
+/// in an `if` / `unless` condition. List mirrors the HAProxy docs "ACL anchors
+/// and terminators" table plus the handful of anonymous predefined ACLs
+/// (`TRUE`, `FALSE`) widely used in production configs.
+const BUILTIN_ACL_NAMES: &[&str] = &[
+    "FALSE",
+    "TRUE",
+    "HTTP",
+    "HTTP_1.0",
+    "HTTP_1.1",
+    "HTTP_CONTENT",
+    "HTTP_URL_ABSOLUTE",
+    "HTTP_URL_SLASH",
+    "HTTP_URL_STAR",
+    "LOCALHOST",
+    "METH_CONNECT",
+    "METH_DELETE",
+    "METH_GET",
+    "METH_HEAD",
+    "METH_OPTIONS",
+    "METH_POST",
+    "METH_PUT",
+    "METH_TRACE",
+    "RDP_COOKIE",
+    "REQ_CONTENT",
+    "WAIT_END",
+];
+
+/// For a directive line whose first non-whitespace token is `keyword`, locate
+/// the immediate argument token and return `(name, start_col, end_col)` in
+/// byte offsets (which equal LSP character offsets for ASCII identifiers).
+/// Returns `None` when the keyword is absent, not at line start, or when the
+/// argument is missing / not a valid HAProxy identifier.
+fn find_leading_directive_arg(line: &str, keyword: &str) -> Option<(String, u32, u32)> {
+    let trimmed_start = line.len() - line.trim_start().len();
+    let after_ws = &line[trimmed_start..];
+    let rest = after_ws.strip_prefix(keyword)?;
+    if !rest.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let mut i = trimmed_start + keyword.len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if start == i {
+        return None;
+    }
+    let name = &line[start..i];
+    if !is_valid_identifier(name) {
+        return None;
+    }
+    Some((name.to_string(), start as u32, i as u32))
+}
+
+/// Scan `content` for references to symbols that aren't defined in
+/// `symbols`. Emits three diagnostic rules (severity `Error`):
+///
+///   - `undefined-backend` on `use_backend NAME [...]` and `default_backend
+///     NAME` where `NAME` is not a `Backend` symbol.
+///   - `undefined-acl` on `... if NAME` / `... unless NAME` where `NAME` is
+///     neither an ACL definition in this file nor a HAProxy built-in
+///     (`TRUE`, `FALSE`, `METH_GET`, ...).
+///   - `undefined-server` on `use_server NAME [...]` where `NAME` is not a
+///     `Server` symbol inside the enclosing backend/listen section. Server
+///     identity is section-scoped, so a `server` of the same name in an
+///     unrelated section does not silence the diagnostic.
+///
+/// Scope is tracked by walking section headers with `is_section_header`;
+/// comments and the section header line itself are skipped so a
+/// `# use_backend foo` sample config line doesn't trip rule #1.
+fn undefined_reference_diagnostics(
+    content: &str,
+    symbols: &[Symbol],
+    extra_backends: &HashSet<String>,
+    extra_servers_by_scope: &HashMap<String, HashSet<String>>,
+    extra_acls: &HashSet<String>,
+) -> Vec<Diagnostic> {
+    use std::collections::HashSet;
+
+    let mut backend_names: HashSet<String> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Backend)
+        .map(|s| s.name.clone())
+        .collect();
+    backend_names.extend(extra_backends.iter().cloned());
+    // Merge local ACL definitions with any ACLs defined in sibling include
+    // files so a reference in this file to an ACL defined across the
+    // include boundary is not flagged as `undefined-acl`.
+    let mut acl_names: HashSet<String> = symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Acl)
+        .map(|s| s.name.clone())
+        .collect();
+    acl_names.extend(extra_acls.iter().cloned());
+    let builtin_acls: HashSet<&str> = BUILTIN_ACL_NAMES.iter().copied().collect();
+    let mut servers_by_scope: HashMap<String, HashSet<String>> = HashMap::new();
+    for s in symbols {
+        if s.kind == SymbolKind::Server {
+            if let Some(scope) = &s.scope {
+                servers_by_scope
+                    .entry(scope.clone())
+                    .or_default()
+                    .insert(s.name.clone());
+            }
+        }
+    }
+    for (scope, names) in extra_servers_by_scope {
+        servers_by_scope
+            .entry(scope.clone())
+            .or_default()
+            .extend(names.iter().cloned());
+    }
+
+    let mut diags = Vec::new();
+    let mut current_section: Option<String> = None;
+    for (line_num, raw_line) in content.lines().enumerate() {
+        let is_section = is_section_header(raw_line);
+        let trimmed = raw_line.trim();
+        let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+        if is_section {
+            match first_tok {
+                "backend" | "frontend" | "listen" | "peers" => {
+                    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                    current_section = tokens.get(1).map(|s| s.to_string());
+                }
+                "global" | "defaults" | "resolvers" | "userlist" | "mailers"
+                | "cache" | "program" | "ring" => {
+                    current_section = None;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        // Undefined backend: `use_backend NAME` and `default_backend NAME`.
+        for keyword in &["use_backend", "default_backend"] {
+            if let Some((name, start, end)) = find_leading_directive_arg(raw_line, keyword) {
+                if !backend_names.contains(name.as_str()) {
+                    diags.push(Diagnostic {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: start },
+                            end: Position { line: line_num as u32, character: end },
+                        },
+                        severity: 1,
+                        code: "undefined-backend",
+                        source: "haproxy-lsp",
+                        message: format!("Undefined backend: {}", name),
+                    });
+                }
+            }
+        }
+
+        // Undefined server: `use_server NAME` inside a backend/listen section.
+        if let Some((name, start, end)) = find_leading_directive_arg(raw_line, "use_server") {
+            let known = current_section
+                .as_ref()
+                .and_then(|s| servers_by_scope.get(s))
+                .map(|set| set.contains(name.as_str()))
+                .unwrap_or(false);
+            if !known {
+                diags.push(Diagnostic {
+                    range: Range {
+                        start: Position { line: line_num as u32, character: start },
+                        end: Position { line: line_num as u32, character: end },
+                    },
+                    severity: 1,
+                    code: "undefined-server",
+                    source: "haproxy-lsp",
+                    message: format!("Undefined server: {}", name),
+                });
+            }
+        }
+
+        // Undefined ACL: tokens in ` if ` / ` unless ` conditions that are
+        // neither user-defined ACLs in this file nor HAProxy built-ins.
+        for keyword in &["if", "unless"] {
+            for (name, start, end) in collect_acl_ref_positions(raw_line, keyword) {
+                if acl_names.contains(&name)
+                    || builtin_acls.contains(name.as_str())
+                {
+                    continue;
+                }
+                diags.push(Diagnostic {
+                    range: Range {
+                        start: Position { line: line_num as u32, character: start },
+                        end: Position { line: line_num as u32, character: end },
+                    },
+                    severity: 1,
+                    code: "undefined-acl",
+                    source: "haproxy-lsp",
+                    message: format!("Undefined ACL: {}", name),
+                });
+            }
+        }
+    }
+
+    diags
+}
+
+/// Section header metadata used by structural diagnostic passes.
+///
+/// `name_start` / `name_end` are byte offsets on `header_line` (which equal
+/// LSP character offsets — HAProxy identifiers are ASCII per the grammar).
+/// `body_end_line` is inclusive and clamped to the line index immediately
+/// before the next section header (or the last line of the file for the
+/// trailing section). `name` is empty for section kinds that take no name
+/// token (`global`, `defaults`).
+struct SectionHeaderInfo {
+    keyword: String,
+    name: String,
+    name_start: u32,
+    name_end: u32,
+    header_line: u32,
+    body_end_line: u32,
+}
+
+fn collect_section_headers(content: &str) -> Vec<SectionHeaderInfo> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut hdrs: Vec<SectionHeaderInfo> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !is_section_header(line) {
+            continue;
+        }
+        let keyword = match line.split_whitespace().next() {
+            Some(k) => k.to_string(),
+            None => continue,
+        };
+        let (name, name_start, name_end) = match find_leading_directive_arg(line, &keyword) {
+            Some((n, s, e)) => (n, s, e),
+            None => (String::new(), 0u32, 0u32),
+        };
+        hdrs.push(SectionHeaderInfo {
+            keyword,
+            name,
+            name_start,
+            name_end,
+            header_line: i as u32,
+            body_end_line: 0,
+        });
+    }
+    for i in 0..hdrs.len() {
+        let next = if i + 1 < hdrs.len() {
+            hdrs[i + 1].header_line.saturating_sub(1)
+        } else if line_count > 0 {
+            (line_count - 1) as u32
+        } else {
+            hdrs[i].header_line
+        };
+        hdrs[i].body_end_line = next;
+    }
+    hdrs
+}
+
+/// Emit a `duplicate-section` error (severity `Error`) on every occurrence of
+/// a `backend` / `frontend` / `listen` section whose (keyword, name) already
+/// appears somewhere in the project under a lower (uri, line) tuple — the
+/// "canonical first" per pair. Cross-kind collisions (e.g. `backend foo` +
+/// `frontend foo`) are not flagged; HAProxy permits distinct namespaces per
+/// keyword in practice.
+///
+/// `canonical_first` carries the winning (uri, header_line) for every
+/// (keyword, name) pair present in the project. The canonical ordering is a
+/// stable tuple sort over (uri, line), which guarantees exactly one survivor
+/// per pair regardless of traversal order. Same-file duplicates still flag
+/// correctly because every second-and-later header in the same URI compares
+/// unequal to the canonical (uri, first_line).
+fn duplicate_section_diagnostics(
+    uri: &str,
+    headers: &[SectionHeaderInfo],
+    canonical_first: &HashMap<(String, String), (String, u32)>,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "backend" | "frontend" | "listen") {
+            continue;
+        }
+        if h.name.is_empty() {
+            continue;
+        }
+        let key = (h.keyword.clone(), h.name.clone());
+        let (canon_uri, canon_line) = match canonical_first.get(&key) {
+            Some(c) => c,
+            None => continue,
+        };
+        if canon_uri.as_str() == uri && *canon_line == h.header_line {
+            continue;
+        }
+        diags.push(Diagnostic {
+            range: Range {
+                start: Position { line: h.header_line, character: h.name_start },
+                end: Position { line: h.header_line, character: h.name_end },
+            },
+            severity: 1,
+            code: "duplicate-section",
+            source: "haproxy-lsp",
+            message: format!("Duplicate {} section: {}", h.keyword, h.name),
+        });
+    }
+    diags
+}
+
+/// Location of a single `acl NAME ...` definition within a file. Used by the
+/// project-aware duplicate-acl rule to group defs by (section, name) across
+/// files that share an effective section via `.include` transclusion.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct AclDefLocation {
+    uri: String,
+    line: u32,
+    start: u32,
+    end: u32,
+}
+
+/// Walk `content` and emit one entry per `acl NAME ...` definition tagged
+/// with the section name active at that line. Section tracking is seeded
+/// with `entry_scope` so ACLs defined in a header-less fragment (one pulled
+/// into a parent section via `.include`) attribute to the parent section.
+///
+/// Returned tuple: (effective_section_name, acl_name, location).
+/// `effective_section_name` is `None` only when the ACL appears outside any
+/// named section AND no `entry_scope` was supplied — syntactically invalid
+/// HAProxy, but we still emit so duplicate detection across syntactically
+/// dubious top-level fragments still catches obvious copy-paste collisions.
+fn collect_acl_defs_with_scope(
+    uri: &str,
+    content: &str,
+    entry_scope: Option<&str>,
+) -> Vec<(Option<String>, String, AclDefLocation)> {
+    let mut out = Vec::new();
+    let mut current_section: Option<String> = entry_scope.map(|s| s.to_string());
+    for (ln_idx, raw_line) in content.lines().enumerate() {
+        let is_section = is_section_header(raw_line);
+        let trimmed = raw_line.trim();
+        let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+        if is_section {
+            match first_tok {
+                "backend" | "frontend" | "listen" | "peers" => {
+                    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                    current_section = tokens.get(1).map(|s| s.to_string());
+                }
+                "global" | "defaults" | "resolvers" | "userlist"
+                | "mailers" | "cache" | "program" | "ring" => {
+                    current_section = None;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.starts_with("acl ") && trimmed != "acl" {
+            continue;
+        }
+        if let Some((name, start, end)) = find_leading_directive_arg(raw_line, "acl") {
+            out.push((
+                current_section.clone(),
+                name,
+                AclDefLocation {
+                    uri: uri.to_string(),
+                    line: ln_idx as u32,
+                    start,
+                    end,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Emit a `duplicate-acl` error on every second-and-later `acl NAME ...`
+/// whose (effective-section, name) pair already appears earlier in the
+/// project (by canonical (uri, line) sort). Effective section follows
+/// `.include` transclusion: an ACL in a header-less fragment inherits the
+/// parent section's name.
+///
+/// Restricted to sections whose header keyword is `frontend` or `listen`
+/// somewhere in the project — HAProxy technically permits repeated `acl`
+/// lines as an OR shorthand, but in frontends/listens a repeat is almost
+/// always a copy-paste mistake that silently overrides condition semantics.
+/// Backend-scoped ACL duplicates are not flagged (unchanged from the
+/// single-file rule).
+///
+/// `project_defs` groups every ACL definition in the project by
+/// (section_name, acl_name); `frontend_listen_names` carries the set of
+/// section names that match the frontend/listen restriction. Emits only
+/// diagnostics that belong to `uri`.
+fn duplicate_acl_diagnostics(
+    uri: &str,
+    project_defs: &HashMap<(String, String), Vec<AclDefLocation>>,
+    frontend_listen_names: &HashSet<String>,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for ((section, name), locs) in project_defs {
+        if !frontend_listen_names.contains(section) {
+            continue;
+        }
+        if locs.len() < 2 {
+            continue;
+        }
+        let mut sorted = locs.clone();
+        sorted.sort();
+        for loc in sorted.iter().skip(1) {
+            if loc.uri != uri {
+                continue;
+            }
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: loc.line, character: loc.start },
+                    end: Position { line: loc.line, character: loc.end },
+                },
+                severity: 1,
+                code: "duplicate-acl",
+                source: "haproxy-lsp",
+                message: format!("Duplicate ACL in section: {}", name),
+            });
+        }
+    }
+    diags
+}
+
+/// Emit a `missing-default-backend` warning for each `frontend` / `listen`
+/// that has a `bind` directive (or a `listen NAME addr` inline bind) but
+/// neither a `default_backend` nor any `use_backend` directive in its body.
+/// Range is anchored on the section name token in the header.
+fn missing_default_backend_diagnostics(
+    content: &str,
+    headers: &[SectionHeaderInfo],
+) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "frontend" | "listen") {
+            continue;
+        }
+        if h.name.is_empty() {
+            continue;
+        }
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (h.body_end_line as usize).min(line_count.saturating_sub(1));
+        let mut has_bind = false;
+        let mut has_backend_ref = false;
+        // `listen NAME addr[:port]` header form counts as an inline bind.
+        if h.keyword == "listen" {
+            if let Some(hdr_line) = lines.get(h.header_line as usize) {
+                let toks: Vec<&str> = hdr_line.split_whitespace().collect();
+                if toks.len() >= 3 && !toks[2].starts_with('#') {
+                    has_bind = true;
+                }
+            }
+        }
+        if body_start <= body_end {
+            for ln_idx in body_start..=body_end {
+                let line = lines[ln_idx];
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let tok = trimmed.split_whitespace().next().unwrap_or("");
+                if tok == "bind" {
+                    has_bind = true;
+                }
+                if tok == "default_backend" || tok == "use_backend" {
+                    has_backend_ref = true;
+                }
+            }
+        }
+        if has_bind && !has_backend_ref {
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: h.header_line, character: h.name_start },
+                    end: Position { line: h.header_line, character: h.name_end },
+                },
+                severity: 2,
+                code: "missing-default-backend",
+                source: "haproxy-lsp",
+                message: format!(
+                    "{} '{}' has `bind` but no `default_backend` or `use_backend`",
+                    h.keyword, h.name
+                ),
+            });
+        }
+    }
+    diags
+}
+
+/// Emit an `unused-backend` warning for every `backend` symbol whose reference
+/// list is empty. Stick-table accessors (`sc0_*(name)`, `stick match name`)
+/// attach to the `StickTable` symbol rather than the enclosing backend, so a
+/// backend whose sole purpose is carrying a `stick-table` is still flagged —
+/// callers are expected to reference the backend via `use_backend` somewhere
+/// if they want the warning suppressed.
+fn unused_backend_diagnostics(
+    content: &str,
+    symbols: &[Symbol],
+    cross_file_refs: &HashSet<(SymbolKind, String)>,
+) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut diags = Vec::new();
+    for s in symbols {
+        if s.kind != SymbolKind::Backend || !s.references.is_empty() {
+            continue;
+        }
+        // A backend referenced from a sibling include file is still used,
+        // even if nothing in this file references it.
+        if cross_file_refs.contains(&(SymbolKind::Backend, s.name.clone())) {
+            continue;
+        }
+        let line_idx = s.range.start.line as usize;
+        let line = match lines.get(line_idx) {
+            Some(l) => l,
+            None => continue,
+        };
+        if let Some((_, start, end)) = find_leading_directive_arg(line, "backend") {
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: line_idx as u32, character: start },
+                    end: Position { line: line_idx as u32, character: end },
+                },
+                severity: 2,
+                code: "unused-backend",
+                source: "haproxy-lsp",
+                message: format!("Unused backend: {}", s.name),
+            });
+        }
+    }
+    diags
+}
+
+/// Emit an `unused-acl` warning for every `acl NAME ...` defined inside a
+/// `frontend` / `listen` / `backend` body where no `if` / `unless` condition
+/// in the same section body references `NAME`. Scope is enforced at the
+/// section level to avoid cross-section false negatives: two sections each
+/// defining `acl foo` don't suppress each other's warning.
+///
+/// Only the first occurrence of a duplicated ACL name within a section is
+/// considered for this rule; the duplicates are already reported by
+/// `duplicate_acl_diagnostics`.
+fn unused_acl_diagnostics(
+    content: &str,
+    headers: &[SectionHeaderInfo],
+    extra_acl_refs: &HashSet<String>,
+) -> Vec<Diagnostic> {
+    use std::collections::HashSet;
+    let lines: Vec<&str> = content.lines().collect();
+    let line_count = lines.len();
+    let mut diags = Vec::new();
+    for h in headers {
+        if !matches!(h.keyword.as_str(), "frontend" | "listen" | "backend") {
+            continue;
+        }
+        let body_start = (h.header_line as usize) + 1;
+        let body_end = (h.body_end_line as usize).min(line_count.saturating_sub(1));
+        if body_start > body_end {
+            continue;
+        }
+        let mut defs: Vec<(String, u32, u32, u32)> = Vec::new();
+        let mut refs: HashSet<String> = HashSet::new();
+        for ln_idx in body_start..=body_end {
+            let line = lines[ln_idx];
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with("acl ") || trimmed == "acl" {
+                if let Some((name, start, end)) = find_leading_directive_arg(line, "acl") {
+                    defs.push((name, ln_idx as u32, start, end));
+                }
+            }
+            for kw in &["if", "unless"] {
+                for (name, _, _) in collect_acl_ref_positions(line, kw) {
+                    refs.insert(name);
+                }
+            }
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for (name, ln, start, end) in defs {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            // HAProxy resolves ACL references within the defining section's
+            // body, which may span files when a fragment is pulled in via
+            // `.include`. `extra_acl_refs` carries every ACL name referenced
+            // anywhere in the project so a cross-file reference suppresses
+            // the warning. This intentionally widens suppression beyond the
+            // section boundary — false positives are worse than occasionally
+            // missing a genuinely unused ACL.
+            if refs.contains(&name) || extra_acl_refs.contains(&name) {
+                continue;
+            }
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: ln, character: start },
+                    end: Position { line: ln, character: end },
+                },
+                severity: 2,
+                code: "unused-acl",
+                source: "haproxy-lsp",
+                message: format!("Unused ACL: {}", name),
+            });
+        }
+    }
+    diags
+}
+
+/// Collect ACL identifier references on a line under an `if` / `unless`
+/// condition, with precise column ranges for each occurrence. Mirrors the
+/// token-filtering semantics of `extract_acl_names_from_condition`
+/// (brace-wrapped sample expressions skipped, operators `!` / `&&` / `||`
+/// dropped, leading `!` negation stripped) but preserves positions for
+/// diagnostic range reporting.
+fn collect_acl_ref_positions(line: &str, keyword: &str) -> Vec<(String, u32, u32)> {
+    let pattern = format!(" {} ", keyword);
+    let cond_start = match line.find(&pattern) {
+        Some(i) => i + pattern.len(),
+        None => return Vec::new(),
+    };
+    let cond_slice = strip_inline_comment(&line[cond_start..]);
+    let cond_end = cond_start + cond_slice.len();
+
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut brace_depth: u32 = 0;
+    let mut i = cond_start;
+    while i < cond_end {
+        while i < cond_end && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= cond_end {
+            break;
+        }
+        let tok_start = i;
+        while i < cond_end && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let tok_end = i;
+        let tok = &line[tok_start..tok_end];
+        if tok == "{" || tok == "!{" {
+            brace_depth += 1;
+            continue;
+        }
+        if tok == "}" {
+            brace_depth = brace_depth.saturating_sub(1);
+            continue;
+        }
+        if brace_depth > 0 {
+            continue;
+        }
+        if tok == "||" || tok == "&&" || tok == "!" {
+            continue;
+        }
+        let (name_start, name) = if let Some(stripped) = tok.strip_prefix('!') {
+            (tok_start + 1, stripped)
+        } else {
+            (tok_start, tok)
+        };
+        if name.is_empty() || !is_valid_identifier(name) {
+            continue;
+        }
+        out.push((name.to_string(), name_start as u32, tok_end as u32));
+    }
+    out
 }
 
 /// Byte offset just past the reference-context keyword on a reference line.
@@ -801,17 +2102,809 @@ impl HaproxyLsp {
             folds: HashMap::new(),
             outline: HashMap::new(),
             documents: HashMap::new(),
+            diagnostics: HashMap::new(),
+            pending_notifications: Vec::new(),
+            workspace_root: None,
+            project_configs: HashMap::new(),
+            included_files: HashMap::new(),
+            explicitly_opened: HashSet::new(),
+            project_indices: HashMap::new(),
+            raw_references: HashMap::new(),
+            entry_scopes: HashMap::new(),
         })
     }
 
+    // Queue a JSON-RPC notification. The main loop drains the queue after the
+    // current request handler returns, so the framed write to stdout is
+    // serialized with the (at most one) response for that request.
+    fn send_notification(&mut self, method: &str, params: Value) {
+        self.pending_notifications.push(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }));
+    }
+
+    fn drain_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending_notifications)
+    }
+
+    // Build the diagnostics set for `uri` and publish it. Called at the tail
+    // of `parse_document` after the per-URI caches are committed, so rule
+    // handlers can rely on `self.symbols[uri]` / `self.documents[uri]`.
+    // Task 2 adds undefined-reference rules; Task 3 will add unused-symbol
+    // and structural rules.
+    fn collect_diagnostics(&mut self, uri: &str) {
+        let mut diags: Vec<Diagnostic> = Vec::new();
+        if let (Some(content), Some(symbols)) = (
+            self.documents.get(uri).cloned(),
+            self.symbols.get(uri).cloned(),
+        ) {
+            // Gather cross-file symbol sets so undefined-reference rules
+            // don't flag names defined in an included sibling file. Only
+            // siblings — the current file's own symbols are already in
+            // `symbols`, and including them twice would be harmless but
+            // wasteful.
+            let mut extra_backends: HashSet<String> = HashSet::new();
+            let mut extra_servers_by_scope: HashMap<String, HashSet<String>> =
+                HashMap::new();
+            let mut extra_acls: HashSet<String> = HashSet::new();
+            for u in self.strictly_related_uris(uri) {
+                if u == uri {
+                    continue;
+                }
+                if let Some(syms) = self.symbols.get(&u) {
+                    for s in syms {
+                        match s.kind {
+                            SymbolKind::Backend => {
+                                extra_backends.insert(s.name.clone());
+                            }
+                            SymbolKind::Server => {
+                                if let Some(scope) = &s.scope {
+                                    extra_servers_by_scope
+                                        .entry(scope.clone())
+                                        .or_default()
+                                        .insert(s.name.clone());
+                                }
+                            }
+                            SymbolKind::Acl => {
+                                extra_acls.insert(s.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            diags.extend(undefined_reference_diagnostics(
+                &content,
+                &symbols,
+                &extra_backends,
+                &extra_servers_by_scope,
+                &extra_acls,
+            ));
+            let headers = collect_section_headers(&content);
+
+            // Build project-wide inputs for the structural rules. Walk every
+            // URI in the project graph once and aggregate:
+            //   - canonical-first (keyword, name) section locations so
+            //     `duplicate-section` flags cross-file collisions.
+            //   - ACL definitions tagged with their effective section (local
+            //     header OR inherited `entry_scope` for fragments) so
+            //     `duplicate-acl` catches copy-paste ACLs spread across
+            //     fragments that are pulled into the same parent section.
+            //   - the set of section names whose keyword is `frontend` /
+            //     `listen` in any project file — the filter for the
+            //     `duplicate-acl` rule (preserves the single-file
+            //     restriction that backend ACLs are not flagged).
+            //   - the set of ACL names referenced anywhere in the project so
+            //     `unused-acl` doesn't flag an ACL whose only references
+            //     live on the far side of an `.include`.
+            let project_uris = self.strictly_related_uris(uri);
+            let mut canonical_section_first: HashMap<(String, String), (String, u32)> =
+                HashMap::new();
+            let mut project_acl_defs: HashMap<(String, String), Vec<AclDefLocation>> =
+                HashMap::new();
+            let mut frontend_listen_names: HashSet<String> = HashSet::new();
+            let mut project_acl_refs: HashSet<String> = HashSet::new();
+            for u in &project_uris {
+                let u_content = match self.documents.get(u) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let u_headers = if u == uri {
+                    // Reuse the already-computed header list for the current
+                    // URI; every other URI's headers are cheap one-offs.
+                    headers.iter().map(|h| SectionHeaderInfo {
+                        keyword: h.keyword.clone(),
+                        name: h.name.clone(),
+                        name_start: h.name_start,
+                        name_end: h.name_end,
+                        header_line: h.header_line,
+                        body_end_line: h.body_end_line,
+                    }).collect::<Vec<_>>()
+                } else {
+                    collect_section_headers(&u_content)
+                };
+                for h in &u_headers {
+                    if matches!(h.keyword.as_str(), "backend" | "frontend" | "listen")
+                        && !h.name.is_empty()
+                    {
+                        let key = (h.keyword.clone(), h.name.clone());
+                        let entry = (u.clone(), h.header_line);
+                        canonical_section_first
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if entry < *existing {
+                                    *existing = entry.clone();
+                                }
+                            })
+                            .or_insert(entry);
+                    }
+                    if matches!(h.keyword.as_str(), "frontend" | "listen") && !h.name.is_empty() {
+                        frontend_listen_names.insert(h.name.clone());
+                    }
+                }
+                let entry_scope = self
+                    .entry_scopes
+                    .get(u)
+                    .and_then(|e| e.clone());
+                for (section, name, loc) in
+                    collect_acl_defs_with_scope(u, &u_content, entry_scope.as_deref())
+                {
+                    let section_name = match section {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    project_acl_defs
+                        .entry((section_name, name))
+                        .or_default()
+                        .push(loc);
+                }
+                if let Some(raws) = self.raw_references.get(u) {
+                    for r in raws {
+                        if matches!(
+                            r.context,
+                            ReferenceContext::AclCondition | ReferenceContext::AclUnlessCondition
+                        ) {
+                            project_acl_refs.insert(r.name.clone());
+                        }
+                    }
+                }
+            }
+
+            diags.extend(duplicate_section_diagnostics(
+                uri,
+                &headers,
+                &canonical_section_first,
+            ));
+            diags.extend(duplicate_acl_diagnostics(
+                uri,
+                &project_acl_defs,
+                &frontend_listen_names,
+            ));
+            diags.extend(missing_default_backend_diagnostics(&content, &headers));
+            // Gather cross-file references so an unused-backend warning
+            // doesn't fire for a backend defined in this file but referenced
+            // from a sibling include.
+            let cross_file_refs: HashSet<(SymbolKind, String)> = {
+                let mut set: HashSet<(SymbolKind, String)> = HashSet::new();
+                for u in &project_uris {
+                    if u == uri {
+                        continue;
+                    }
+                    if let Some(raws) = self.raw_references.get(u) {
+                        for r in raws {
+                            set.insert((r.kind.clone(), r.name.clone()));
+                        }
+                    }
+                }
+                set
+            };
+            diags.extend(unused_backend_diagnostics(&content, &symbols, &cross_file_refs));
+            diags.extend(unused_acl_diagnostics(&content, &headers, &project_acl_refs));
+        }
+        let diags_json: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
+        self.diagnostics.insert(uri.to_string(), diags);
+        self.send_notification(
+            "textDocument/publishDiagnostics",
+            json!({
+                "uri": uri,
+                "diagnostics": diags_json,
+            }),
+        );
+    }
+
+    // Top-level parse entry point. Parses the document at `uri`, then walks
+    // the include graph (`.include`, `-f`, `crt`) so siblings are parsed
+    // transitively, and finally rebuilds the project index keyed by the
+    // file's project root. Preserves the single-file semantics of the
+    // original `parse_document` (symbols / folds / outline / diagnostics all
+    // committed for `uri`) while layering cross-file state on top.
     fn parse_document(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut visited: HashSet<String> = HashSet::new();
+        // Top-level document is always parsed with no entry scope — it's the
+        // root of the include graph, not a fragment pulled into a section.
+        self.parse_graph_node(uri, Some(content), None, &mut visited)?;
+        self.rebuild_project_index_for(uri);
+        // Emit diagnostics for every file in the project graph now that the
+        // project index is coherent. Cross-file undefined-reference rules
+        // consult the index to avoid flagging a reference whose target is
+        // defined in a sibling include.
+        let project_uris = self.project_uris_for(uri);
+        for u in project_uris {
+            self.collect_diagnostics(&u);
+        }
+        Ok(())
+    }
+
+    // Parse a single node in the include graph and recurse into its
+    // neighbours. `content_override` is supplied for the top-level call (the
+    // buffer the client just sent); sibling calls pass `None`, which either
+    // picks up the last content the client explicitly provided via
+    // didOpen/didChange, or reads from disk when the sibling isn't an open
+    // editor buffer. `visited` is shared across the whole walk to prevent
+    // cycles.
+    //
+    // `entry_scope` is the enclosing HAProxy section name active in the
+    // parent file at the point of the `.include` / `-f` / `crt` directive
+    // that reached this node. For the top-level document it is always
+    // `None`. For a fragment pulled into the body of `backend foo`, it is
+    // `Some("foo")`. This seeds both passes of `parse_single_file` so
+    // header-less fragments (a file that starts with `server s1 ...` with no
+    // `backend` header of its own) attribute their symbols to the parent's
+    // section rather than dropping them or leaving `scope = None`.
+    //
+    // Limitation: `visited` dedups on URI only, so if the same fragment is
+    // included from two distinct sections the first edge's `entry_scope`
+    // wins. Multi-scope inclusion of the same fragment is rare in practice
+    // and would require duplicating symbols per (uri, scope) pair, which is
+    // out of scope for this pass.
+    fn parse_graph_node(
+        &mut self,
+        uri: &str,
+        content_override: Option<&str>,
+        entry_scope: Option<String>,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !visited.insert(uri.to_string()) {
+            return Ok(());
+        }
+
+        let content: String = if let Some(c) = content_override {
+            c.to_string()
+        } else if self.explicitly_opened.contains(uri) {
+            // Sibling that the client is actively editing — trust its buffer
+            // over the on-disk copy so unsaved edits stay authoritative.
+            self.documents.get(uri).cloned().unwrap_or_default()
+        } else if let Some(path) = uri_to_path(uri) {
+            std::fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Ensure a project config is resolved for this URI. Siblings discovered
+        // via the include graph inherit the root file's config implicitly;
+        // `resolve_project_config_for_path` walks up from the sibling's
+        // directory so a shared `.zed/haproxy.toml` still applies.
+        if !self.project_configs.contains_key(uri) {
+            if let Some(path) = uri_to_path(uri) {
+                let cfg = resolve_project_config_for_path(
+                    &path,
+                    self.workspace_root.as_deref(),
+                );
+                self.project_configs.insert(uri.to_string(), cfg);
+            }
+        }
+
+        // Record the entry scope under which this URI was parsed so
+        // cross-file duplicate-acl detection can attribute ACL definitions
+        // in a header-less fragment to the parent section that pulled it
+        // in. First-edge wins (matches the `visited` dedup policy).
+        self.entry_scopes
+            .entry(uri.to_string())
+            .or_insert_with(|| entry_scope.clone());
+
+        self.parse_single_file(uri, &content, entry_scope.clone())?;
+
+        let includes = self.extract_include_uris(uri, &content, entry_scope.as_deref());
+        self.included_files.insert(
+            uri.to_string(),
+            includes.iter().map(|(u, _)| u.clone()).collect(),
+        );
+
+        for (inc_uri, inc_scope) in includes {
+            if visited.contains(&inc_uri) {
+                continue;
+            }
+            let _ = self.parse_graph_node(&inc_uri, None, inc_scope, visited);
+        }
+
+        Ok(())
+    }
+
+    // Discover include-graph neighbours on `content` for the file at `uri`.
+    // Recognised directives:
+    //   - `.include <path>` — HAProxy 2.4+ preprocessor include.
+    //   - `-f <path>` — command-line-style include (rare inside configs but
+    //     appears in `program` sections and deployment wrappers).
+    //   - `crt <path>` — TLS certificate include on `bind` lines; only
+    //     included when the resolved path is a file (directories are skipped
+    //     since Task 5 does not implement directory walking).
+    //
+    // Path resolution tries the file's own directory first, then the project
+    // root from the resolved `ProjectConfig`. Absolute paths are kept as-is.
+    // `.if` / `.elif` / `.else` / `.endif` are parsed conservatively: every
+    // branch is walked regardless of the condition, since the line-scanner
+    // already treats conditional directives as ordinary content.
+    // Return the list of include-graph neighbours together with the
+    // HAProxy section name active at the line of the directive that reached
+    // each neighbour. `entry_scope` is the section active at the top of
+    // this file (non-`None` when the current file is itself a fragment
+    // included from a parent section); section tracking during the walk is
+    // seeded with it so nested `.include` inside a header-less fragment
+    // still carries the parent scope.
+    //
+    // `extra_files` edges from `.zed/haproxy.toml` are emitted with
+    // `entry_scope = None` since they are project-wide peers, not
+    // section-body fragments.
+    fn extract_include_uris(
+        &self,
+        uri: &str,
+        content: &str,
+        entry_scope: Option<&str>,
+    ) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        // Honor `follow_includes = false` in .zed/haproxy.toml — users with
+        // segmented projects can opt out of the graph walk entirely.
+        if let Some(cfg) = self.project_configs.get(uri) {
+            if !cfg.follow_includes {
+                return out;
+            }
+        }
+        let file_path = match uri_to_path(uri) {
+            Some(p) => p,
+            None => return out,
+        };
+        let file_dir = file_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let project_root = self
+            .project_configs
+            .get(uri)
+            .map(|c| c.project_root.clone())
+            .unwrap_or_else(|| file_dir.clone());
+
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut current_section_name: Option<String> = entry_scope.map(|s| s.to_string());
+
+        for raw_line in content.lines() {
+            // Track section headers the same way `parse_single_file` does so
+            // `.include` directives appearing inside a backend/frontend/
+            // listen/peers body attribute correctly to that section.
+            let is_section_line = is_section_header(raw_line);
+            let trimmed = raw_line.trim();
+            let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+            if is_section_line {
+                match first_tok {
+                    "backend" | "frontend" | "listen" | "peers" => {
+                        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                        current_section_name = tokens.get(1).map(|s| s.to_string());
+                    }
+                    "global" | "defaults" | "resolvers" | "userlist"
+                    | "mailers" | "cache" | "program" | "ring" => {
+                        current_section_name = None;
+                    }
+                    _ => {}
+                }
+            }
+
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let line_no_comment = strip_inline_comment(trimmed);
+            let tokens: Vec<&str> = line_no_comment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            if tokens[0] == ".include" && tokens.len() >= 2 {
+                let path_tok = unquote_path_token(tokens[1]);
+                if let Some(resolved) =
+                    resolve_include_path(path_tok, &file_dir, &project_root)
+                {
+                    if resolved.is_file() && seen.insert(resolved.clone()) {
+                        if let Some(u) = path_to_file_uri(&resolved) {
+                            out.push((u, current_section_name.clone()));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            for (i, tok) in tokens.iter().enumerate() {
+                if *tok == "-f" {
+                    if let Some(path_tok) = tokens.get(i + 1) {
+                        let path_tok = unquote_path_token(path_tok);
+                        if let Some(resolved) =
+                            resolve_include_path(path_tok, &file_dir, &project_root)
+                        {
+                            if resolved.is_file() && seen.insert(resolved.clone()) {
+                                if let Some(u) = path_to_file_uri(&resolved) {
+                                    out.push((u, current_section_name.clone()));
+                                }
+                            }
+                        }
+                    }
+                } else if *tok == "crt" {
+                    if let Some(path_tok) = tokens.get(i + 1) {
+                        let path_tok = unquote_path_token(path_tok);
+                        if let Some(resolved) =
+                            resolve_include_path(path_tok, &file_dir, &project_root)
+                        {
+                            if resolved.is_file() && seen.insert(resolved.clone()) {
+                                if let Some(u) = path_to_file_uri(&resolved) {
+                                    out.push((u, current_section_name.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Seed `extra_files` from .zed/haproxy.toml into the include graph.
+        // Patterns with `*`, `?`, or `**` are expanded against `project_root`;
+        // literal paths resolve as before. Absolute patterns resolve from
+        // `/`. These are project-wide peers rather than fragments, so their
+        // entry scope is always `None`.
+        if let Some(cfg) = self.project_configs.get(uri) {
+            for pat in &cfg.extra_files {
+                if pat.is_empty() {
+                    continue;
+                }
+                if component_has_glob(pat) || pat.contains("**") {
+                    for resolved in expand_glob(pat, &project_root) {
+                        if resolved.is_file() && seen.insert(resolved.clone()) {
+                            if let Some(u) = path_to_file_uri(&resolved) {
+                                out.push((u, None));
+                            }
+                        }
+                    }
+                } else if let Some(resolved) =
+                    resolve_include_path(pat, &project_root, &project_root)
+                {
+                    if resolved.is_file() && seen.insert(resolved.clone()) {
+                        if let Some(u) = path_to_file_uri(&resolved) {
+                            out.push((u, None));
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    // Rebuild the project index rooted at the project_root of `seed_uri`.
+    //
+    // Membership is every URI in `self.project_configs` that resolved to the
+    // same `project_root`. Include-graph reachability from the seed is an
+    // insufficient cut for the cross-file handlers in Task 6: opening
+    // `backends.cfg` directly yields a forward graph of only
+    // `[backends.cfg]`, but `main.cfg` (previously opened or loaded via a
+    // sibling's include) holds a reverse reference we still need the index
+    // to expose for references / rename / diagnostics. Keying on project
+    // root gives a consistent bidirectional membership.
+    fn rebuild_project_index_for(&mut self, seed_uri: &str) {
+        let project_root = match self.project_configs.get(seed_uri) {
+            Some(cfg) => cfg.project_root.clone(),
+            None => return,
+        };
+
+        let mut reachable: Vec<String> = self
+            .project_configs
+            .iter()
+            .filter(|(_, cfg)| cfg.project_root == project_root)
+            .map(|(u, _)| u.clone())
+            .collect();
+        reachable.sort();
+
+        let mut symbols_by_name: HashMap<(SymbolKind, String), Vec<ProjectSymbolRef>> =
+            HashMap::new();
+        for u in &reachable {
+            if let Some(syms) = self.symbols.get(u) {
+                for s in syms {
+                    symbols_by_name
+                        .entry((s.kind.clone(), s.name.clone()))
+                        .or_default()
+                        .push(ProjectSymbolRef {
+                            uri: u.clone(),
+                            range: s.range.clone(),
+                            scope: s.scope.clone(),
+                        });
+                }
+            }
+        }
+
+        let key = project_root.to_string_lossy().into_owned();
+        self.project_indices.insert(
+            key,
+            ProjectIndex {
+                project_root,
+                uris: reachable,
+                symbols_by_name,
+            },
+        );
+    }
+
+    // Return every URI reachable from `uri` via the include graph, including
+    // `uri` itself. Falls back to `vec![uri]` when no project index has been
+    // built yet (e.g. early in startup before any didOpen).
+    // Drop every URI from the caches whose presence is not justified by
+    // an open editor buffer. Called after `didClose` so auto-loaded
+    // siblings whose only reason to exist was the closed URI's include
+    // graph get freed, preventing unbounded cache growth in long-lived
+    // sessions and stopping `workspace/symbol` from advertising stale
+    // entries.
+    //
+    // "Live" = the include-graph forward closure of the remaining
+    // `explicitly_opened` URIs. Everything else in `project_configs` is
+    // an orphan and gets fully evicted (all per-URI caches + project
+    // index membership). Clients are told to clear any stale diagnostics
+    // on the evicted URIs via an empty-array `publishDiagnostics`.
+    //
+    // Returns the set of project roots that lost at least one member so
+    // the caller can refresh their indices.
+    fn evict_orphaned_siblings(&mut self) -> HashSet<PathBuf> {
+        let mut live: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = self.explicitly_opened.iter().cloned().collect();
+        while let Some(u) = stack.pop() {
+            if !live.insert(u.clone()) {
+                continue;
+            }
+            if let Some(neighbors) = self.included_files.get(&u) {
+                for n in neighbors {
+                    if !live.contains(n) {
+                        stack.push(n.clone());
+                    }
+                }
+            }
+        }
+
+        let known: Vec<String> = self.project_configs.keys().cloned().collect();
+        let mut touched_roots: HashSet<PathBuf> = HashSet::new();
+        for u in known {
+            if live.contains(&u) {
+                continue;
+            }
+            if let Some(cfg) = self.project_configs.get(&u) {
+                touched_roots.insert(cfg.project_root.clone());
+            }
+            self.symbols.remove(&u);
+            self.folds.remove(&u);
+            self.outline.remove(&u);
+            self.documents.remove(&u);
+            self.diagnostics.remove(&u);
+            self.raw_references.remove(&u);
+            self.project_configs.remove(&u);
+            self.included_files.remove(&u);
+            self.entry_scopes.remove(&u);
+            self.send_notification(
+                "textDocument/publishDiagnostics",
+                json!({ "uri": u, "diagnostics": [] }),
+            );
+        }
+
+        // Drop project_indices entries for roots that no longer have any
+        // members. A root with surviving members gets rebuilt by the
+        // caller; only fully-vacant roots are removed here.
+        let remaining_roots: HashSet<PathBuf> = self
+            .project_configs
+            .values()
+            .map(|c| c.project_root.clone())
+            .collect();
+        let vacant: Vec<String> = touched_roots
+            .iter()
+            .filter(|r| !remaining_roots.contains(*r))
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect();
+        for key in vacant {
+            self.project_indices.remove(&key);
+        }
+
+        touched_roots
+    }
+
+    // Return the URI set considered "strictly related" to `uri` for the
+    // purposes of cross-file diagnostic aggregation. Stricter than
+    // `project_uris_for`: without an explicit `.zed/haproxy.toml`, project
+    // root falls back to the opened file's directory, which would otherwise
+    // let two unrelated configs in the same directory trip each other's
+    // duplicate-section / duplicate-acl / undefined-reference rules.
+    //
+    // With an explicit project config, trust the declared membership.
+    // Without one, restrict to URIs reachable from `uri` through the
+    // include graph (forward and reverse edges walked together). Navigation
+    // handlers keep using `project_uris_for` — they benefit from looser
+    // membership when the user intentionally jumps across files.
+    fn strictly_related_uris(&self, uri: &str) -> Vec<String> {
+        if let Some(cfg) = self.project_configs.get(uri) {
+            if cfg.config_file.is_some() {
+                return self.project_uris_for(uri);
+            }
+        }
+        let candidates = self.project_uris_for(uri);
+        let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+        for u in &candidates {
+            if let Some(neighbors) = self.included_files.get(u) {
+                for n in neighbors {
+                    edges
+                        .entry(u.clone())
+                        .or_default()
+                        .insert(n.clone());
+                    edges
+                        .entry(n.clone())
+                        .or_default()
+                        .insert(u.clone());
+                }
+            }
+        }
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![uri.to_string()];
+        while let Some(u) = stack.pop() {
+            if !visited.insert(u.clone()) {
+                continue;
+            }
+            if let Some(ns) = edges.get(&u) {
+                for n in ns {
+                    if !visited.contains(n) {
+                        stack.push(n.clone());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = visited.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    fn project_uris_for(&self, uri: &str) -> Vec<String> {
+        let project_root_key = match self.project_configs.get(uri) {
+            Some(cfg) => cfg.project_root.to_string_lossy().into_owned(),
+            None => return vec![uri.to_string()],
+        };
+        match self.project_indices.get(&project_root_key) {
+            Some(idx) if !idx.uris.is_empty() => idx.uris.clone(),
+            _ => vec![uri.to_string()],
+        }
+    }
+
+    // Return the enclosing section name for a child symbol (ACL, StickTable)
+    // located at `target_line` within `uri`. Scans the per-URI `symbols` cache
+    // for the highest-line Backend/Frontend/Listen definition at or before
+    // `target_line`. Returns `None` if the child appears before any section
+    // header (e.g. a top-of-file stray `acl` line).
+    fn enclosing_section_for_uri(&self, uri: &str, target_line: u32) -> Option<String> {
+        let syms = self.symbols.get(uri)?;
+        let mut best: Option<(u32, &str)> = None;
+        for s in syms {
+            if !matches!(
+                s.kind,
+                SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
+            ) {
+                continue;
+            }
+            let sl = s.range.start.line;
+            if sl > target_line {
+                continue;
+            }
+            match best {
+                Some((bl, _)) if bl >= sl => {}
+                _ => best = Some((sl, s.name.as_str())),
+            }
+        }
+        best.map(|(_, n)| n.to_string())
+    }
+
+    // Aggregate references to `(name, kind, scope)` across every URI in the
+    // project graph, deduped by (uri, line, start, context). Drives cross-file
+    // `textDocument/references`, `textDocument/rename`, and the unused-symbol
+    // diagnostic rules.
+    fn project_references(
+        &self,
+        uri: &str,
+        name: &str,
+        kind: &SymbolKind,
+        scope: Option<&str>,
+    ) -> Vec<Reference> {
+        let mut out: Vec<Reference> = Vec::new();
+        let mut seen: HashSet<(String, u32, u32, ReferenceContext)> = HashSet::new();
+        for u in self.project_uris_for(uri) {
+            if let Some(raws) = self.raw_references.get(&u) {
+                for r in raws {
+                    if r.name != name || r.kind != *kind {
+                        continue;
+                    }
+                    if let Some(want) = scope {
+                        // Scope filter for section-scoped references (Server).
+                        // For unscoped kinds (Backend/Acl/StickTable) the
+                        // reference's own `scope` is `None` and must not be
+                        // matched against `want`.
+                        if *kind == SymbolKind::Server && r.scope.as_deref() != Some(want) {
+                            continue;
+                        }
+                    }
+                    let key = (
+                        r.uri.clone(),
+                        r.range.start.line,
+                        r.range.start.character,
+                        r.context.clone(),
+                    );
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    out.push(Reference {
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    // Find every defining symbol matching `(name, kind, scope)` across every
+    // URI in the project graph. Returned symbols carry their own file's
+    // same-file references only; cross-file references live in
+    // `project_references`.
+    fn project_symbols(
+        &self,
+        uri: &str,
+        name: &str,
+        kind: &SymbolKind,
+        scope: Option<&str>,
+    ) -> Vec<Symbol> {
+        let mut out: Vec<Symbol> = Vec::new();
+        for u in self.project_uris_for(uri) {
+            if let Some(syms) = self.symbols.get(&u) {
+                for s in syms {
+                    if s.name != name || s.kind != *kind {
+                        continue;
+                    }
+                    if let Some(want) = scope {
+                        match s.scope.as_deref() {
+                            Some(have) if have == want => {}
+                            _ => continue,
+                        }
+                    }
+                    out.push(s.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn parse_single_file(
+        &mut self,
+        uri: &str,
+        content: &str,
+        entry_scope: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Line-scanning parser. Tree-sitter is loaded by Zed for highlighting
         // only; no AST is available to the LSP.
         let mut symbols = Vec::new();
         // Track the enclosing named section so `stick-table` directives can
         // be attributed to the correct backend/frontend/listen/peers name
         // (HAProxy binds one table per section, keyed by the section name).
-        let mut current_section_name: Option<String> = None;
+        // `entry_scope` seeds this for included fragments: when the file was
+        // pulled into the body of `backend foo` via `.include`, its server
+        // and stick-table directives must attribute to `foo` even though no
+        // `backend` header appears in the fragment itself.
+        let mut current_section_name: Option<String> = entry_scope.clone();
 
         for (line_num, raw_line) in content.lines().enumerate() {
             let line = raw_line.trim();
@@ -961,7 +3054,11 @@ impl HaproxyLsp {
         // `use_server`) can be resolved against the correct server definition
         // even when two backends share a server name.
         let mut updated_symbols = symbols;
-        let mut ref_section_name: Option<String> = None;
+        let mut raw_refs: Vec<RawReference> = Vec::new();
+        // Same `entry_scope` rationale as the first pass: `use_server` and
+        // other scoped references inside a header-less included fragment
+        // must resolve against the parent section's server definitions.
+        let mut ref_section_name: Option<String> = entry_scope;
         for (line_num, raw_line) in content.lines().enumerate() {
             let is_section_line = is_section_header(raw_line);
             let trimmed = raw_line.trim();
@@ -992,31 +3089,47 @@ impl HaproxyLsp {
             // Collect backend references
             if line.contains("use_backend") {
                 if let Some(backend_name) = self.extract_backend_from_use_backend(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend,
-                                              Reference {
-                                                  range: Range {
-                                                      start: Position { line: line_num as u32, character: 0 },
-                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                  },
-                                                  uri: uri.to_string(),
-                                                  context: ReferenceContext::UseBackend,
-                                                  scope: None,
-                                              });
+                    let r = Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::UseBackend,
+                        scope: None,
+                    };
+                    raw_refs.push(RawReference {
+                        name: backend_name.clone(),
+                        kind: SymbolKind::Backend,
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend, r);
                 }
             }
 
             if line.contains("default_backend") {
                 if let Some(backend_name) = self.extract_backend_from_default_backend(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend,
-                                              Reference {
-                                                  range: Range {
-                                                      start: Position { line: line_num as u32, character: 0 },
-                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                  },
-                                                  uri: uri.to_string(),
-                                                  context: ReferenceContext::DefaultBackend,
-                                                  scope: None,
-                                              });
+                    let r = Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::DefaultBackend,
+                        scope: None,
+                    };
+                    raw_refs.push(RawReference {
+                        name: backend_name.clone(),
+                        kind: SymbolKind::Backend,
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                    self.add_reference_to_symbol(&mut updated_symbols, &backend_name, SymbolKind::Backend, r);
                 }
             }
 
@@ -1030,16 +3143,24 @@ impl HaproxyLsp {
             // both define a `server shared` stay independent.
             if line.starts_with("use_server ") {
                 if let Some(server_name) = self.extract_server_from_use_server(line) {
-                    self.add_reference_to_symbol(&mut updated_symbols, &server_name, SymbolKind::Server,
-                                              Reference {
-                                                  range: Range {
-                                                      start: Position { line: line_num as u32, character: 0 },
-                                                      end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                  },
-                                                  uri: uri.to_string(),
-                                                  context: ReferenceContext::UseServer,
-                                                  scope: ref_section_name.clone(),
-                                              });
+                    let r = Reference {
+                        range: Range {
+                            start: Position { line: line_num as u32, character: 0 },
+                            end: Position { line: line_num as u32, character: line.len() as u32 },
+                        },
+                        uri: uri.to_string(),
+                        context: ReferenceContext::UseServer,
+                        scope: ref_section_name.clone(),
+                    };
+                    raw_refs.push(RawReference {
+                        name: server_name.clone(),
+                        kind: SymbolKind::Server,
+                        range: r.range.clone(),
+                        uri: r.uri.clone(),
+                        context: r.context.clone(),
+                        scope: r.scope.clone(),
+                    });
+                    self.add_reference_to_symbol(&mut updated_symbols, &server_name, SymbolKind::Server, r);
                 }
             }
 
@@ -1047,16 +3168,24 @@ impl HaproxyLsp {
             if line.contains(" if ") {
                 if let Some(acl_names) = self.extract_acl_names_from_condition(line, "if") {
                     for acl_name in acl_names {
-                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl,
-                                                  Reference {
-                                                      range: Range {
-                                                          start: Position { line: line_num as u32, character: 0 },
-                                                          end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                      },
-                                                      uri: uri.to_string(),
-                                                      context: ReferenceContext::AclCondition,
-                                                      scope: None,
-                                                  });
+                        let r = Reference {
+                            range: Range {
+                                start: Position { line: line_num as u32, character: 0 },
+                                end: Position { line: line_num as u32, character: line.len() as u32 },
+                            },
+                            uri: uri.to_string(),
+                            context: ReferenceContext::AclCondition,
+                            scope: None,
+                        };
+                        raw_refs.push(RawReference {
+                            name: acl_name.clone(),
+                            kind: SymbolKind::Acl,
+                            range: r.range.clone(),
+                            uri: r.uri.clone(),
+                            context: r.context.clone(),
+                            scope: r.scope.clone(),
+                        });
+                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl, r);
                     }
                 }
             }
@@ -1064,16 +3193,24 @@ impl HaproxyLsp {
             if line.contains(" unless ") {
                 if let Some(acl_names) = self.extract_acl_names_from_condition(line, "unless") {
                     for acl_name in acl_names {
-                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl,
-                                                  Reference {
-                                                      range: Range {
-                                                          start: Position { line: line_num as u32, character: 0 },
-                                                          end: Position { line: line_num as u32, character: line.len() as u32 },
-                                                      },
-                                                      uri: uri.to_string(),
-                                                      context: ReferenceContext::AclUnlessCondition,
-                                                      scope: None,
-                                                  });
+                        let r = Reference {
+                            range: Range {
+                                start: Position { line: line_num as u32, character: 0 },
+                                end: Position { line: line_num as u32, character: line.len() as u32 },
+                            },
+                            uri: uri.to_string(),
+                            context: ReferenceContext::AclUnlessCondition,
+                            scope: None,
+                        };
+                        raw_refs.push(RawReference {
+                            name: acl_name.clone(),
+                            kind: SymbolKind::Acl,
+                            range: r.range.clone(),
+                            uri: r.uri.clone(),
+                            context: r.context.clone(),
+                            scope: r.scope.clone(),
+                        });
+                        self.add_reference_to_symbol(&mut updated_symbols, &acl_name, SymbolKind::Acl, r);
                     }
                 }
             }
@@ -1086,23 +3223,32 @@ impl HaproxyLsp {
             let stick_refs = collect_stick_table_references(line_no_comment);
             for (table_name, start_col) in stick_refs {
                 let end_col = start_col + table_name.len();
+                let r = Reference {
+                    range: Range {
+                        start: Position { line: line_num as u32, character: start_col as u32 },
+                        end: Position { line: line_num as u32, character: end_col as u32 },
+                    },
+                    uri: uri.to_string(),
+                    context: ReferenceContext::StickTable,
+                    scope: None,
+                };
+                raw_refs.push(RawReference {
+                    name: table_name.clone(),
+                    kind: SymbolKind::StickTable,
+                    range: r.range.clone(),
+                    uri: r.uri.clone(),
+                    context: r.context.clone(),
+                    scope: r.scope.clone(),
+                });
                 self.add_reference_to_symbol(
                     &mut updated_symbols,
                     &table_name,
                     SymbolKind::StickTable,
-                    Reference {
-                        range: Range {
-                            start: Position { line: line_num as u32, character: start_col as u32 },
-                            end: Position { line: line_num as u32, character: end_col as u32 },
-                        },
-                        uri: uri.to_string(),
-                        context: ReferenceContext::StickTable,
-                        scope: None,
-                    },
+                    r,
                 );
             }
         }
-        
+
         // Build fold/outline data into locals before any self.* write so a
         // mid-parse panic cannot leave caches out of sync with each other.
         let folds = compute_folds(content);
@@ -1112,6 +3258,7 @@ impl HaproxyLsp {
         self.folds.insert(uri.to_string(), folds);
         self.outline.insert(uri.to_string(), outline);
         self.documents.insert(uri.to_string(), content.to_string());
+        self.raw_references.insert(uri.to_string(), raw_refs);
         Ok(())
     }
 
@@ -1122,6 +3269,14 @@ impl HaproxyLsp {
             return None;
         }
         let line = lines[line_idx];
+
+        // Cross-file: F12 on an include-directive path token jumps to the
+        // resolved file. We synthesise a Symbol whose URI points at the
+        // included file and whose range is `{0,0}-{0,0}` so the client
+        // navigates to the file's head.
+        if let Some(sym) = self.include_path_target(uri, line, position.character as usize) {
+            return Some(sym);
+        }
 
         // Resolve the word under the cursor and its byte offset on the line.
         let (word, word_start) = self.word_at_position(line, position.character as usize)?;
@@ -1279,17 +3434,17 @@ impl HaproxyLsp {
     fn extract_backend_from_use_backend(&self, line: &str) -> Option<String> {
         // Parse "use_backend BACKEND_NAME [if condition]"
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() >= 2 && parts[0] == "use_backend" {
+        if parts.len() >= 2 && parts[0] == "use_backend" && is_valid_identifier(parts[1]) {
             Some(parts[1].to_string())
         } else {
             None
         }
     }
-    
+
     fn extract_backend_from_default_backend(&self, line: &str) -> Option<String> {
         // Parse "default_backend BACKEND_NAME"
         let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() >= 2 && parts[0] == "default_backend" {
+        if parts.len() >= 2 && parts[0] == "default_backend" && is_valid_identifier(parts[1]) {
             Some(parts[1].to_string())
         } else {
             None
@@ -1446,11 +3601,112 @@ impl HaproxyLsp {
         self.find_symbol_by_name_scoped(uri, name, kind, None)
     }
 
+    /// If the cursor on `line` sits inside the path token of a `.include`,
+    /// `-f`, or `crt` directive, resolve that path against the same
+    /// include-graph rules as `extract_include_uris` and return a synthetic
+    /// `Symbol` whose URI points at the resolved file and whose range is
+    /// `{0,0}-{0,0}`. Returns `None` for any other line or cursor position.
+    fn include_path_target(
+        &self,
+        uri: &str,
+        line: &str,
+        char_pos: usize,
+    ) -> Option<Symbol> {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let line_no_comment = strip_inline_comment(trimmed);
+        let tokens: Vec<&str> = line_no_comment.split_whitespace().collect();
+        if tokens.is_empty() {
+            return None;
+        }
+
+        // Locate the byte offset of each token on the original `line` so we
+        // can check whether `char_pos` sits inside the path slot. Matching
+        // on `line` (not the trimmed slice) keeps the caller's cursor offset
+        // in the same coordinate space.
+        let mut search_from = 0usize;
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+        for tok in &tokens {
+            let found = line[search_from..].find(tok)?;
+            let start = search_from + found;
+            let end = start + tok.len();
+            positions.push((start, end));
+            search_from = end;
+        }
+
+        // char_pos is a char-index, not a byte offset — convert before
+        // comparing with token byte spans. HAProxy config is ASCII in
+        // practice, but stay defensive.
+        let byte_pos = line
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+
+        // Identify the token slot we care about for each directive.
+        let path_slot: Option<usize> = match tokens[0] {
+            ".include" if tokens.len() >= 2 => Some(1),
+            _ => {
+                let mut slot: Option<usize> = None;
+                for (i, tok) in tokens.iter().enumerate() {
+                    if (*tok == "-f" || *tok == "crt") && tokens.get(i + 1).is_some() {
+                        let (s, e) = positions[i + 1];
+                        if byte_pos >= s && byte_pos <= e {
+                            slot = Some(i + 1);
+                            break;
+                        }
+                    }
+                }
+                slot
+            }
+        };
+        let slot = path_slot?;
+        let (start, end) = positions[slot];
+        if byte_pos < start || byte_pos > end {
+            return None;
+        }
+        let path_tok = unquote_path_token(tokens[slot]);
+        let file_path = uri_to_path(uri)?;
+        let file_dir = file_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let project_root = self
+            .project_configs
+            .get(uri)
+            .map(|c| c.project_root.clone())
+            .unwrap_or_else(|| file_dir.clone());
+        let resolved = resolve_include_path(path_tok, &file_dir, &project_root)?;
+        if !resolved.is_file() {
+            return None;
+        }
+        let target_uri = path_to_file_uri(&resolved)?;
+        Some(Symbol {
+            name: path_tok.to_string(),
+            kind: SymbolKind::Backend,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            uri: target_uri,
+            references: Vec::new(),
+            scope: None,
+        })
+    }
+
     /// Scoped symbol lookup. When `scope` is `Some`, only symbols whose
     /// `scope` matches are returned — used for Server resolution so that
     /// `use_server shared` in backend A does not cross-navigate to
     /// backend B's same-named server. When `scope` is `None`, the first
     /// matching symbol is returned (legacy behaviour).
+    ///
+    /// Resolution first checks the requesting document, then falls back to
+    /// every URI in the project graph so cross-file definitions are
+    /// reachable. Server (scope-bearing) lookups stay within the section;
+    /// a server defined in another file's same-named section would be
+    /// conceptually a different symbol and is intentionally not matched.
     fn find_symbol_by_name_scoped(
         &self,
         uri: &str,
@@ -1458,23 +3714,43 @@ impl HaproxyLsp {
         kind: SymbolKind,
         scope: Option<&str>,
     ) -> Option<Symbol> {
-        // Single-file scope: only resolve against the requesting document so
-        // that two open files with the same backend/acl name don't silently
-        // cross-navigate.
-        let symbols = self.symbols.get(uri)?;
-        for symbol in symbols {
-            if symbol.name != name
-                || std::mem::discriminant(&symbol.kind) != std::mem::discriminant(&kind)
-            {
+        if let Some(symbols) = self.symbols.get(uri) {
+            for symbol in symbols {
+                if symbol.name != name || symbol.kind != kind {
+                    continue;
+                }
+                if let Some(want) = scope {
+                    match symbol.scope.as_deref() {
+                        Some(have) if have == want => return Some(symbol.clone()),
+                        _ => continue,
+                    }
+                }
+                return Some(symbol.clone());
+            }
+        }
+        // Fall back to the project graph for cross-file definitions.
+        // Servers are section-scoped; cross-file server lookups would only
+        // make sense if the enclosing section also lived in the other file,
+        // which is the normal case when the file split follows section
+        // boundaries. Respect the scope filter either way.
+        for u in self.project_uris_for(uri) {
+            if u == uri {
                 continue;
             }
-            if let Some(want) = scope {
-                match symbol.scope.as_deref() {
-                    Some(have) if have == want => return Some(symbol.clone()),
-                    _ => continue,
+            if let Some(symbols) = self.symbols.get(&u) {
+                for symbol in symbols {
+                    if symbol.name != name || symbol.kind != kind {
+                        continue;
+                    }
+                    if let Some(want) = scope {
+                        match symbol.scope.as_deref() {
+                            Some(have) if have == want => return Some(symbol.clone()),
+                            _ => continue,
+                        }
+                    }
+                    return Some(symbol.clone());
                 }
             }
-            return Some(symbol.clone());
         }
         None
     }
@@ -1795,6 +4071,216 @@ impl HaproxyLsp {
         self.find_references_to_symbol_scoped(uri, symbol_name, symbol_kind, None)
     }
 
+    /// Build the `Location[]` response for `textDocument/references` given a
+    /// resolved cursor symbol. Aggregates definitions and references across
+    /// every URI in the project graph, narrowing each range to the identifier
+    /// token by scanning the corresponding file's cached content. When a
+    /// section symbol has a stick-table bound to its name, call-site
+    /// references to the table (`sc*_*(X)`, `... table X`) are cascaded into
+    /// the response so operators asking for references on the section see
+    /// every file-level usage.
+    fn build_references_locations(
+        &self,
+        uri: &str,
+        sym: &Symbol,
+        include_declaration: bool,
+    ) -> Vec<Value> {
+        let mut locs: Vec<Value> = Vec::new();
+        // Dedup across URIs — same file path resolved from different
+        // call-sites never collides because `uri` is part of the key.
+        let mut seen_locs: HashSet<(String, u32, u32)> = HashSet::new();
+        // Per-(uri, line, context) search-floor for narrowing successive
+        // same-name references on one line to distinct occurrences.
+        let mut ref_search_floor: HashMap<(String, u32, ReferenceContext), usize> =
+            HashMap::new();
+
+        let push_loc = |loc_uri: &str,
+                         line_num: u32,
+                         start: u32,
+                         end: u32,
+                         locs: &mut Vec<Value>,
+                         seen: &mut HashSet<(String, u32, u32)>| {
+            if seen.insert((loc_uri.to_string(), line_num, start)) {
+                locs.push(json!({
+                    "uri": loc_uri,
+                    "range": {
+                        "start": { "line": line_num, "character": start },
+                        "end": { "line": line_num, "character": end },
+                    }
+                }));
+            }
+        };
+
+        // Aggregate definitions from every URI in the project graph.
+        let scope = if sym.kind == SymbolKind::Server {
+            sym.scope.as_deref()
+        } else {
+            None
+        };
+        let matching_defs: Vec<Symbol> =
+            self.project_symbols(uri, &sym.name, &sym.kind, scope);
+
+        if include_declaration {
+            for def in &matching_defs {
+                let def_content = match self.documents.get(&def.uri) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let def_lines: Vec<&str> = def_content.lines().collect();
+                let def_line_idx = def.range.start.line as usize;
+                let search_from = def_lines
+                    .get(def_line_idx)
+                    .and_then(|raw| def_line_search_from(raw, &def.kind));
+                let (start_char, end_char) = def_lines
+                    .get(def_line_idx)
+                    .and_then(|raw| {
+                        find_identifier_range(raw, &def.name, search_from.unwrap_or(0))
+                    })
+                    .unwrap_or((def.range.start.character, def.range.end.character));
+                push_loc(
+                    &def.uri,
+                    def.range.start.line,
+                    start_char,
+                    end_char,
+                    &mut locs,
+                    &mut seen_locs,
+                );
+            }
+        }
+
+        // Aggregate references from every URI in the project graph.
+        let all_refs = self.project_references(uri, &sym.name, &sym.kind, scope);
+        for r in &all_refs {
+            let ref_content = match self.documents.get(&r.uri) {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            let ref_lines: Vec<&str> = ref_content.lines().collect();
+            let ref_line_idx = r.range.start.line as usize;
+            let base_search_from = ref_lines
+                .get(ref_line_idx)
+                .map(|raw| ref_line_search_from(raw, r));
+            let key = (r.uri.clone(), r.range.start.line, r.context.clone());
+            let precise = ref_context_has_precise_position(&r.context);
+            let floor = if precise {
+                None
+            } else {
+                ref_search_floor.get(&key).copied()
+            };
+            let search_from = match (base_search_from, floor) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(raw) = ref_lines.get(ref_line_idx) {
+                if let Some((s, e)) =
+                    find_identifier_range(raw, &sym.name, search_from.unwrap_or(0))
+                {
+                    push_loc(&r.uri, r.range.start.line, s, e, &mut locs, &mut seen_locs);
+                    if !precise {
+                        ref_search_floor.insert(key, e as usize);
+                    }
+                    continue;
+                }
+            }
+            push_loc(
+                &r.uri,
+                r.range.start.line,
+                r.range.start.character,
+                r.range.end.character,
+                &mut locs,
+                &mut seen_locs,
+            );
+        }
+
+        // Cascade stick-table references into section symbols. A
+        // backend/frontend/listen that owns a stick-table of the same name
+        // should surface call-site references when operators ask for
+        // references on the section itself.
+        if matches!(
+            sym.kind,
+            SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
+        ) {
+            let table_refs = self.project_references(uri, &sym.name, &SymbolKind::StickTable, None);
+            let table_defs = self.project_symbols(uri, &sym.name, &SymbolKind::StickTable, None);
+            if include_declaration {
+                for t in &table_defs {
+                    let t_content = match self.documents.get(&t.uri) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    let t_lines: Vec<&str> = t_content.lines().collect();
+                    let def_line_idx = t.range.start.line as usize;
+                    let end_char = t_lines
+                        .get(def_line_idx)
+                        .map(|l| l.len() as u32)
+                        .unwrap_or(t.range.end.character);
+                    push_loc(
+                        &t.uri,
+                        t.range.start.line,
+                        t.range.start.character,
+                        end_char,
+                        &mut locs,
+                        &mut seen_locs,
+                    );
+                }
+            }
+            for r in &table_refs {
+                let r_content = match self.documents.get(&r.uri) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let r_lines: Vec<&str> = r_content.lines().collect();
+                let ref_line_idx = r.range.start.line as usize;
+                let base_search_from = r_lines
+                    .get(ref_line_idx)
+                    .map(|raw| ref_line_search_from(raw, r));
+                let key = (r.uri.clone(), r.range.start.line, r.context.clone());
+                let precise = ref_context_has_precise_position(&r.context);
+                let floor = if precise {
+                    None
+                } else {
+                    ref_search_floor.get(&key).copied()
+                };
+                let search_from = match (base_search_from, floor) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                if let Some(raw) = r_lines.get(ref_line_idx) {
+                    if let Some((s, e)) =
+                        find_identifier_range(raw, &sym.name, search_from.unwrap_or(0))
+                    {
+                        push_loc(
+                            &r.uri,
+                            r.range.start.line,
+                            s,
+                            e,
+                            &mut locs,
+                            &mut seen_locs,
+                        );
+                        if !precise {
+                            ref_search_floor.insert(key, e as usize);
+                        }
+                        continue;
+                    }
+                }
+                push_loc(
+                    &r.uri,
+                    r.range.start.line,
+                    r.range.start.character,
+                    r.range.end.character,
+                    &mut locs,
+                    &mut seen_locs,
+                );
+            }
+        }
+
+        locs
+    }
+
     fn find_references_to_symbol_scoped(
         &self,
         uri: &str,
@@ -1802,28 +4288,16 @@ impl HaproxyLsp {
         symbol_kind: SymbolKind,
         scope: Option<&str>,
     ) -> Option<Vec<Reference>> {
-        // Single-file scope: look only in the requesting document.
-        let symbols = self.symbols.get(uri)?;
-        for symbol in symbols {
-            if symbol.name != symbol_name
-                || std::mem::discriminant(&symbol.kind)
-                    != std::mem::discriminant(&symbol_kind)
-            {
-                continue;
-            }
-            if let Some(want) = scope {
-                match symbol.scope.as_deref() {
-                    Some(have) if have == want => {}
-                    _ => continue,
-                }
-            }
-            if symbol.references.is_empty() {
-                return None;
-            } else {
-                return Some(symbol.references.clone());
-            }
+        // Project-wide scope: aggregate references from every URI in the
+        // include graph. `project_references` dedupes by (uri, line, col,
+        // context) so same-file references recorded on both
+        // `Symbol.references` and `raw_references` don't double-count.
+        let refs = self.project_references(uri, symbol_name, &symbol_kind, scope);
+        if refs.is_empty() {
+            None
+        } else {
+            Some(refs)
         }
-        None
     }
 
     /// Compute completion items for `textDocument/completion`.
@@ -2236,6 +4710,16 @@ impl HaproxyLsp {
 
         match method {
             "initialize" => {
+                // Capture workspace root from `initializationOptions.workspace_root`.
+                // Zed's extension glue (see `src/lib.rs`) forwards
+                // `worktree.root_path()` there so the LSP knows where to stop
+                // when walking up looking for `.zed/haproxy.toml`.
+                let opts = &request["params"]["initializationOptions"];
+                if let Some(root) = opts.get("workspace_root").and_then(|v| v.as_str()) {
+                    if !root.is_empty() {
+                        self.workspace_root = Some(PathBuf::from(root));
+                    }
+                }
                 Some(json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -2247,6 +4731,7 @@ impl HaproxyLsp {
                             "renameProvider": { "prepareProvider": true },
                             "foldingRangeProvider": true,
                             "documentSymbolProvider": true,
+                            "workspaceSymbolProvider": true,
                             "hoverProvider": true,
                             "completionProvider": {
                                 "triggerCharacters": [" ", "("],
@@ -2264,22 +4749,83 @@ impl HaproxyLsp {
                 let params = &request["params"];
                 let uri = params["textDocument"]["uri"].as_str()?;
                 let content = params["textDocument"]["text"].as_str()?;
-                
+
+                // Resolve and cache the project configuration for this file
+                // before parsing. Cross-file resolution (Task 5+) will read
+                // from this cache to decide which sibling files to pull in.
+                if let Some(file_path) = uri_to_path(uri) {
+                    let cfg = resolve_project_config_for_path(
+                        &file_path,
+                        self.workspace_root.as_deref(),
+                    );
+                    self.project_configs.insert(uri.to_string(), cfg);
+                }
+
+                // Mark this URI as a client-owned buffer so subsequent
+                // include-graph walks rooted elsewhere still trust the
+                // in-memory copy over on-disk content for unsaved edits.
+                self.explicitly_opened.insert(uri.to_string());
+
                 if let Err(_) = self.parse_document(uri, content) {
                     eprintln!("Failed to parse document: {}", uri);
                 }
-                
+
                 None // No response needed for notifications
             }
             "textDocument/didClose" => {
-                // Evict all per-URI caches so long-lived sessions don't grow
-                // unbounded as files are opened and closed.
+                // Evict the closed URI AND any auto-loaded siblings that were
+                // only resident because of its include graph. Without the
+                // follow-up orphan sweep, long-lived sessions accumulate
+                // stale siblings in `symbols`/`project_configs`, the project
+                // index keeps resurrecting them on rebuild, and
+                // `workspace/symbol` keeps returning them.
                 let params = &request["params"];
                 if let Some(uri) = params["textDocument"]["uri"].as_str() {
-                    self.symbols.remove(uri);
-                    self.folds.remove(uri);
-                    self.outline.remove(uri);
-                    self.documents.remove(uri);
+                    let closed_uri = uri.to_string();
+                    self.symbols.remove(&closed_uri);
+                    self.folds.remove(&closed_uri);
+                    self.outline.remove(&closed_uri);
+                    self.documents.remove(&closed_uri);
+                    self.diagnostics.remove(&closed_uri);
+                    self.raw_references.remove(&closed_uri);
+                    self.project_configs.remove(&closed_uri);
+                    self.included_files.remove(&closed_uri);
+                    self.entry_scopes.remove(&closed_uri);
+                    self.explicitly_opened.remove(&closed_uri);
+                    self.send_notification(
+                        "textDocument/publishDiagnostics",
+                        json!({ "uri": closed_uri, "diagnostics": [] }),
+                    );
+
+                    // Sweep orphaned siblings reachable only from the closed
+                    // root. Evicted URIs get an empty diagnostics push inside
+                    // the helper.
+                    self.evict_orphaned_siblings();
+
+                    // Rebuild the project index for each project root whose
+                    // membership still has at least one explicitly-opened
+                    // member, then republish diagnostics for the survivors so
+                    // cross-file rules (unused-backend / duplicate-section /
+                    // undefined-reference) reflect the new membership.
+                    let open_uris: Vec<String> =
+                        self.explicitly_opened.iter().cloned().collect();
+                    let mut rebuilt_roots: HashSet<String> = HashSet::new();
+                    for u in &open_uris {
+                        if let Some(cfg) = self.project_configs.get(u) {
+                            let key = cfg.project_root.to_string_lossy().into_owned();
+                            if rebuilt_roots.insert(key) {
+                                self.rebuild_project_index_for(u);
+                            }
+                        }
+                    }
+                    let surviving: Vec<String> = self
+                        .project_configs
+                        .keys()
+                        .cloned()
+                        .collect();
+                    for u in surviving {
+                        self.collect_diagnostics(&u);
+                    }
                 }
                 None
             }
@@ -2399,227 +4945,12 @@ impl HaproxyLsp {
                     .as_ref()
                     .and_then(|content| self.find_symbol_at_cursor(uri, &position, content));
 
-                let locations: Vec<Value> = if let (Some(sym), Some(content)) =
-                    (symbol, content_opt)
-                {
-                    // Narrow reference and declaration ranges to the identifier
-                    // token so clients like Zed highlight the symbol itself
-                    // rather than the whole line. Falls back to the stored
-                    // line-span range if the raw line can't be located or the
-                    // identifier can't be found in it.
-                    let lines: Vec<&str> = content.lines().collect();
-                    let mut locs: Vec<Value> = Vec::new();
-                    let mut seen_locs: std::collections::HashSet<(u32, u32)> =
-                        std::collections::HashSet::new();
-                    // Per-(line, context) next-search offset. A line may carry
-                    // the same symbol more than once (e.g. a stick-table
-                    // `... table rate ... sc0_*(rate) ...` or an ACL repeated
-                    // in a condition `if foo || foo`). Each recorded reference
-                    // must map to a distinct occurrence, so after every match
-                    // we advance the context-scoped search floor past its end.
-                    // Keying on context as well as line keeps independent
-                    // contexts on the same line (e.g. `use_backend foo if foo`)
-                    // from clobbering each other's offsets.
-                    let mut ref_search_floor: std::collections::HashMap<
-                        (u32, ReferenceContext),
-                        usize,
-                    > = std::collections::HashMap::new();
-                    let push_loc =
-                        |line_num: u32,
-                         start: u32,
-                         end: u32,
-                         locs: &mut Vec<Value>,
-                         seen: &mut std::collections::HashSet<(u32, u32)>| {
-                            if seen.insert((line_num, start)) {
-                                locs.push(json!({
-                                    "uri": sym.uri,
-                                    "range": {
-                                        "start": { "line": line_num, "character": start },
-                                        "end": { "line": line_num, "character": end },
-                                    }
-                                }));
-                            }
-                        };
-                    let push_narrow = |line_num: u32,
-                                           stored_start: &Position,
-                                           stored_end: &Position,
-                                           name: &str,
-                                           search_from_hint: Option<usize>,
-                                           locs: &mut Vec<Value>,
-                                           seen: &mut std::collections::HashSet<(u32, u32)>| {
-                        let (start_char, end_char) = lines
-                            .get(line_num as usize)
-                            .and_then(|raw| {
-                                let start = search_from_hint.unwrap_or(0);
-                                find_identifier_range(raw, name, start)
-                            })
-                            .unwrap_or((stored_start.character, stored_end.character));
-                        push_loc(line_num, start_char, end_char, locs, seen);
-                    };
-
-                    // Collect all definition lines with the same name/kind
-                    // (+scope for servers). Multiple ACL declarations share
-                    // the same name — every one of them is a declaration and
-                    // must surface when `includeDeclaration=true`.
-                    let matching_defs: Vec<Symbol> = self
-                        .symbols
-                        .get(uri)
-                        .map(|syms| {
-                            syms.iter()
-                                .filter(|s| {
-                                    s.name == sym.name
-                                        && s.kind == sym.kind
-                                        && (sym.kind != SymbolKind::Server
-                                            || s.scope == sym.scope)
-                                })
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
-                    if include_declaration {
-                        for def in &matching_defs {
-                            let def_line_idx = def.range.start.line as usize;
-                            let search_from = lines
-                                .get(def_line_idx)
-                                .and_then(|raw| def_line_search_from(raw, &def.kind));
-                            push_narrow(
-                                def.range.start.line,
-                                &def.range.start,
-                                &def.range.end,
-                                &def.name,
-                                search_from,
-                                &mut locs,
-                                &mut seen_locs,
-                            );
-                        }
-                    }
-                    for r in &sym.references {
-                        let ref_line_idx = r.range.start.line as usize;
-                        let base_search_from = lines
-                            .get(ref_line_idx)
-                            .map(|raw| ref_line_search_from(raw, r));
-                        let key = (r.range.start.line, r.context.clone());
-                        let precise = ref_context_has_precise_position(&r.context);
-                        let floor = if precise {
-                            None
-                        } else {
-                            ref_search_floor.get(&key).copied()
-                        };
-                        let search_from = match (base_search_from, floor) {
-                            (Some(a), Some(b)) => Some(a.max(b)),
-                            (Some(a), None) => Some(a),
-                            (None, Some(b)) => Some(b),
-                            (None, None) => None,
-                        };
-                        if let Some(raw) = lines.get(ref_line_idx) {
-                            if let Some((s, e)) = find_identifier_range(
-                                raw,
-                                &sym.name,
-                                search_from.unwrap_or(0),
-                            ) {
-                                push_loc(
-                                    r.range.start.line,
-                                    s,
-                                    e,
-                                    &mut locs,
-                                    &mut seen_locs,
-                                );
-                                if !precise {
-                                    ref_search_floor.insert(key, e as usize);
-                                }
-                                continue;
-                            }
-                        }
-                        push_narrow(
-                            r.range.start.line,
-                            &r.range.start,
-                            &r.range.end,
-                            &sym.name,
-                            search_from,
-                            &mut locs,
-                            &mut seen_locs,
-                        );
-                    }
-
-                    // Cascade stick-table references into section symbols.
-                    // A backend/frontend/listen that owns a stick-table is
-                    // conceptually one name; references like `sc0_*(X)` and
-                    // `... table X` target the table, but operators expect
-                    // them to surface when asking for references on the
-                    // enclosing section of the same name.
-                    if matches!(
-                        sym.kind,
-                        SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
-                    ) {
-                        if let Some(table) =
-                            self.find_symbol_by_name(uri, &sym.name, SymbolKind::StickTable)
-                        {
-                            if include_declaration {
-                                let def_line_idx = table.range.start.line as usize;
-                                // Stick-table def line has no identifier to
-                                // anchor on; fall through to the stored range.
-                                push_loc(
-                                    table.range.start.line,
-                                    table.range.start.character,
-                                    lines
-                                        .get(def_line_idx)
-                                        .map(|l| l.len() as u32)
-                                        .unwrap_or(table.range.end.character),
-                                    &mut locs,
-                                    &mut seen_locs,
-                                );
-                            }
-                            for r in &table.references {
-                                let ref_line_idx = r.range.start.line as usize;
-                                let base_search_from = lines
-                                    .get(ref_line_idx)
-                                    .map(|raw| ref_line_search_from(raw, r));
-                                let key = (r.range.start.line, r.context.clone());
-                                let precise = ref_context_has_precise_position(&r.context);
-                                let floor = if precise {
-                                    None
-                                } else {
-                                    ref_search_floor.get(&key).copied()
-                                };
-                                let search_from = match (base_search_from, floor) {
-                                    (Some(a), Some(b)) => Some(a.max(b)),
-                                    (Some(a), None) => Some(a),
-                                    (None, Some(b)) => Some(b),
-                                    (None, None) => None,
-                                };
-                                if let Some(raw) = lines.get(ref_line_idx) {
-                                    if let Some((s, e)) = find_identifier_range(
-                                        raw,
-                                        &table.name,
-                                        search_from.unwrap_or(0),
-                                    ) {
-                                        push_loc(
-                                            r.range.start.line,
-                                            s,
-                                            e,
-                                            &mut locs,
-                                            &mut seen_locs,
-                                        );
-                                        if !precise {
-                                            ref_search_floor.insert(key, e as usize);
-                                        }
-                                        continue;
-                                    }
-                                }
-                                push_narrow(
-                                    r.range.start.line,
-                                    &r.range.start,
-                                    &r.range.end,
-                                    &table.name,
-                                    search_from,
-                                    &mut locs,
-                                    &mut seen_locs,
-                                );
-                            }
-                        }
-                    }
-
+                let locations: Vec<Value> = if let Some(sym) = symbol {
+                    let locs = self.build_references_locations(
+                        uri,
+                        &sym,
+                        include_declaration,
+                    );
                     locs
                 } else {
                     Vec::new()
@@ -2781,34 +5112,39 @@ impl HaproxyLsp {
                     }));
                 }
 
-                let lines: Vec<&str> = content.lines().collect();
-                let mut edits: Vec<Value> = Vec::new();
-                // Dedup by (line, start) so identical edits from duplicate
-                // reference entries (e.g. the same ACL appearing twice in a
-                // condition) don't produce overlapping TextEdits, which
-                // violates the LSP WorkspaceEdit invariant.
-                let mut seen: std::collections::HashSet<(u32, u32)> =
-                    std::collections::HashSet::new();
-                // Per-(line, context) next-search offset. A line may carry
-                // the same symbol more than once (`... table rate ...
-                // sc0_*(rate) ...`, `if foo || foo`). Each recorded reference
-                // must map to its own occurrence; without advancing a
-                // per-context floor past the previous match, all duplicate
-                // same-name references on a line collapse onto the first
-                // occurrence and the second/third/… stay stale after rename.
-                let mut ref_search_floor: std::collections::HashMap<
-                    (u32, ReferenceContext),
-                    usize,
-                > = std::collections::HashMap::new();
-                let mut push_edit = |line: u32, start: u32, end: u32, edits: &mut Vec<Value>| {
-                    if seen.insert((line, start)) {
-                        edits.push(json!({
-                            "range": {
-                                "start": { "line": line, "character": start },
-                                "end": { "line": line, "character": end },
-                            },
-                            "newText": new_name,
-                        }));
+                // Per-URI edit buckets so the resulting `WorkspaceEdit.changes`
+                // map has one entry per affected file. Definitions and
+                // references may live in separate include-graph files — each
+                // contributes its own `TextEdit[]` keyed by its URI.
+                let mut edits_by_uri: HashMap<String, Vec<Value>> = HashMap::new();
+                // Dedup by (uri, line, start) so identical edits from
+                // duplicate reference entries never produce overlapping
+                // TextEdits, violating the LSP WorkspaceEdit invariant.
+                let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
+                // Per-(uri, line, context) next-search offset. A line may
+                // carry the same symbol more than once; each recorded
+                // reference must map to its own occurrence.
+                let mut ref_search_floor: HashMap<(String, u32, ReferenceContext), usize> =
+                    HashMap::new();
+
+                let new_name_owned = new_name.to_string();
+                let push_edit = |loc_uri: &str,
+                                      line: u32,
+                                      start: u32,
+                                      end: u32,
+                                      edits_by_uri: &mut HashMap<String, Vec<Value>>,
+                                      seen: &mut HashSet<(String, u32, u32)>| {
+                    if seen.insert((loc_uri.to_string(), line, start)) {
+                        edits_by_uri
+                            .entry(loc_uri.to_string())
+                            .or_default()
+                            .push(json!({
+                                "range": {
+                                    "start": { "line": line, "character": start },
+                                    "end": { "line": line, "character": end },
+                                },
+                                "newText": new_name_owned,
+                            }));
                     }
                 };
 
@@ -2818,49 +5154,58 @@ impl HaproxyLsp {
                 // partial rename would leave an orphan declaration and
                 // silently break the config. For servers the match also
                 // scope-filters by enclosing section so two backends with a
-                // same-named server stay independent.
-                let all_defs: Vec<(u32, String)> = self
-                    .symbols
-                    .get(uri)
-                    .map(|syms| {
-                        syms.iter()
-                            .filter(|s| {
-                                s.name == symbol.name
-                                    && s.kind == symbol.kind
-                                    && (symbol.kind != SymbolKind::Server
-                                        || s.scope == symbol.scope)
-                            })
-                            .map(|s| (s.range.start.line, s.name.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (def_line_num, _) in &all_defs {
-                    let def_line_idx = *def_line_num as usize;
-                    if def_line_idx >= lines.len() {
-                        continue;
-                    }
-                    let def_line = lines[def_line_idx];
+                // same-named server stay independent. With cross-file
+                // resolution, definitions may live in any project file.
+                let scope_for_match = if symbol.kind == SymbolKind::Server {
+                    symbol.scope.as_deref()
+                } else {
+                    None
+                };
+                let all_defs = self.project_symbols(uri, &symbol.name, &symbol.kind, scope_for_match);
+                for def in &all_defs {
+                    let def_content = match self.documents.get(&def.uri) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    let def_lines: Vec<&str> = def_content.lines().collect();
+                    let def_line_idx = def.range.start.line as usize;
+                    let def_line = match def_lines.get(def_line_idx) {
+                        Some(l) => *l,
+                        None => continue,
+                    };
                     if let Some(search_from) = def_line_search_from(def_line, &symbol.kind) {
                         if let Some((s, e)) =
                             find_identifier_range(def_line, &symbol.name, search_from)
                         {
-                            push_edit(*def_line_num, s, e, &mut edits);
+                            push_edit(
+                                &def.uri,
+                                def.range.start.line,
+                                s,
+                                e,
+                                &mut edits_by_uri,
+                                &mut seen,
+                            );
                         }
                     }
                 }
 
-                // Reference edits. Advance per-(line, context) floor after
-                // each match so multiple same-context references on one line
-                // pick up successive occurrences instead of collapsing onto
-                // the first.
-                for r in &symbol.references {
+                // Reference edits across all project files. Advance per-(uri,
+                // line, context) floor after each match so duplicates on the
+                // same line pick up successive occurrences.
+                let all_refs = self.project_references(uri, &symbol.name, &symbol.kind, scope_for_match);
+                for r in &all_refs {
+                    let ref_content = match self.documents.get(&r.uri) {
+                        Some(c) => c.clone(),
+                        None => continue,
+                    };
+                    let ref_lines: Vec<&str> = ref_content.lines().collect();
                     let ref_line_idx = r.range.start.line as usize;
-                    if ref_line_idx >= lines.len() {
-                        continue;
-                    }
-                    let ref_line = lines[ref_line_idx];
+                    let ref_line = match ref_lines.get(ref_line_idx) {
+                        Some(l) => *l,
+                        None => continue,
+                    };
                     let base_search_from = ref_line_search_from(ref_line, r);
-                    let key = (r.range.start.line, r.context.clone());
+                    let key = (r.uri.clone(), r.range.start.line, r.context.clone());
                     let precise = ref_context_has_precise_position(&r.context);
                     let search_from = if precise {
                         base_search_from
@@ -2871,61 +5216,76 @@ impl HaproxyLsp {
                     if let Some((s, e)) =
                         find_identifier_range(ref_line, &symbol.name, search_from)
                     {
-                        push_edit(r.range.start.line, s, e, &mut edits);
+                        push_edit(
+                            &r.uri,
+                            r.range.start.line,
+                            s,
+                            e,
+                            &mut edits_by_uri,
+                            &mut seen,
+                        );
                         if !precise {
                             ref_search_floor.insert(key, e as usize);
                         }
                     }
                 }
 
-                // Cascade stick-table references into section renames.
-                // The stick-table is bound to the enclosing section's name,
-                // so renaming the section must also rewrite every
-                // `sc*_*(X)` / `... table X` / `stick on ... table X`
-                // call-site that names the section's table. Without this,
-                // renaming the section silently leaves call-sites pointing
-                // at a non-existent table.
+                // Cascade stick-table references into section renames. The
+                // stick-table is bound to the enclosing section's name, so
+                // renaming the section must also rewrite every call-site
+                // that names the section's table across every file.
                 if matches!(
                     symbol.kind,
                     SymbolKind::Backend | SymbolKind::Frontend | SymbolKind::Listen
                 ) {
-                    if let Some(table) =
-                        self.find_symbol_by_name(uri, &symbol.name, SymbolKind::StickTable)
-                    {
-                        for r in &table.references {
-                            let ref_line_idx = r.range.start.line as usize;
-                            if ref_line_idx >= lines.len() {
-                                continue;
-                            }
-                            let ref_line = lines[ref_line_idx];
-                            let base_search_from = ref_line_search_from(ref_line, r);
-                            let key = (r.range.start.line, r.context.clone());
-                            let precise = ref_context_has_precise_position(&r.context);
-                            let search_from = if precise {
-                                base_search_from
-                            } else {
-                                let floor = ref_search_floor.get(&key).copied().unwrap_or(0);
-                                base_search_from.max(floor)
-                            };
-                            if let Some((s, e)) =
-                                find_identifier_range(ref_line, &table.name, search_from)
-                            {
-                                push_edit(r.range.start.line, s, e, &mut edits);
-                                if !precise {
-                                    ref_search_floor.insert(key, e as usize);
-                                }
+                    let table_refs = self.project_references(uri, &symbol.name, &SymbolKind::StickTable, None);
+                    for r in &table_refs {
+                        let ref_content = match self.documents.get(&r.uri) {
+                            Some(c) => c.clone(),
+                            None => continue,
+                        };
+                        let ref_lines: Vec<&str> = ref_content.lines().collect();
+                        let ref_line_idx = r.range.start.line as usize;
+                        let ref_line = match ref_lines.get(ref_line_idx) {
+                            Some(l) => *l,
+                            None => continue,
+                        };
+                        let base_search_from = ref_line_search_from(ref_line, r);
+                        let key = (r.uri.clone(), r.range.start.line, r.context.clone());
+                        let precise = ref_context_has_precise_position(&r.context);
+                        let search_from = if precise {
+                            base_search_from
+                        } else {
+                            let floor = ref_search_floor.get(&key).copied().unwrap_or(0);
+                            base_search_from.max(floor)
+                        };
+                        if let Some((s, e)) =
+                            find_identifier_range(ref_line, &symbol.name, search_from)
+                        {
+                            push_edit(
+                                &r.uri,
+                                r.range.start.line,
+                                s,
+                                e,
+                                &mut edits_by_uri,
+                                &mut seen,
+                            );
+                            if !precise {
+                                ref_search_floor.insert(key, e as usize);
                             }
                         }
                     }
                 }
 
+                let changes: serde_json::Map<String, Value> = edits_by_uri
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::Array(v)))
+                    .collect();
                 Some(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
-                        "changes": {
-                            uri: edits,
-                        }
+                        "changes": changes,
                     }
                 }))
             }
@@ -3030,6 +5390,167 @@ impl HaproxyLsp {
                     }))
                 }
             }
+            "workspace/symbol" => {
+                // Enumerate every symbol known to the server (all URIs in the
+                // per-file `symbols` cache — populated on didOpen and by the
+                // include-graph walker for sibling files). Case-insensitive
+                // substring match on `query`; an empty query returns up to
+                // `WORKSPACE_SYMBOL_CAP` entries so Zed can stream.
+                let params = &request["params"];
+                let query = params["query"].as_str().unwrap_or("");
+                let lower = query.to_lowercase();
+                let cap = WORKSPACE_SYMBOL_CAP;
+
+                // Stable ordering: URIs lexically ascending, then definition
+                // line within each URI. Matches the projectIndex introspection
+                // schema so cross-test comparisons stay deterministic.
+                let mut uris: Vec<String> = self.symbols.keys().cloned().collect();
+                uris.sort();
+
+                let mut items: Vec<Value> = Vec::new();
+                'outer: for uri in &uris {
+                    let syms = match self.symbols.get(uri) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    for s in syms {
+                        if !lower.is_empty() {
+                            if !s.name.to_lowercase().contains(&lower) {
+                                continue;
+                            }
+                        }
+                        let container = match s.kind {
+                            // Server carries its enclosing section in `scope`.
+                            SymbolKind::Server => s.scope.clone(),
+                            // ACL / StickTable identity is section-local but
+                            // not stored on the symbol — recover it by
+                            // scanning the per-URI symbol list for the most
+                            // recent Backend/Frontend/Listen at or above the
+                            // child's line.
+                            SymbolKind::Acl | SymbolKind::StickTable => {
+                                self.enclosing_section_for_uri(uri, s.range.start.line)
+                            }
+                            _ => None,
+                        };
+                        let mut entry = json!({
+                            "name": s.name,
+                            "kind": lsp_symbol_kind(&s.kind),
+                            "location": {
+                                "uri": s.uri,
+                                "range": {
+                                    "start": {
+                                        "line": s.range.start.line,
+                                        "character": s.range.start.character,
+                                    },
+                                    "end": {
+                                        "line": s.range.end.line,
+                                        "character": s.range.end.character,
+                                    },
+                                },
+                            },
+                        });
+                        if let Some(c) = container {
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("containerName".to_string(), Value::String(c));
+                            }
+                        }
+                        items.push(entry);
+                        if items.len() >= cap {
+                            break 'outer;
+                        }
+                    }
+                }
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": items,
+                }))
+            }
+            "$/haproxy/projectIndex" => {
+                // Introspection request used by the test harness to verify the
+                // cross-file symbol index. Returns the project root, the list
+                // of URIs in the include graph, and a flat list of every
+                // symbol aggregated across them. Emitted as stable-sorted by
+                // URI then by (line, character) so tests can compare
+                // deterministically.
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                let root_key = self
+                    .project_configs
+                    .get(uri)
+                    .map(|cfg| cfg.project_root.to_string_lossy().into_owned());
+                let result = match root_key.as_deref().and_then(|k| self.project_indices.get(k)) {
+                    Some(idx) => {
+                        let mut symbols: Vec<Value> = Vec::new();
+                        for ((kind, name), refs) in &idx.symbols_by_name {
+                            for r in refs {
+                                symbols.push(json!({
+                                    "name": name,
+                                    "kind": symbol_kind_name(kind),
+                                    "uri": r.uri,
+                                    "range": {
+                                        "start": { "line": r.range.start.line, "character": r.range.start.character },
+                                        "end": { "line": r.range.end.line, "character": r.range.end.character },
+                                    },
+                                    "scope": r.scope,
+                                }));
+                            }
+                        }
+                        symbols.sort_by(|a, b| {
+                            let au = a["uri"].as_str().unwrap_or("");
+                            let bu = b["uri"].as_str().unwrap_or("");
+                            au.cmp(bu)
+                                .then_with(|| {
+                                    a["range"]["start"]["line"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        .cmp(&b["range"]["start"]["line"].as_u64().unwrap_or(0))
+                                })
+                                .then_with(|| {
+                                    a["range"]["start"]["character"]
+                                        .as_u64()
+                                        .unwrap_or(0)
+                                        .cmp(&b["range"]["start"]["character"].as_u64().unwrap_or(0))
+                                })
+                        });
+                        json!({
+                            "project_root": idx.project_root.to_string_lossy(),
+                            "uris": idx.uris,
+                            "symbols": symbols,
+                        })
+                    }
+                    None => Value::Null,
+                };
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+            }
+            "$/haproxy/projectInfo" => {
+                // Introspection request used by the test harness to verify
+                // project-config discovery. Returns the cached `ProjectConfig`
+                // for the given URI, or a `null` result if the file was never
+                // opened / has been closed.
+                let params = &request["params"];
+                let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
+                let result = match self.project_configs.get(uri) {
+                    Some(cfg) => json!({
+                        "project_root": cfg.project_root.to_string_lossy(),
+                        "follow_includes": cfg.follow_includes,
+                        "extra_files": cfg.extra_files,
+                        "config_file": cfg.config_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        "workspace_root": self.workspace_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    }),
+                    None => Value::Null,
+                };
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                }))
+            }
             _ => {
                 // LSP requests (those with a non-null `id`) require a response;
                 // notifications (null id) do not. Reply with method-not-found
@@ -3055,6 +5576,12 @@ impl HaproxyLsp {
 // Cap per-message size to avoid unbounded allocation on malicious/malformed
 // Content-Length. 64 MiB is far larger than any reasonable HAProxy config.
 const MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
+
+// Upper bound on `workspace/symbol` results. An empty query must return
+// something streamable rather than dumping an arbitrary count — real-world
+// configs top out at a few thousand symbols, so 1000 is a reasonable ceiling
+// for the fuzzy-search pane without flooding the wire.
+const WORKSPACE_SYMBOL_CAP: usize = 1000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lsp = HaproxyLsp::new()?;
@@ -3117,12 +5644,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Parse JSON-RPC request
         if let Ok(request) = serde_json::from_str::<Value>(&content) {
-            if let Some(response) = lsp.handle_request(request) {
+            let response = lsp.handle_request(request);
+            if let Some(response) = response {
                 let response_str = serde_json::to_string(&response)?;
                 let response_len = response_str.len();
 
                 // Write LSP response with headers
                 write!(stdout, "Content-Length: {}\r\n\r\n{}", response_len, response_str)?;
+                stdout.flush()?;
+            }
+            // Drain any notifications queued by the handler (e.g.
+            // `textDocument/publishDiagnostics` emitted from `parse_document`).
+            // Written after the response so request/response ordering stays
+            // intact; stdout is single-writer so framing is never interleaved.
+            for notification in lsp.drain_notifications() {
+                let msg = serde_json::to_string(&notification)?;
+                let msg_len = msg.len();
+                write!(stdout, "Content-Length: {}\r\n\r\n{}", msg_len, msg)?;
                 stdout.flush()?;
             }
         }

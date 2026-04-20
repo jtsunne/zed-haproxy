@@ -26,6 +26,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BINARY = REPO_ROOT / "bin" / "haproxy-lsp"
 HAPROXY_CONF = REPO_ROOT / "test" / "haproxy.conf"
 HAPROXY_CFG = REPO_ROOT / "test" / "haproxy.prod.cfg"
+FRAGMENTS_DIR = REPO_ROOT / "test" / "fragments"
+FRAGMENTS_MAIN = FRAGMENTS_DIR / "main.cfg"
+FRAGMENTS_BACKENDS = FRAGMENTS_DIR / "backends.cfg"
+FRAGMENTS_TOML = FRAGMENTS_DIR / ".zed" / "haproxy.toml"
+# Scoped-include fixture: a root file whose `.include` sits inside a backend
+# body, pointing at a header-less fragment. Exercises inheritance of the
+# enclosing section scope across include boundaries.
+FRAGMENTS_SCOPED_MAIN = FRAGMENTS_DIR / "scoped-main.cfg"
+FRAGMENTS_SCOPED_SERVERS = FRAGMENTS_DIR / "scoped-servers.cfg"
 
 
 def path_to_uri(path: Path) -> str:
@@ -45,6 +54,12 @@ class LspClient:
         )
         self._next_id = 1
         self._responses: dict[int, dict] = {}
+        # Latest `publishDiagnostics` payload per URI, plus a monotonically
+        # increasing version that bumps on every update. Tests call
+        # `wait_for_diagnostics(uri, min_version=...)` after a did_open /
+        # did_change to wait for the *next* publish rather than stale state.
+        self._diagnostics: dict[str, list[dict]] = {}
+        self._diagnostics_version: dict[str, int] = {}
         self._lock = threading.Lock()
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
@@ -96,6 +111,16 @@ class LspClient:
             if "id" in msg and msg.get("id") is not None:
                 with self._lock:
                     self._responses[int(msg["id"])] = msg
+            elif msg.get("method") == "textDocument/publishDiagnostics":
+                params = msg.get("params") or {}
+                uri = params.get("uri")
+                if isinstance(uri, str):
+                    diags = params.get("diagnostics") or []
+                    with self._lock:
+                        self._diagnostics[uri] = diags
+                        self._diagnostics_version[uri] = (
+                            self._diagnostics_version.get(uri, 0) + 1
+                        )
 
     def _send(self, payload: dict):
         body = json.dumps(payload).encode("utf-8")
@@ -120,8 +145,35 @@ class LspClient:
     def notify(self, method: str, params: dict):
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
-    def initialize(self):
-        return self.request("initialize", {"capabilities": {}})
+    def diagnostics_version(self, uri: str) -> int:
+        with self._lock:
+            return self._diagnostics_version.get(uri, 0)
+
+    def wait_for_diagnostics(
+        self, uri: str, min_version: int = 1, timeout: float = 3.0
+    ) -> list[dict]:
+        """Block until a `publishDiagnostics` for `uri` with version >=
+        `min_version` arrives, then return its `diagnostics` array.
+
+        Call `diagnostics_version(uri)` before sending a did_open / did_change
+        to snapshot the pre-publish version, then pass `snapshot + 1` here.
+        Raises TimeoutError on timeout."""
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._diagnostics_version.get(uri, 0) >= min_version:
+                    return list(self._diagnostics.get(uri, []))
+            time.sleep(0.01)
+        raise TimeoutError(
+            f"No publishDiagnostics v>={min_version} for {uri} within {timeout}s"
+        )
+
+    def initialize(self, workspace_root: str | None = None):
+        params: dict = {"capabilities": {}}
+        if workspace_root is not None:
+            params["initializationOptions"] = {"workspace_root": workspace_root}
+        return self.request("initialize", params)
 
     def initialized(self):
         self.notify("initialized", {})
@@ -137,6 +189,12 @@ class LspClient:
                     "text": text,
                 }
             },
+        )
+
+    def did_close(self, uri: str):
+        self.notify(
+            "textDocument/didClose",
+            {"textDocument": {"uri": uri}},
         )
 
     def shutdown(self):
@@ -1887,6 +1945,191 @@ def run_completion_probes(client: LspClient, results: Results):
         )
 
 
+DIAGNOSTICS_PROBES: list[dict] = [
+    # Task 2: undefined-reference errors against test/haproxy.conf fixtures
+    # appended below the `# --- regression: undefined-reference diagnostics` marker.
+    # Range tuple: (line, start_char, end_char). Severity 1 = Error.
+    {
+        "desc": "conf: undefined-backend on `use_backend diag_missing_backend`",
+        "code": "undefined-backend",
+        "severity": 1,
+        "range": (181, 14, 181, 34),
+        "message_contains": "diag_missing_backend",
+    },
+    {
+        "desc": "conf: undefined-backend on `default_backend diag_missing_backend2`",
+        "code": "undefined-backend",
+        "severity": 1,
+        "range": (182, 18, 182, 39),
+        "message_contains": "diag_missing_backend2",
+    },
+    {
+        "desc": "conf: undefined-acl on `if diag_missing_acl`",
+        "code": "undefined-acl",
+        "severity": 1,
+        "range": (183, 33, 183, 49),
+        "message_contains": "diag_missing_acl",
+    },
+    {
+        "desc": "conf: undefined-server on `use_server diag_missing_srv`",
+        "code": "undefined-server",
+        "severity": 1,
+        "range": (188, 13, 188, 29),
+        "message_contains": "diag_missing_srv",
+    },
+    # Task 3: unused-symbol / duplicate / structural diagnostics.
+    {
+        "desc": "conf: unused-backend on `backend diag_unused_backend`",
+        "code": "unused-backend",
+        "severity": 2,
+        "range": (192, 8, 192, 27),
+        "message_contains": "diag_unused_backend",
+    },
+    {
+        "desc": "conf: unused-acl on `acl diag_unused_acl`",
+        "code": "unused-acl",
+        "severity": 2,
+        "range": (199, 6, 199, 21),
+        "message_contains": "diag_unused_acl",
+    },
+    {
+        "desc": "conf: duplicate-section on second `backend diag_dup_section`",
+        "code": "duplicate-section",
+        "severity": 1,
+        "range": (206, 8, 206, 24),
+        "message_contains": "diag_dup_section",
+    },
+    {
+        "desc": "conf: duplicate-acl on repeated `acl diag_dup_acl`",
+        "code": "duplicate-acl",
+        "severity": 1,
+        "range": (214, 6, 214, 18),
+        "message_contains": "diag_dup_acl",
+    },
+    {
+        "desc": "conf: missing-default-backend on `frontend diag_no_backend_frontend`",
+        "code": "missing-default-backend",
+        "severity": 2,
+        "range": (217, 9, 217, 33),
+        "message_contains": "diag_no_backend_frontend",
+    },
+]
+
+
+def _diag_range_tuple(diag: dict) -> tuple:
+    r = diag.get("range") or {}
+    s = r.get("start") or {}
+    e = r.get("end") or {}
+    return (s.get("line"), s.get("character"), e.get("line"), e.get("character"))
+
+
+def run_diagnostics_probes(client: LspClient, results: Results):
+    """Drive `textDocument/publishDiagnostics` and assert observed payloads.
+
+    Task 1 baseline: every clean file publishes an empty diagnostics array.
+    Task 2 adds undefined-reference assertions against test/haproxy.conf
+    — each probe matches by (code, severity, range, message substring).
+    Task 3 will extend this with unused-symbol and structural probes.
+    """
+    # Use an inline minimal config so this probe stays stable even as the
+    # on-disk fixtures gain intentionally-broken lines in later tasks.
+    clean_cfg = (
+        "global\n"
+        "    daemon\n"
+        "\n"
+        "defaults\n"
+        "    mode http\n"
+        "\n"
+        "backend web\n"
+        "    server s1 127.0.0.1:8080\n"
+        "\n"
+        "frontend fe\n"
+        "    bind *:80\n"
+        "    default_backend web\n"
+    )
+    fake_uri = "file:///tmp/haproxy-lsp-diag-clean.cfg"
+
+    prev_version = client.diagnostics_version(fake_uri)
+    client.did_open(fake_uri, clean_cfg)
+    try:
+        diags = client.wait_for_diagnostics(fake_uri, min_version=prev_version + 1)
+    except TimeoutError as exc:
+        results.record("diagnostics", "clean file publishes empty array", False, str(exc))
+        return
+
+    ok = diags == []
+    detail = "empty array as expected" if ok else f"unexpected diagnostics: {diags!r}"
+    results.record("diagnostics", "clean file publishes empty array", ok, detail)
+
+    # Task 2: fixture-driven undefined-reference probes.
+    if not DIAGNOSTICS_PROBES:
+        return
+    if not HAPROXY_CONF.exists():
+        results.record(
+            "diagnostics", "fixture present", False, f"missing: {HAPROXY_CONF}"
+        )
+        return
+
+    conf_uri = path_to_uri(HAPROXY_CONF)
+    prev_version = client.diagnostics_version(conf_uri)
+    client.did_open(conf_uri, HAPROXY_CONF.read_text())
+    try:
+        conf_diags = client.wait_for_diagnostics(conf_uri, min_version=prev_version + 1)
+    except TimeoutError as exc:
+        results.record("diagnostics", "conf fixture publish", False, str(exc))
+        return
+
+    for probe in DIAGNOSTICS_PROBES:
+        expected_range = probe["range"]
+        match = None
+        for d in conf_diags:
+            if d.get("code") != probe["code"]:
+                continue
+            if d.get("severity") != probe["severity"]:
+                continue
+            if _diag_range_tuple(d) != expected_range:
+                continue
+            if "message_contains" in probe:
+                msg = d.get("message") or ""
+                if probe["message_contains"] not in msg:
+                    continue
+            match = d
+            break
+
+        if match is not None:
+            src = match.get("source")
+            ok = src == "haproxy-lsp"
+            detail = (
+                f"matched code={probe['code']} range={expected_range} source={src!r}"
+                if ok
+                else f"matched but source={src!r} (expected 'haproxy-lsp')"
+            )
+            results.record("diagnostics", probe["desc"], ok, detail)
+        else:
+            candidates = [
+                (d.get("code"), _diag_range_tuple(d)) for d in conf_diags
+            ]
+            results.record(
+                "diagnostics",
+                probe["desc"],
+                False,
+                f"no match for code={probe['code']} range={expected_range}; got {candidates}",
+            )
+
+    # Assert `TRUE` built-in ACL (line 188) is NOT flagged as undefined-acl.
+    true_flagged = any(
+        d.get("code") == "undefined-acl"
+        and (d.get("range") or {}).get("start", {}).get("line") == 188
+        for d in conf_diags
+    )
+    results.record(
+        "diagnostics",
+        "conf: built-in `TRUE` ACL is not flagged as undefined",
+        not true_flagged,
+        "not flagged" if not true_flagged else "unexpectedly flagged",
+    )
+
+
 def run_declaration_probes(client: LspClient, results: Results):
     if not DECLARATION_PROBES:
         return
@@ -1929,6 +2172,1235 @@ def run_declaration_probes(client: LspClient, results: Results):
         results.record("declaration", probe["desc"], ok, detail)
 
 
+def run_project_info_probes(client: LspClient, results: Results):
+    """Exercise `$/haproxy/projectInfo` against the `test/fragments/` fixture.
+
+    Opening `main.cfg` must resolve the project root through the fixture's
+    `.zed/haproxy.toml`; the cached config must then be readable via the
+    introspection request. These assertions cover Task 4's discovery path;
+    Task 5+ will layer on cross-file index assertions over the same fixture.
+    """
+    if not FRAGMENTS_MAIN.exists():
+        results.record("project-info", "fragments fixture present", False, f"missing: {FRAGMENTS_MAIN}")
+        return
+
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+    try:
+        resp = client.request(
+            "$/haproxy/projectInfo",
+            {"textDocument": {"uri": main_uri}},
+        )
+    except TimeoutError as exc:
+        results.record("project-info", "projectInfo request returns", False, str(exc))
+        return
+
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        results.record(
+            "project-info",
+            "projectInfo payload is an object",
+            False,
+            f"got {type(result).__name__}: {result!r}",
+        )
+        return
+
+    # Project root resolves relative to the config file's parent (the
+    # fragments dir), with `project_root = "."` in the TOML.
+    expected_root = str(FRAGMENTS_DIR.resolve())
+    actual_root = Path(result.get("project_root", "")).resolve()
+    ok = str(actual_root) == expected_root
+    results.record(
+        "project-info",
+        "fragments project_root resolves to fragments dir",
+        ok,
+        f"got {actual_root}" if ok else f"expected {expected_root}, got {actual_root}",
+    )
+
+    results.record(
+        "project-info",
+        "fragments follow_includes == true",
+        result.get("follow_includes") is True,
+        f"got {result.get('follow_includes')!r}",
+    )
+
+    extra = result.get("extra_files") or []
+    ok_extra = extra == ["extras/*.cfg"]
+    results.record(
+        "project-info",
+        "fragments extra_files parsed from TOML",
+        ok_extra,
+        f"got {extra!r}",
+    )
+
+    expected_cfg = str(FRAGMENTS_TOML.resolve())
+    actual_cfg = result.get("config_file")
+    ok_cfg = isinstance(actual_cfg, str) and str(Path(actual_cfg).resolve()) == expected_cfg
+    results.record(
+        "project-info",
+        "fragments config_file points to .zed/haproxy.toml",
+        ok_cfg,
+        f"got {actual_cfg!r}",
+    )
+
+    # When no config file is discoverable, the defaults must apply and
+    # `project_root` falls back to the opened file's directory.
+    from tempfile import TemporaryDirectory
+    with TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / "loose.cfg"
+        tmp_path.write_text("backend loose\n    server s1 127.0.0.1:80\n")
+        loose_uri = path_to_uri(tmp_path)
+        client.did_open(loose_uri, tmp_path.read_text())
+        try:
+            loose_resp = client.request(
+                "$/haproxy/projectInfo",
+                {"textDocument": {"uri": loose_uri}},
+            )
+        except TimeoutError as exc:
+            results.record("project-info", "defaults projectInfo returns", False, str(exc))
+            return
+        loose_result = loose_resp.get("result") or {}
+        default_root = Path(loose_result.get("project_root", "")).resolve()
+        ok_def = default_root == Path(tmp).resolve()
+        results.record(
+            "project-info",
+            "no config -> project_root defaults to file's directory",
+            ok_def,
+            f"got {default_root}" if ok_def else f"expected {Path(tmp).resolve()}, got {default_root}",
+        )
+        ok_def_cfg = loose_result.get("config_file") is None
+        results.record(
+            "project-info",
+            "no config -> config_file is null",
+            ok_def_cfg,
+            f"got {loose_result.get('config_file')!r}",
+        )
+
+
+def run_cross_file_probes(client: LspClient, results: Results):
+    """Exercise Task 5's include-graph + project index.
+
+    Fixture: `test/fragments/main.cfg` uses `.include backends.cfg`. Opening
+    `main.cfg` must walk the include graph, parse `backends.cfg` from disk,
+    and aggregate its symbols into the project index. A follow-up `didChange`
+    of `main.cfg` after the sibling's on-disk content changes must refresh
+    the index to reflect the new sibling symbols.
+    """
+    if not FRAGMENTS_MAIN.exists() or not FRAGMENTS_BACKENDS.exists():
+        results.record(
+            "cross-file",
+            "fragments fixture present",
+            False,
+            f"missing: {FRAGMENTS_MAIN} or {FRAGMENTS_BACKENDS}",
+        )
+        return
+
+    original_backends = FRAGMENTS_BACKENDS.read_text()
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    backends_uri = path_to_uri(FRAGMENTS_BACKENDS)
+
+    try:
+        client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": main_uri}},
+            )
+        except TimeoutError as exc:
+            results.record("cross-file", "projectIndex responds", False, str(exc))
+            return
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            results.record(
+                "cross-file",
+                "projectIndex payload is an object",
+                False,
+                f"got {type(result).__name__}: {result!r}",
+            )
+            return
+
+        uris = result.get("uris") or []
+        ok_uris = main_uri in uris and backends_uri in uris
+        results.record(
+            "cross-file",
+            "opening main.cfg includes backends.cfg in index",
+            ok_uris,
+            f"uris={uris}",
+        )
+
+        symbols = result.get("symbols") or []
+        def has_symbol(name: str, kind: str, uri: str) -> bool:
+            return any(
+                s.get("name") == name and s.get("kind") == kind and s.get("uri") == uri
+                for s in symbols
+            )
+
+        results.record(
+            "cross-file",
+            "index contains `backend be_web` from backends.cfg",
+            has_symbol("be_web", "Backend", backends_uri),
+            f"symbols for backends.cfg: {[s for s in symbols if s.get('uri') == backends_uri]}",
+        )
+        results.record(
+            "cross-file",
+            "index contains `server web1` scoped to be_web",
+            any(
+                s.get("name") == "web1"
+                and s.get("kind") == "Server"
+                and s.get("uri") == backends_uri
+                and s.get("scope") == "be_web"
+                for s in symbols
+            ),
+            "web1 present" ,
+        )
+        results.record(
+            "cross-file",
+            "index contains `frontend fe_main` from main.cfg",
+            has_symbol("fe_main", "Frontend", main_uri),
+            "fe_main present",
+        )
+
+        # Task 5 "changing backends.cfg on disk and sending didChange for
+        # main.cfg refreshes the index": write a new backend into
+        # backends.cfg on disk, then fire a didChange for main.cfg with
+        # unchanged content. The LSP must re-read the sibling from disk.
+        updated_backends = original_backends + (
+            "\nbackend be_refresh\n    server refreshed 10.0.0.9:9000\n"
+        )
+        FRAGMENTS_BACKENDS.write_text(updated_backends)
+
+        client.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": main_uri, "version": 2},
+                "contentChanges": [{"text": FRAGMENTS_MAIN.read_text()}],
+            },
+        )
+
+        try:
+            resp2 = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": main_uri}},
+            )
+        except TimeoutError as exc:
+            results.record("cross-file", "projectIndex after didChange responds", False, str(exc))
+            return
+        result2 = resp2.get("result") or {}
+        symbols2 = result2.get("symbols") or []
+        results.record(
+            "cross-file",
+            "didChange on main.cfg refreshes sibling (picks up be_refresh)",
+            any(
+                s.get("name") == "be_refresh"
+                and s.get("kind") == "Backend"
+                and s.get("uri") == backends_uri
+                for s in symbols2
+            ),
+            f"found symbols for backends.cfg: {[s.get('name') for s in symbols2 if s.get('uri') == backends_uri]}",
+        )
+    finally:
+        # Restore the fixture so re-runs start from a known state.
+        FRAGMENTS_BACKENDS.write_text(original_backends)
+
+
+def run_cross_file_navigation_probes(client: LspClient, results: Results):
+    """Exercise Task 6: cross-file definition, declaration, references,
+    rename, F12-on-include-path, and cross-file-aware undefined-reference
+    diagnostics.
+
+    Fixture layout:
+        test/fragments/main.cfg
+          0: global
+          1:     daemon
+          2:
+          3: defaults
+          4:     mode http
+          5:     timeout connect 5s
+          6:     timeout client  30s
+          7:     timeout server  30s
+          8:
+          9: .include backends.cfg
+         10:
+         11: frontend fe_main
+         12:     bind *:80
+         13:     default_backend be_web
+
+        test/fragments/backends.cfg
+          0: backend be_web
+          1:     mode http
+          2:     server web1 10.0.0.1:8080
+          3:     server web2 10.0.0.2:8080
+    """
+    if not FRAGMENTS_MAIN.exists() or not FRAGMENTS_BACKENDS.exists():
+        results.record(
+            "cross-file-nav",
+            "fragments fixture present",
+            False,
+            f"missing: {FRAGMENTS_MAIN} or {FRAGMENTS_BACKENDS}",
+        )
+        return
+
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    backends_uri = path_to_uri(FRAGMENTS_BACKENDS)
+
+    client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+    # 1. Cross-file definition: cursor on `be_web` in `default_backend be_web`
+    #    (main.cfg line 13 col 22) must jump to backends.cfg line 0.
+    try:
+        resp = client.request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": main_uri},
+                "position": {"line": 13, "character": 22},
+            },
+        )
+        loc = resp.get("result")
+        ok = (
+            isinstance(loc, dict)
+            and loc.get("uri") == backends_uri
+            and loc.get("range", {}).get("start", {}).get("line") == 0
+        )
+        results.record(
+            "cross-file-nav",
+            "definition on `default_backend be_web` lands in backends.cfg line 0",
+            ok,
+            f"got {loc!r}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "cross-file definition responds", False, str(exc))
+
+    # 2. F12 on `.include backends.cfg` path token (main.cfg line 9 col 12).
+    try:
+        resp = client.request(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": main_uri},
+                "position": {"line": 9, "character": 12},
+            },
+        )
+        loc = resp.get("result")
+        ok = (
+            isinstance(loc, dict)
+            and loc.get("uri") == backends_uri
+            and loc.get("range", {}).get("start", {}).get("line") == 0
+            and loc.get("range", {}).get("start", {}).get("character") == 0
+        )
+        results.record(
+            "cross-file-nav",
+            "F12 on `.include backends.cfg` path jumps to backends.cfg {0,0}",
+            ok,
+            f"got {loc!r}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "include-path F12 responds", False, str(exc))
+
+    # 3. Cross-file rename: renaming `be_web` at backends.cfg line 0 col 10
+    #    must produce TextEdits in both backends.cfg and main.cfg.
+    client.did_open(backends_uri, FRAGMENTS_BACKENDS.read_text())
+    try:
+        resp = client.request(
+            "textDocument/rename",
+            {
+                "textDocument": {"uri": backends_uri},
+                "position": {"line": 0, "character": 10},
+                "newName": "be_renamed",
+            },
+        )
+        changes = (resp.get("result") or {}).get("changes") or {}
+        main_edits = changes.get(main_uri) or []
+        backends_edits = changes.get(backends_uri) or []
+        main_ok = any(
+            e.get("newText") == "be_renamed"
+            and e.get("range", {}).get("start", {}).get("line") == 13
+            for e in main_edits
+        )
+        backends_ok = any(
+            e.get("newText") == "be_renamed"
+            and e.get("range", {}).get("start", {}).get("line") == 0
+            for e in backends_edits
+        )
+        results.record(
+            "cross-file-nav",
+            "rename of `be_web` produces edit in backends.cfg (definition)",
+            backends_ok,
+            f"backends.cfg edits: {backends_edits}",
+        )
+        results.record(
+            "cross-file-nav",
+            "rename of `be_web` produces edit in main.cfg (reference)",
+            main_ok,
+            f"main.cfg edits: {main_edits}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "cross-file rename responds", False, str(exc))
+
+    # 4. Cross-file references: cursor on the `be_web` DEFINITION in
+    #    backends.cfg must list the reference in main.cfg (and, with
+    #    includeDeclaration=true, the definition itself).
+    try:
+        resp = client.request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": backends_uri},
+                "position": {"line": 0, "character": 10},
+                "context": {"includeDeclaration": False},
+            },
+        )
+        locs = resp.get("result") or []
+        main_hits = [
+            l
+            for l in locs
+            if l.get("uri") == main_uri
+            and l.get("range", {}).get("start", {}).get("line") == 13
+        ]
+        results.record(
+            "cross-file-nav",
+            "references on `be_web` def includes main.cfg call-site",
+            bool(main_hits),
+            f"locations: {locs}",
+        )
+    except TimeoutError as exc:
+        results.record("cross-file-nav", "cross-file references responds", False, str(exc))
+
+    # 5. Undefined-reference diagnostics: the `default_backend be_web`
+    #    line in main.cfg must NOT be flagged because `be_web` is defined in
+    #    backends.cfg.
+    diags = client._diagnostics.get(main_uri) or []
+    flagged = any(
+        d.get("code") == "undefined-backend"
+        and d.get("range", {}).get("start", {}).get("line") == 13
+        for d in diags
+    )
+    results.record(
+        "cross-file-nav",
+        "cross-file be_web not flagged as undefined in main.cfg",
+        not flagged,
+        f"diagnostics: {diags}",
+    )
+
+
+def run_scoped_include_probes(client: LspClient, results: Results):
+    """Exercise section-scope inheritance across `.include` boundaries.
+
+    Fixture layout:
+        test/fragments/scoped-main.cfg
+          0: backend be_scoped
+          1:     mode http
+          2:     .include scoped-servers.cfg
+
+        test/fragments/scoped-servers.cfg
+          0: server scoped_s1 10.0.2.1:9000
+          1: server scoped_s2 10.0.2.2:9000
+          2: stick-table type ip size 100k expire 30s
+
+    `scoped-servers.cfg` has no section header of its own — when HAProxy
+    evaluates the config, `.include` is textual substitution so the fragment
+    executes inside `backend be_scoped`'s body. The LSP must mirror that:
+
+      - `server scoped_s1` and `server scoped_s2` must be indexed with
+        `scope = "be_scoped"` (not `None`), so rename / references /
+        `use_server` resolution across sections stay correct.
+      - The bare `stick-table` directive must bind a StickTable symbol
+        named `be_scoped` — before the fix, a header-less fragment dropped
+        the stick-table entirely since no section name was tracked.
+    """
+    if not FRAGMENTS_SCOPED_MAIN.exists() or not FRAGMENTS_SCOPED_SERVERS.exists():
+        results.record(
+            "scoped-include",
+            "scoped fixture present",
+            False,
+            f"missing: {FRAGMENTS_SCOPED_MAIN} or {FRAGMENTS_SCOPED_SERVERS}",
+        )
+        return
+
+    main_uri = path_to_uri(FRAGMENTS_SCOPED_MAIN)
+    servers_uri = path_to_uri(FRAGMENTS_SCOPED_SERVERS)
+
+    client.did_open(main_uri, FRAGMENTS_SCOPED_MAIN.read_text())
+
+    try:
+        resp = client.request(
+            "$/haproxy/projectIndex",
+            {"textDocument": {"uri": main_uri}},
+        )
+    except TimeoutError as exc:
+        results.record("scoped-include", "projectIndex responds", False, str(exc))
+        return
+
+    result = resp.get("result") or {}
+    symbols = result.get("symbols") or []
+    fragment_symbols = [s for s in symbols if s.get("uri") == servers_uri]
+
+    def find_symbol(name: str, kind: str) -> dict | None:
+        for s in fragment_symbols:
+            if s.get("name") == name and s.get("kind") == kind:
+                return s
+        return None
+
+    s1 = find_symbol("scoped_s1", "Server")
+    results.record(
+        "scoped-include",
+        "server scoped_s1 in header-less include inherits backend scope",
+        s1 is not None and s1.get("scope") == "be_scoped",
+        f"got {s1!r}",
+    )
+
+    s2 = find_symbol("scoped_s2", "Server")
+    results.record(
+        "scoped-include",
+        "server scoped_s2 in header-less include inherits backend scope",
+        s2 is not None and s2.get("scope") == "be_scoped",
+        f"got {s2!r}",
+    )
+
+    tbl = find_symbol("be_scoped", "StickTable")
+    results.record(
+        "scoped-include",
+        "bare stick-table in fragment binds to parent section name",
+        tbl is not None,
+        f"fragment symbols: {[(s.get('kind'), s.get('name')) for s in fragment_symbols]}",
+    )
+
+
+def run_cross_file_diagnostics_probes(client: LspClient, results: Results):
+    """Exercise cross-file diagnostic rules. Each probe builds an isolated
+    project under a fresh temp directory with a `.zed/haproxy.toml` so the
+    files participate in cross-file aggregation without cross-polluting
+    unrelated tests.
+
+    Covers four failure modes from the codex review:
+      1. `undefined-acl` must NOT fire for an ACL defined in a sibling.
+      2. `unused-acl` must NOT fire for an ACL whose only references live
+         on the far side of an `.include`.
+      3. `duplicate-section` MUST fire when two files in the same project
+         declare the same `(keyword, name)` section.
+      4. `duplicate-acl` MUST fire when two fragments pulled into the same
+         parent section both define the same `acl NAME`.
+    """
+    from tempfile import TemporaryDirectory
+
+    def setup_project(tmp: str, files: dict[str, str]) -> dict[str, str]:
+        """Write `files` (relative path → content) into tmp plus a
+        `.zed/haproxy.toml` anchoring the project root. Returns a
+        {relative_path: absolute_uri} map.
+        """
+        zed_dir = Path(tmp) / ".zed"
+        zed_dir.mkdir()
+        (zed_dir / "haproxy.toml").write_text(
+            'project_root = "."\nfollow_includes = true\n'
+        )
+        uris: dict[str, str] = {}
+        for rel, body in files.items():
+            p = Path(tmp) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            uris[rel] = path_to_uri(p)
+        return uris
+
+    def wait_diags(uri: str, timeout: float = 5.0) -> list[dict]:
+        try:
+            return client.wait_for_diagnostics(uri, timeout=timeout)
+        except TimeoutError:
+            return client._diagnostics.get(uri, [])
+
+    # --- Probe 1: ACL defined in sibling, referenced in main — no
+    # `undefined-acl` on the referring file.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    .include acls.cfg\n"
+                "    http-request deny if bad_ip\n"
+                "    default_backend be\n"
+                "backend be\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+            "acls.cfg": "acl bad_ip src 1.2.3.4\n",
+        })
+        prev = client.diagnostics_version(uris["main.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev + 1)
+        except TimeoutError:
+            pass
+        diags = client._diagnostics.get(uris["main.cfg"], [])
+        flagged = [d for d in diags if d.get("code") == "undefined-acl"]
+        results.record(
+            "xfile-diagnostics",
+            "ACL defined in sibling suppresses undefined-acl on referring file",
+            not flagged,
+            f"diagnostics: {diags!r}",
+        )
+
+    # --- Probe 2: ACL defined in main, referenced only in sibling — no
+    # `unused-acl` on main.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    acl allow_net src 10.0.0.0/8\n"
+                "    .include rules.cfg\n"
+                "    default_backend be\n"
+                "backend be\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+            "rules.cfg": "    http-request deny unless allow_net\n",
+        })
+        prev = client.diagnostics_version(uris["main.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev + 1)
+        except TimeoutError:
+            pass
+        diags = client._diagnostics.get(uris["main.cfg"], [])
+        flagged = [
+            d for d in diags
+            if d.get("code") == "unused-acl"
+            and "allow_net" in (d.get("message") or "")
+        ]
+        results.record(
+            "xfile-diagnostics",
+            "ACL referenced only in sibling suppresses unused-acl in definer",
+            not flagged,
+            f"diagnostics: {diags!r}",
+        )
+
+    # --- Probe 3: Two files in same project both declare `backend be_dup`.
+    # The canonical-first (lower (uri, line) tuple) keeps its range clean;
+    # the later file MUST get a `duplicate-section` diagnostic.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "backend be_dup\n"
+                "    server s1 127.0.0.1:1\n"
+                ".include other.cfg\n"
+            ),
+            "other.cfg": (
+                "backend be_dup\n"
+                "    server s9 127.0.0.9:9\n"
+            ),
+        })
+        prev_main = client.diagnostics_version(uris["main.cfg"])
+        prev_other = client.diagnostics_version(uris["other.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev_main + 1)
+            client.wait_for_diagnostics(uris["other.cfg"], min_version=prev_other + 1, timeout=2.0)
+        except TimeoutError:
+            pass
+        main_diags = client._diagnostics.get(uris["main.cfg"], [])
+        other_diags = client._diagnostics.get(uris["other.cfg"], [])
+        other_flagged = [d for d in other_diags if d.get("code") == "duplicate-section"]
+        main_flagged = [d for d in main_diags if d.get("code") == "duplicate-section"]
+        results.record(
+            "xfile-diagnostics",
+            "cross-file duplicate backend flagged in the later file",
+            bool(other_flagged),
+            f"other.cfg diagnostics: {other_diags!r}",
+        )
+        results.record(
+            "xfile-diagnostics",
+            "cross-file duplicate: canonical-first file stays clean",
+            not main_flagged,
+            f"main.cfg diagnostics: {main_diags!r}",
+        )
+
+    # --- Probe 4: Two fragments pulled into the same frontend both define
+    # `acl dup_acl`. Each fragment alone sees only one def; cross-file
+    # aggregation MUST catch the duplicate.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    .include frag_a.cfg\n"
+                "    .include frag_b.cfg\n"
+                "    default_backend be\n"
+                "backend be\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+            "frag_a.cfg": "    acl dup_acl src 1.2.3.4\n",
+            "frag_b.cfg": "    acl dup_acl src 5.6.7.8\n",
+        })
+        prev_main = client.diagnostics_version(uris["main.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev_main + 1)
+            client.wait_for_diagnostics(uris["frag_b.cfg"], timeout=2.0)
+        except TimeoutError:
+            pass
+        frag_b_diags = client._diagnostics.get(uris["frag_b.cfg"], [])
+        frag_a_diags = client._diagnostics.get(uris["frag_a.cfg"], [])
+        b_flagged = [d for d in frag_b_diags if d.get("code") == "duplicate-acl"]
+        a_flagged = [d for d in frag_a_diags if d.get("code") == "duplicate-acl"]
+        results.record(
+            "xfile-diagnostics",
+            "cross-fragment duplicate-acl flagged in the later fragment",
+            bool(b_flagged),
+            f"frag_b.cfg diagnostics: {frag_b_diags!r}",
+        )
+        results.record(
+            "xfile-diagnostics",
+            "cross-fragment duplicate-acl: canonical-first fragment stays clean",
+            not a_flagged,
+            f"frag_a.cfg diagnostics: {frag_a_diags!r}",
+        )
+
+
+def run_extra_files_glob_probes(client: LspClient, results: Results):
+    """Exercise `extra_files` glob expansion in `.zed/haproxy.toml`.
+
+    Historically `extra_files` accepted only literal paths — patterns with
+    `*`, `?`, or `**` were stored but silently dropped from the include
+    graph, so a common setup like `extra_files = ["conf.d/*.cfg"]` made
+    those files invisible to symbols, navigation, diagnostics, and rename.
+
+    These probes verify:
+      - A `*`-glob inside a literal subdir (`conf.d/*.cfg`) pulls every
+        matching file into the project index.
+      - A recursive `**`-glob (`**/*.cfg`) pulls files from nested
+        subdirectories.
+      - A glob that matches nothing on disk stays inert (no crash, no
+        spurious entries).
+    """
+    from tempfile import TemporaryDirectory
+
+    def setup_project(tmp: str, extra_files_toml: str, files: dict[str, str]) -> dict[str, str]:
+        zed_dir = Path(tmp) / ".zed"
+        zed_dir.mkdir()
+        (zed_dir / "haproxy.toml").write_text(
+            'project_root = "."\nfollow_includes = true\n'
+            f'extra_files = {extra_files_toml}\n'
+        )
+        uris: dict[str, str] = {}
+        for rel, body in files.items():
+            p = Path(tmp) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            uris[rel] = path_to_uri(p)
+        return uris
+
+    # --- Probe 1: `conf.d/*.cfg` pulls every matching sibling.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(
+            tmp,
+            '["conf.d/*.cfg"]',
+            {
+                "main.cfg": (
+                    "frontend fe\n"
+                    "    bind *:80\n"
+                    "    default_backend be_glob_one\n"
+                ),
+                "conf.d/one.cfg": (
+                    "backend be_glob_one\n"
+                    "    server s1 127.0.0.1:1\n"
+                ),
+                "conf.d/two.cfg": (
+                    "backend be_glob_two\n"
+                    "    server s2 127.0.0.2:2\n"
+                ),
+                # Non-matching extension — must be ignored.
+                "conf.d/ignore.txt": "not a cfg\n",
+            },
+        )
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uris["main.cfg"]}},
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "projectIndex responds", False, str(exc))
+            return
+        result = resp.get("result") or {}
+        indexed_uris = set(result.get("uris") or [])
+        indexed_symbols = result.get("symbols") or []
+
+        results.record(
+            "extra-files-glob",
+            "conf.d/one.cfg pulled in via *-glob",
+            uris["conf.d/one.cfg"] in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+        results.record(
+            "extra-files-glob",
+            "conf.d/two.cfg pulled in via *-glob",
+            uris["conf.d/two.cfg"] in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+        results.record(
+            "extra-files-glob",
+            "conf.d/ignore.txt excluded (extension doesn't match)",
+            uris["conf.d/ignore.txt"] not in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+        results.record(
+            "extra-files-glob",
+            "be_glob_two symbol from globbed sibling reachable via project index",
+            any(
+                s.get("name") == "be_glob_two"
+                and s.get("kind") == "Backend"
+                and s.get("uri") == uris["conf.d/two.cfg"]
+                for s in indexed_symbols
+            ),
+            f"symbols in conf.d/two.cfg: "
+            f"{[s for s in indexed_symbols if s.get('uri') == uris['conf.d/two.cfg']]}",
+        )
+
+        # Cross-file navigation through the glob: F12 on the root file's
+        # `default_backend be_glob_one` must resolve to conf.d/one.cfg.
+        try:
+            def_resp = client.request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": uris["main.cfg"]},
+                    # Line 2 is `    default_backend be_glob_one` — column
+                    # 22 sits inside the name token.
+                    "position": {"line": 2, "character": 22},
+                },
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "definition request responds", False, str(exc))
+            return
+        def_result = def_resp.get("result")
+        results.record(
+            "extra-files-glob",
+            "F12 on backend reference resolves into globbed sibling",
+            isinstance(def_result, dict) and def_result.get("uri") == uris["conf.d/one.cfg"],
+            f"got {def_result!r}",
+        )
+
+    # --- Probe 2: `**/*.cfg` pulls files from nested directories.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(
+            tmp,
+            '["**/*.cfg"]',
+            {
+                "main.cfg": (
+                    "frontend fe\n"
+                    "    bind *:80\n"
+                    "    default_backend be_root\n"
+                ),
+                "nested/deeper/leaf.cfg": (
+                    "backend be_root\n"
+                    "    server s1 127.0.0.1:1\n"
+                ),
+            },
+        )
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uris["main.cfg"]}},
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "recursive glob responds", False, str(exc))
+            return
+        indexed_uris = set((resp.get("result") or {}).get("uris") or [])
+        results.record(
+            "extra-files-glob",
+            "recursive **/*.cfg glob reaches nested directory",
+            uris["nested/deeper/leaf.cfg"] in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+
+    # --- Probe 3: glob that matches nothing must stay inert.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(
+            tmp,
+            '["missing/*.cfg"]',
+            {
+                "main.cfg": (
+                    "backend be_solo\n"
+                    "    server s1 127.0.0.1:1\n"
+                ),
+            },
+        )
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uris["main.cfg"]}},
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "empty-glob responds", False, str(exc))
+            return
+        indexed_uris = set((resp.get("result") or {}).get("uris") or [])
+        results.record(
+            "extra-files-glob",
+            "non-matching glob leaves project index containing only main.cfg",
+            indexed_uris == {uris["main.cfg"]},
+            f"uris={sorted(indexed_uris)!r}",
+        )
+
+
+def run_didclose_eviction_probes(client: LspClient, results: Results):
+    """Exercise that `didClose` evicts auto-loaded siblings along with the
+    closed root, not just the closed URI alone.
+
+    Scenario:
+        main.cfg `.include`s sibling.cfg. Opening main.cfg pulls sibling.cfg
+        into every per-URI cache (symbols, project_configs, project_indices)
+        even though the client never opened it directly. A subsequent
+        `didClose main.cfg` must evict sibling.cfg too — otherwise:
+          - the project index keeps advertising the sibling's symbols
+          - `workspace/symbol` keeps returning them
+          - long-lived sessions leak unbounded sibling state
+
+    Each case uses an isolated tempdir with its own `.zed/haproxy.toml` so
+    the project boundary is explicit and no cross-test pollution occurs.
+    """
+    from tempfile import TemporaryDirectory
+
+    def setup_project(tmp: str, files: dict[str, str]) -> dict[str, str]:
+        zed_dir = Path(tmp) / ".zed"
+        zed_dir.mkdir()
+        (zed_dir / "haproxy.toml").write_text(
+            'project_root = "."\nfollow_includes = true\n'
+        )
+        uris: dict[str, str] = {}
+        for rel, body in files.items():
+            p = Path(tmp) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            uris[rel] = path_to_uri(p)
+        return uris
+
+    def project_index_uris(client: LspClient, uri: str) -> set:
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uri}},
+            )
+        except TimeoutError:
+            return set()
+        return set((resp.get("result") or {}).get("uris") or [])
+
+    # --- Case 1: closing the only open root must drop the auto-loaded sibling.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    .include sibling.cfg\n"
+                "    default_backend be_sib\n"
+            ),
+            "sibling.cfg": (
+                "backend be_sib\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+        })
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+
+        pre_close = project_index_uris(client, uris["main.cfg"])
+        results.record(
+            "didclose-eviction",
+            "open root + sibling both visible in project index",
+            uris["main.cfg"] in pre_close and uris["sibling.cfg"] in pre_close,
+            f"pre-close uris={sorted(pre_close)!r}",
+        )
+
+        client.did_close(uris["main.cfg"])
+        # Wait for eviction side effects: an empty-diagnostics publish is
+        # sent per evicted URI, so poll until the sibling's cached diagnostics
+        # go empty (or timeout).
+        import time
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if client._diagnostics.get(uris["sibling.cfg"]) == []:
+                break
+            time.sleep(0.02)
+
+        # The only remaining workspace symbols from this project must NOT
+        # include the sibling. Use workspace/symbol with a distinctive query.
+        try:
+            ws_resp = client.request("workspace/symbol", {"query": "be_sib"})
+        except TimeoutError as exc:
+            results.record("didclose-eviction", "workspace/symbol responds", False, str(exc))
+            return
+        ws_items = ws_resp.get("result") or []
+        sibling_hits = [
+            it for it in ws_items
+            if (it.get("location") or {}).get("uri") == uris["sibling.cfg"]
+        ]
+        results.record(
+            "didclose-eviction",
+            "workspace/symbol no longer returns evicted sibling's symbols",
+            not sibling_hits,
+            f"hits={sibling_hits!r}",
+        )
+
+        # Re-open an unrelated file under the same tmp project to probe
+        # whether any stale cache still holds the sibling's URI. Use a
+        # fresh file so the project index rebuild doesn't re-import the
+        # sibling from disk unless the include graph actually pulls it.
+        standalone = Path(tmp) / "standalone.cfg"
+        standalone.write_text("backend be_standalone\n    server s 127.0.0.1:2\n")
+        standalone_uri = path_to_uri(standalone)
+        client.did_open(standalone_uri, standalone.read_text())
+        post_close = project_index_uris(client, standalone_uri)
+        results.record(
+            "didclose-eviction",
+            "re-opened unrelated root sees no leftover sibling in project index",
+            uris["sibling.cfg"] not in post_close,
+            f"post-close uris={sorted(post_close)!r}",
+        )
+        client.did_close(standalone_uri)
+
+    # --- Case 2: a sibling that's also explicitly opened must NOT be evicted
+    # when its transitive parent is closed. Eviction must only remove
+    # auto-loaded siblings, not client-owned buffers.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                ".include sibling.cfg\n"
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    default_backend be_client_owned\n"
+            ),
+            "sibling.cfg": (
+                "backend be_client_owned\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+        })
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        client.did_open(uris["sibling.cfg"], Path(tmp, "sibling.cfg").read_text())
+        client.did_close(uris["main.cfg"])
+
+        # Sibling is still owned by the client — its symbols must remain
+        # reachable via workspace/symbol and the per-URI cache.
+        try:
+            ws_resp = client.request("workspace/symbol", {"query": "be_client_owned"})
+        except TimeoutError as exc:
+            results.record("didclose-eviction", "workspace/symbol responds (case 2)", False, str(exc))
+            return
+        ws_items = ws_resp.get("result") or []
+        hits = [
+            it for it in ws_items
+            if (it.get("location") or {}).get("uri") == uris["sibling.cfg"]
+        ]
+        results.record(
+            "didclose-eviction",
+            "sibling that is also explicitly opened survives parent's didClose",
+            bool(hits),
+            f"hits={hits!r}",
+        )
+        client.did_close(uris["sibling.cfg"])
+
+
+def run_workspace_symbol_probes(client: LspClient, results: Results):
+    """Exercise Task 7's `workspace/symbol` provider.
+
+    The handler enumerates every known symbol across all opened URIs
+    (including include-graph siblings) and does a case-insensitive substring
+    match on the query string. Empty query returns up to WORKSPACE_SYMBOL_CAP
+    entries so Zed can stream.
+
+    Assumes prior probes have opened `test/haproxy.prod.cfg` and the
+    `test/fragments/` pair. Those did_opens run earlier in `main`, so the
+    per-URI symbol cache is already populated by the time we query.
+    """
+    prod_uri = path_to_uri(HAPROXY_CFG)
+    main_uri = path_to_uri(FRAGMENTS_MAIN)
+    backends_uri = path_to_uri(FRAGMENTS_BACKENDS)
+
+    # Ensure prod.cfg is opened — document-symbol probes do this, but guard
+    # in case probe ordering ever changes.
+    if HAPROXY_CFG.exists():
+        client.did_open(prod_uri, HAPROXY_CFG.read_text())
+
+    # --- 1. query `opcart` must return `backend opcart-direct`.
+    try:
+        resp = client.request(
+            "workspace/symbol",
+            {"query": "opcart"},
+        )
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "opcart query responds", False, str(exc))
+        return
+
+    items = resp.get("result")
+    if not isinstance(items, list):
+        results.record(
+            "workspace-symbol",
+            "workspace/symbol returns a list",
+            False,
+            f"got {type(items).__name__}: {items!r}",
+        )
+        return
+    results.record(
+        "workspace-symbol",
+        "workspace/symbol returns a list",
+        True,
+        f"{len(items)} items",
+    )
+
+    opcart_direct = [
+        it
+        for it in items
+        if it.get("name") == "opcart-direct"
+        and it.get("kind") == 5  # Class / Backend
+        and (it.get("location") or {}).get("uri") == prod_uri
+    ]
+    results.record(
+        "workspace-symbol",
+        "`opcart` query finds `backend opcart-direct` in prod.cfg",
+        bool(opcart_direct),
+        f"matched: {opcart_direct[:1]}",
+    )
+
+    # Every returned item must contain a substring of the query.
+    bad = [it for it in items if "opcart" not in (it.get("name") or "").lower()]
+    results.record(
+        "workspace-symbol",
+        "every result name contains `opcart` (case-insensitive)",
+        not bad,
+        f"violators: {bad[:3]}" if bad else "all match",
+    )
+
+    # --- 2. cross-file query across test/fragments/: `be_` returns symbols
+    # from both main.cfg (fe_main references) and backends.cfg (be_web).
+    if FRAGMENTS_MAIN.exists() and FRAGMENTS_BACKENDS.exists():
+        client.did_open(main_uri, FRAGMENTS_MAIN.read_text())
+
+        try:
+            resp = client.request("workspace/symbol", {"query": "be_"})
+        except TimeoutError as exc:
+            results.record("workspace-symbol", "be_ query responds", False, str(exc))
+            return
+        items = resp.get("result") or []
+
+        be_web = [
+            it
+            for it in items
+            if it.get("name") == "be_web"
+            and (it.get("location") or {}).get("uri") == backends_uri
+        ]
+        results.record(
+            "workspace-symbol",
+            "`be_` query finds `backend be_web` in backends.cfg",
+            bool(be_web),
+            f"matched: {be_web[:1]}",
+        )
+
+    # --- 3. case-insensitive match.
+    try:
+        resp = client.request("workspace/symbol", {"query": "OPCART"})
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "case-insensitive query responds", False, str(exc))
+        return
+    items = resp.get("result") or []
+    results.record(
+        "workspace-symbol",
+        "case-insensitive query `OPCART` still finds opcart-direct",
+        any(it.get("name") == "opcart-direct" for it in items),
+        f"{len(items)} items",
+    )
+
+    # --- 4. containerName populated for Server symbols (scope = backend).
+    try:
+        resp = client.request("workspace/symbol", {"query": "web1"})
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "web1 query responds", False, str(exc))
+        return
+    items = resp.get("result") or []
+    web1_hits = [
+        it
+        for it in items
+        if it.get("name") == "web1"
+        and it.get("kind") == 8  # Field / Server
+        and (it.get("location") or {}).get("uri") == backends_uri
+    ]
+    results.record(
+        "workspace-symbol",
+        "web1 server has containerName = be_web",
+        bool(web1_hits) and web1_hits[0].get("containerName") == "be_web",
+        f"hit: {web1_hits[:1]}",
+    )
+
+    # --- 5. empty query returns a bounded but non-empty list.
+    try:
+        resp = client.request("workspace/symbol", {"query": ""})
+    except TimeoutError as exc:
+        results.record("workspace-symbol", "empty query responds", False, str(exc))
+        return
+    items = resp.get("result") or []
+    results.record(
+        "workspace-symbol",
+        "empty query returns non-empty list (caps at 1000)",
+        len(items) > 0 and len(items) <= 1000,
+        f"{len(items)} items",
+    )
+
+
+def run_diagnostics_latency_probe(client: LspClient, results: Results):
+    """Task 8 acceptance: measure didChange -> publishDiagnostics round-trip.
+
+    The target is <=200ms on `test/haproxy.prod.cfg` (1188 lines). The probe
+    times three consecutive didChange cycles and records the best measurement
+    to dampen noise from the OS scheduler and the Python reader thread.
+    """
+    import time
+
+    if not HAPROXY_CFG.exists():
+        results.record(
+            "latency", "prod.cfg fixture present", False, f"missing: {HAPROXY_CFG}"
+        )
+        return
+
+    uri = path_to_uri(HAPROXY_CFG)
+    text = HAPROXY_CFG.read_text()
+
+    # Ensure the document is opened; prior probes likely did this already,
+    # but re-opening is idempotent for the server and simplifies the probe.
+    prev = client.diagnostics_version(uri)
+    client.did_open(uri, text)
+    try:
+        client.wait_for_diagnostics(uri, min_version=prev + 1, timeout=5.0)
+    except TimeoutError as exc:
+        results.record("latency", "initial publishDiagnostics", False, str(exc))
+        return
+
+    best_ms = None
+    for i in range(3):
+        # Mutate slightly so the server treats this as a real change. Appending
+        # a harmless blank comment line keeps semantics stable but forces a
+        # full re-parse and re-publish.
+        mutated = text + f"\n# latency probe iteration {i}\n"
+        prev = client.diagnostics_version(uri)
+        start = time.monotonic()
+        client.notify(
+            "textDocument/didChange",
+            {
+                "textDocument": {"uri": uri, "version": 2 + i},
+                "contentChanges": [{"text": mutated}],
+            },
+        )
+        try:
+            client.wait_for_diagnostics(uri, min_version=prev + 1, timeout=5.0)
+        except TimeoutError as exc:
+            results.record("latency", f"didChange iter {i}", False, str(exc))
+            return
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if best_ms is None or elapsed_ms < best_ms:
+            best_ms = elapsed_ms
+
+    assert best_ms is not None
+    threshold_ms = 200.0
+    ok = best_ms <= threshold_ms
+    results.record(
+        "latency",
+        f"didChange -> publishDiagnostics on prod.cfg <= {threshold_ms:.0f}ms",
+        ok,
+        f"best={best_ms:.1f}ms (3 iters)",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="haproxy-lsp integration probes")
     parser.add_argument(
@@ -1947,7 +3419,7 @@ def main() -> int:
     results = Results()
     client = LspClient(binary)
     try:
-        client.initialize()
+        client.initialize(workspace_root=str(REPO_ROOT))
         client.initialized()
         run_definition_probes(client, results)
         run_definition_null_probes(client, results)
@@ -1958,6 +3430,16 @@ def main() -> int:
         run_rename_probes(client, results)
         run_hover_probes(client, results)
         run_completion_probes(client, results)
+        run_diagnostics_probes(client, results)
+        run_project_info_probes(client, results)
+        run_cross_file_probes(client, results)
+        run_cross_file_navigation_probes(client, results)
+        run_scoped_include_probes(client, results)
+        run_cross_file_diagnostics_probes(client, results)
+        run_extra_files_glob_probes(client, results)
+        run_didclose_eviction_probes(client, results)
+        run_workspace_symbol_probes(client, results)
+        run_diagnostics_latency_probe(client, results)
     finally:
         client.shutdown()
 
