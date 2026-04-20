@@ -30,6 +30,11 @@ FRAGMENTS_DIR = REPO_ROOT / "test" / "fragments"
 FRAGMENTS_MAIN = FRAGMENTS_DIR / "main.cfg"
 FRAGMENTS_BACKENDS = FRAGMENTS_DIR / "backends.cfg"
 FRAGMENTS_TOML = FRAGMENTS_DIR / ".zed" / "haproxy.toml"
+# Scoped-include fixture: a root file whose `.include` sits inside a backend
+# body, pointing at a header-less fragment. Exercises inheritance of the
+# enclosing section scope across include boundaries.
+FRAGMENTS_SCOPED_MAIN = FRAGMENTS_DIR / "scoped-main.cfg"
+FRAGMENTS_SCOPED_SERVERS = FRAGMENTS_DIR / "scoped-servers.cfg"
 
 
 def path_to_uri(path: Path) -> str:
@@ -184,6 +189,12 @@ class LspClient:
                     "text": text,
                 }
             },
+        )
+
+    def did_close(self, uri: str):
+        self.notify(
+            "textDocument/didClose",
+            {"textDocument": {"uri": uri}},
         )
 
     def shutdown(self):
@@ -2571,6 +2582,617 @@ def run_cross_file_navigation_probes(client: LspClient, results: Results):
     )
 
 
+def run_scoped_include_probes(client: LspClient, results: Results):
+    """Exercise section-scope inheritance across `.include` boundaries.
+
+    Fixture layout:
+        test/fragments/scoped-main.cfg
+          0: backend be_scoped
+          1:     mode http
+          2:     .include scoped-servers.cfg
+
+        test/fragments/scoped-servers.cfg
+          0: server scoped_s1 10.0.2.1:9000
+          1: server scoped_s2 10.0.2.2:9000
+          2: stick-table type ip size 100k expire 30s
+
+    `scoped-servers.cfg` has no section header of its own — when HAProxy
+    evaluates the config, `.include` is textual substitution so the fragment
+    executes inside `backend be_scoped`'s body. The LSP must mirror that:
+
+      - `server scoped_s1` and `server scoped_s2` must be indexed with
+        `scope = "be_scoped"` (not `None`), so rename / references /
+        `use_server` resolution across sections stay correct.
+      - The bare `stick-table` directive must bind a StickTable symbol
+        named `be_scoped` — before the fix, a header-less fragment dropped
+        the stick-table entirely since no section name was tracked.
+    """
+    if not FRAGMENTS_SCOPED_MAIN.exists() or not FRAGMENTS_SCOPED_SERVERS.exists():
+        results.record(
+            "scoped-include",
+            "scoped fixture present",
+            False,
+            f"missing: {FRAGMENTS_SCOPED_MAIN} or {FRAGMENTS_SCOPED_SERVERS}",
+        )
+        return
+
+    main_uri = path_to_uri(FRAGMENTS_SCOPED_MAIN)
+    servers_uri = path_to_uri(FRAGMENTS_SCOPED_SERVERS)
+
+    client.did_open(main_uri, FRAGMENTS_SCOPED_MAIN.read_text())
+
+    try:
+        resp = client.request(
+            "$/haproxy/projectIndex",
+            {"textDocument": {"uri": main_uri}},
+        )
+    except TimeoutError as exc:
+        results.record("scoped-include", "projectIndex responds", False, str(exc))
+        return
+
+    result = resp.get("result") or {}
+    symbols = result.get("symbols") or []
+    fragment_symbols = [s for s in symbols if s.get("uri") == servers_uri]
+
+    def find_symbol(name: str, kind: str) -> dict | None:
+        for s in fragment_symbols:
+            if s.get("name") == name and s.get("kind") == kind:
+                return s
+        return None
+
+    s1 = find_symbol("scoped_s1", "Server")
+    results.record(
+        "scoped-include",
+        "server scoped_s1 in header-less include inherits backend scope",
+        s1 is not None and s1.get("scope") == "be_scoped",
+        f"got {s1!r}",
+    )
+
+    s2 = find_symbol("scoped_s2", "Server")
+    results.record(
+        "scoped-include",
+        "server scoped_s2 in header-less include inherits backend scope",
+        s2 is not None and s2.get("scope") == "be_scoped",
+        f"got {s2!r}",
+    )
+
+    tbl = find_symbol("be_scoped", "StickTable")
+    results.record(
+        "scoped-include",
+        "bare stick-table in fragment binds to parent section name",
+        tbl is not None,
+        f"fragment symbols: {[(s.get('kind'), s.get('name')) for s in fragment_symbols]}",
+    )
+
+
+def run_cross_file_diagnostics_probes(client: LspClient, results: Results):
+    """Exercise cross-file diagnostic rules. Each probe builds an isolated
+    project under a fresh temp directory with a `.zed/haproxy.toml` so the
+    files participate in cross-file aggregation without cross-polluting
+    unrelated tests.
+
+    Covers four failure modes from the codex review:
+      1. `undefined-acl` must NOT fire for an ACL defined in a sibling.
+      2. `unused-acl` must NOT fire for an ACL whose only references live
+         on the far side of an `.include`.
+      3. `duplicate-section` MUST fire when two files in the same project
+         declare the same `(keyword, name)` section.
+      4. `duplicate-acl` MUST fire when two fragments pulled into the same
+         parent section both define the same `acl NAME`.
+    """
+    from tempfile import TemporaryDirectory
+
+    def setup_project(tmp: str, files: dict[str, str]) -> dict[str, str]:
+        """Write `files` (relative path → content) into tmp plus a
+        `.zed/haproxy.toml` anchoring the project root. Returns a
+        {relative_path: absolute_uri} map.
+        """
+        zed_dir = Path(tmp) / ".zed"
+        zed_dir.mkdir()
+        (zed_dir / "haproxy.toml").write_text(
+            'project_root = "."\nfollow_includes = true\n'
+        )
+        uris: dict[str, str] = {}
+        for rel, body in files.items():
+            p = Path(tmp) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            uris[rel] = path_to_uri(p)
+        return uris
+
+    def wait_diags(uri: str, timeout: float = 5.0) -> list[dict]:
+        try:
+            return client.wait_for_diagnostics(uri, timeout=timeout)
+        except TimeoutError:
+            return client._diagnostics.get(uri, [])
+
+    # --- Probe 1: ACL defined in sibling, referenced in main — no
+    # `undefined-acl` on the referring file.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    .include acls.cfg\n"
+                "    http-request deny if bad_ip\n"
+                "    default_backend be\n"
+                "backend be\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+            "acls.cfg": "acl bad_ip src 1.2.3.4\n",
+        })
+        prev = client.diagnostics_version(uris["main.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev + 1)
+        except TimeoutError:
+            pass
+        diags = client._diagnostics.get(uris["main.cfg"], [])
+        flagged = [d for d in diags if d.get("code") == "undefined-acl"]
+        results.record(
+            "xfile-diagnostics",
+            "ACL defined in sibling suppresses undefined-acl on referring file",
+            not flagged,
+            f"diagnostics: {diags!r}",
+        )
+
+    # --- Probe 2: ACL defined in main, referenced only in sibling — no
+    # `unused-acl` on main.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    acl allow_net src 10.0.0.0/8\n"
+                "    .include rules.cfg\n"
+                "    default_backend be\n"
+                "backend be\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+            "rules.cfg": "    http-request deny unless allow_net\n",
+        })
+        prev = client.diagnostics_version(uris["main.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev + 1)
+        except TimeoutError:
+            pass
+        diags = client._diagnostics.get(uris["main.cfg"], [])
+        flagged = [
+            d for d in diags
+            if d.get("code") == "unused-acl"
+            and "allow_net" in (d.get("message") or "")
+        ]
+        results.record(
+            "xfile-diagnostics",
+            "ACL referenced only in sibling suppresses unused-acl in definer",
+            not flagged,
+            f"diagnostics: {diags!r}",
+        )
+
+    # --- Probe 3: Two files in same project both declare `backend be_dup`.
+    # The canonical-first (lower (uri, line) tuple) keeps its range clean;
+    # the later file MUST get a `duplicate-section` diagnostic.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "backend be_dup\n"
+                "    server s1 127.0.0.1:1\n"
+                ".include other.cfg\n"
+            ),
+            "other.cfg": (
+                "backend be_dup\n"
+                "    server s9 127.0.0.9:9\n"
+            ),
+        })
+        prev_main = client.diagnostics_version(uris["main.cfg"])
+        prev_other = client.diagnostics_version(uris["other.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev_main + 1)
+            client.wait_for_diagnostics(uris["other.cfg"], min_version=prev_other + 1, timeout=2.0)
+        except TimeoutError:
+            pass
+        main_diags = client._diagnostics.get(uris["main.cfg"], [])
+        other_diags = client._diagnostics.get(uris["other.cfg"], [])
+        other_flagged = [d for d in other_diags if d.get("code") == "duplicate-section"]
+        main_flagged = [d for d in main_diags if d.get("code") == "duplicate-section"]
+        results.record(
+            "xfile-diagnostics",
+            "cross-file duplicate backend flagged in the later file",
+            bool(other_flagged),
+            f"other.cfg diagnostics: {other_diags!r}",
+        )
+        results.record(
+            "xfile-diagnostics",
+            "cross-file duplicate: canonical-first file stays clean",
+            not main_flagged,
+            f"main.cfg diagnostics: {main_diags!r}",
+        )
+
+    # --- Probe 4: Two fragments pulled into the same frontend both define
+    # `acl dup_acl`. Each fragment alone sees only one def; cross-file
+    # aggregation MUST catch the duplicate.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    .include frag_a.cfg\n"
+                "    .include frag_b.cfg\n"
+                "    default_backend be\n"
+                "backend be\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+            "frag_a.cfg": "    acl dup_acl src 1.2.3.4\n",
+            "frag_b.cfg": "    acl dup_acl src 5.6.7.8\n",
+        })
+        prev_main = client.diagnostics_version(uris["main.cfg"])
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            client.wait_for_diagnostics(uris["main.cfg"], min_version=prev_main + 1)
+            client.wait_for_diagnostics(uris["frag_b.cfg"], timeout=2.0)
+        except TimeoutError:
+            pass
+        frag_b_diags = client._diagnostics.get(uris["frag_b.cfg"], [])
+        frag_a_diags = client._diagnostics.get(uris["frag_a.cfg"], [])
+        b_flagged = [d for d in frag_b_diags if d.get("code") == "duplicate-acl"]
+        a_flagged = [d for d in frag_a_diags if d.get("code") == "duplicate-acl"]
+        results.record(
+            "xfile-diagnostics",
+            "cross-fragment duplicate-acl flagged in the later fragment",
+            bool(b_flagged),
+            f"frag_b.cfg diagnostics: {frag_b_diags!r}",
+        )
+        results.record(
+            "xfile-diagnostics",
+            "cross-fragment duplicate-acl: canonical-first fragment stays clean",
+            not a_flagged,
+            f"frag_a.cfg diagnostics: {frag_a_diags!r}",
+        )
+
+
+def run_extra_files_glob_probes(client: LspClient, results: Results):
+    """Exercise `extra_files` glob expansion in `.zed/haproxy.toml`.
+
+    Historically `extra_files` accepted only literal paths — patterns with
+    `*`, `?`, or `**` were stored but silently dropped from the include
+    graph, so a common setup like `extra_files = ["conf.d/*.cfg"]` made
+    those files invisible to symbols, navigation, diagnostics, and rename.
+
+    These probes verify:
+      - A `*`-glob inside a literal subdir (`conf.d/*.cfg`) pulls every
+        matching file into the project index.
+      - A recursive `**`-glob (`**/*.cfg`) pulls files from nested
+        subdirectories.
+      - A glob that matches nothing on disk stays inert (no crash, no
+        spurious entries).
+    """
+    from tempfile import TemporaryDirectory
+
+    def setup_project(tmp: str, extra_files_toml: str, files: dict[str, str]) -> dict[str, str]:
+        zed_dir = Path(tmp) / ".zed"
+        zed_dir.mkdir()
+        (zed_dir / "haproxy.toml").write_text(
+            'project_root = "."\nfollow_includes = true\n'
+            f'extra_files = {extra_files_toml}\n'
+        )
+        uris: dict[str, str] = {}
+        for rel, body in files.items():
+            p = Path(tmp) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            uris[rel] = path_to_uri(p)
+        return uris
+
+    # --- Probe 1: `conf.d/*.cfg` pulls every matching sibling.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(
+            tmp,
+            '["conf.d/*.cfg"]',
+            {
+                "main.cfg": (
+                    "frontend fe\n"
+                    "    bind *:80\n"
+                    "    default_backend be_glob_one\n"
+                ),
+                "conf.d/one.cfg": (
+                    "backend be_glob_one\n"
+                    "    server s1 127.0.0.1:1\n"
+                ),
+                "conf.d/two.cfg": (
+                    "backend be_glob_two\n"
+                    "    server s2 127.0.0.2:2\n"
+                ),
+                # Non-matching extension — must be ignored.
+                "conf.d/ignore.txt": "not a cfg\n",
+            },
+        )
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uris["main.cfg"]}},
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "projectIndex responds", False, str(exc))
+            return
+        result = resp.get("result") or {}
+        indexed_uris = set(result.get("uris") or [])
+        indexed_symbols = result.get("symbols") or []
+
+        results.record(
+            "extra-files-glob",
+            "conf.d/one.cfg pulled in via *-glob",
+            uris["conf.d/one.cfg"] in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+        results.record(
+            "extra-files-glob",
+            "conf.d/two.cfg pulled in via *-glob",
+            uris["conf.d/two.cfg"] in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+        results.record(
+            "extra-files-glob",
+            "conf.d/ignore.txt excluded (extension doesn't match)",
+            uris["conf.d/ignore.txt"] not in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+        results.record(
+            "extra-files-glob",
+            "be_glob_two symbol from globbed sibling reachable via project index",
+            any(
+                s.get("name") == "be_glob_two"
+                and s.get("kind") == "Backend"
+                and s.get("uri") == uris["conf.d/two.cfg"]
+                for s in indexed_symbols
+            ),
+            f"symbols in conf.d/two.cfg: "
+            f"{[s for s in indexed_symbols if s.get('uri') == uris['conf.d/two.cfg']]}",
+        )
+
+        # Cross-file navigation through the glob: F12 on the root file's
+        # `default_backend be_glob_one` must resolve to conf.d/one.cfg.
+        try:
+            def_resp = client.request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": uris["main.cfg"]},
+                    # Line 2 is `    default_backend be_glob_one` — column
+                    # 22 sits inside the name token.
+                    "position": {"line": 2, "character": 22},
+                },
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "definition request responds", False, str(exc))
+            return
+        def_result = def_resp.get("result")
+        results.record(
+            "extra-files-glob",
+            "F12 on backend reference resolves into globbed sibling",
+            isinstance(def_result, dict) and def_result.get("uri") == uris["conf.d/one.cfg"],
+            f"got {def_result!r}",
+        )
+
+    # --- Probe 2: `**/*.cfg` pulls files from nested directories.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(
+            tmp,
+            '["**/*.cfg"]',
+            {
+                "main.cfg": (
+                    "frontend fe\n"
+                    "    bind *:80\n"
+                    "    default_backend be_root\n"
+                ),
+                "nested/deeper/leaf.cfg": (
+                    "backend be_root\n"
+                    "    server s1 127.0.0.1:1\n"
+                ),
+            },
+        )
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uris["main.cfg"]}},
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "recursive glob responds", False, str(exc))
+            return
+        indexed_uris = set((resp.get("result") or {}).get("uris") or [])
+        results.record(
+            "extra-files-glob",
+            "recursive **/*.cfg glob reaches nested directory",
+            uris["nested/deeper/leaf.cfg"] in indexed_uris,
+            f"uris={sorted(indexed_uris)!r}",
+        )
+
+    # --- Probe 3: glob that matches nothing must stay inert.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(
+            tmp,
+            '["missing/*.cfg"]',
+            {
+                "main.cfg": (
+                    "backend be_solo\n"
+                    "    server s1 127.0.0.1:1\n"
+                ),
+            },
+        )
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uris["main.cfg"]}},
+            )
+        except TimeoutError as exc:
+            results.record("extra-files-glob", "empty-glob responds", False, str(exc))
+            return
+        indexed_uris = set((resp.get("result") or {}).get("uris") or [])
+        results.record(
+            "extra-files-glob",
+            "non-matching glob leaves project index containing only main.cfg",
+            indexed_uris == {uris["main.cfg"]},
+            f"uris={sorted(indexed_uris)!r}",
+        )
+
+
+def run_didclose_eviction_probes(client: LspClient, results: Results):
+    """Exercise that `didClose` evicts auto-loaded siblings along with the
+    closed root, not just the closed URI alone.
+
+    Scenario:
+        main.cfg `.include`s sibling.cfg. Opening main.cfg pulls sibling.cfg
+        into every per-URI cache (symbols, project_configs, project_indices)
+        even though the client never opened it directly. A subsequent
+        `didClose main.cfg` must evict sibling.cfg too — otherwise:
+          - the project index keeps advertising the sibling's symbols
+          - `workspace/symbol` keeps returning them
+          - long-lived sessions leak unbounded sibling state
+
+    Each case uses an isolated tempdir with its own `.zed/haproxy.toml` so
+    the project boundary is explicit and no cross-test pollution occurs.
+    """
+    from tempfile import TemporaryDirectory
+
+    def setup_project(tmp: str, files: dict[str, str]) -> dict[str, str]:
+        zed_dir = Path(tmp) / ".zed"
+        zed_dir.mkdir()
+        (zed_dir / "haproxy.toml").write_text(
+            'project_root = "."\nfollow_includes = true\n'
+        )
+        uris: dict[str, str] = {}
+        for rel, body in files.items():
+            p = Path(tmp) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
+            uris[rel] = path_to_uri(p)
+        return uris
+
+    def project_index_uris(client: LspClient, uri: str) -> set:
+        try:
+            resp = client.request(
+                "$/haproxy/projectIndex",
+                {"textDocument": {"uri": uri}},
+            )
+        except TimeoutError:
+            return set()
+        return set((resp.get("result") or {}).get("uris") or [])
+
+    # --- Case 1: closing the only open root must drop the auto-loaded sibling.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    .include sibling.cfg\n"
+                "    default_backend be_sib\n"
+            ),
+            "sibling.cfg": (
+                "backend be_sib\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+        })
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+
+        pre_close = project_index_uris(client, uris["main.cfg"])
+        results.record(
+            "didclose-eviction",
+            "open root + sibling both visible in project index",
+            uris["main.cfg"] in pre_close and uris["sibling.cfg"] in pre_close,
+            f"pre-close uris={sorted(pre_close)!r}",
+        )
+
+        client.did_close(uris["main.cfg"])
+        # Wait for eviction side effects: an empty-diagnostics publish is
+        # sent per evicted URI, so poll until the sibling's cached diagnostics
+        # go empty (or timeout).
+        import time
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if client._diagnostics.get(uris["sibling.cfg"]) == []:
+                break
+            time.sleep(0.02)
+
+        # The only remaining workspace symbols from this project must NOT
+        # include the sibling. Use workspace/symbol with a distinctive query.
+        try:
+            ws_resp = client.request("workspace/symbol", {"query": "be_sib"})
+        except TimeoutError as exc:
+            results.record("didclose-eviction", "workspace/symbol responds", False, str(exc))
+            return
+        ws_items = ws_resp.get("result") or []
+        sibling_hits = [
+            it for it in ws_items
+            if (it.get("location") or {}).get("uri") == uris["sibling.cfg"]
+        ]
+        results.record(
+            "didclose-eviction",
+            "workspace/symbol no longer returns evicted sibling's symbols",
+            not sibling_hits,
+            f"hits={sibling_hits!r}",
+        )
+
+        # Re-open an unrelated file under the same tmp project to probe
+        # whether any stale cache still holds the sibling's URI. Use a
+        # fresh file so the project index rebuild doesn't re-import the
+        # sibling from disk unless the include graph actually pulls it.
+        standalone = Path(tmp) / "standalone.cfg"
+        standalone.write_text("backend be_standalone\n    server s 127.0.0.1:2\n")
+        standalone_uri = path_to_uri(standalone)
+        client.did_open(standalone_uri, standalone.read_text())
+        post_close = project_index_uris(client, standalone_uri)
+        results.record(
+            "didclose-eviction",
+            "re-opened unrelated root sees no leftover sibling in project index",
+            uris["sibling.cfg"] not in post_close,
+            f"post-close uris={sorted(post_close)!r}",
+        )
+        client.did_close(standalone_uri)
+
+    # --- Case 2: a sibling that's also explicitly opened must NOT be evicted
+    # when its transitive parent is closed. Eviction must only remove
+    # auto-loaded siblings, not client-owned buffers.
+    with TemporaryDirectory() as tmp:
+        uris = setup_project(tmp, {
+            "main.cfg": (
+                ".include sibling.cfg\n"
+                "frontend fe\n"
+                "    bind *:80\n"
+                "    default_backend be_client_owned\n"
+            ),
+            "sibling.cfg": (
+                "backend be_client_owned\n"
+                "    server s1 127.0.0.1:1\n"
+            ),
+        })
+        client.did_open(uris["main.cfg"], Path(tmp, "main.cfg").read_text())
+        client.did_open(uris["sibling.cfg"], Path(tmp, "sibling.cfg").read_text())
+        client.did_close(uris["main.cfg"])
+
+        # Sibling is still owned by the client — its symbols must remain
+        # reachable via workspace/symbol and the per-URI cache.
+        try:
+            ws_resp = client.request("workspace/symbol", {"query": "be_client_owned"})
+        except TimeoutError as exc:
+            results.record("didclose-eviction", "workspace/symbol responds (case 2)", False, str(exc))
+            return
+        ws_items = ws_resp.get("result") or []
+        hits = [
+            it for it in ws_items
+            if (it.get("location") or {}).get("uri") == uris["sibling.cfg"]
+        ]
+        results.record(
+            "didclose-eviction",
+            "sibling that is also explicitly opened survives parent's didClose",
+            bool(hits),
+            f"hits={hits!r}",
+        )
+        client.did_close(uris["sibling.cfg"])
+
+
 def run_workspace_symbol_probes(client: LspClient, results: Results):
     """Exercise Task 7's `workspace/symbol` provider.
 
@@ -2812,6 +3434,10 @@ def main() -> int:
         run_project_info_probes(client, results)
         run_cross_file_probes(client, results)
         run_cross_file_navigation_probes(client, results)
+        run_scoped_include_probes(client, results)
+        run_cross_file_diagnostics_probes(client, results)
+        run_extra_files_glob_probes(client, results)
+        run_didclose_eviction_probes(client, results)
         run_workspace_symbol_probes(client, results)
         run_diagnostics_latency_probe(client, results)
     finally:

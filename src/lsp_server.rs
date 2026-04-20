@@ -14,10 +14,12 @@ mod docs;
 struct ProjectConfig {
     project_root: PathBuf,
     follow_includes: bool,
-    // Reserved: glob patterns/paths relative to `project_root` that should be
-    // pulled into the include graph even when no `.include` reaches them.
-    // Currently parsed and surfaced via `$/haproxy/projectInfo` but not yet
-    // expanded into `included_files`.
+    // Glob patterns/paths relative to `project_root` that should be pulled
+    // into the include graph even when no `.include` directive reaches
+    // them. Expanded by `expand_glob` (supports `*`, `?`, `**`) at the tail
+    // of `extract_include_uris`; resolved files are added to the include
+    // graph with `entry_scope = None` since they're project-wide peers
+    // rather than section-body fragments.
     extra_files: Vec<String>,
     // Path to the `.zed/haproxy.toml` file that produced this config, if any.
     // `None` means defaults were used (no config discovered).
@@ -212,6 +214,13 @@ struct HaproxyLsp {
     // rename / undefined-reference diagnostics walk this cache across every
     // URI in the project graph.
     raw_references: HashMap<String, Vec<RawReference>>,
+    // Per-URI enclosing-section scope active at the point of the parent
+    // `.include` / `-f` / `crt` directive that reached this file. Recorded
+    // by `parse_graph_node`; `None` for top-level documents and for files
+    // reached as project-wide peers via `extra_files`. Used by cross-file
+    // duplicate-acl detection to attribute ACL definitions in a header-less
+    // fragment to the parent section that transcludes it.
+    entry_scopes: HashMap<String, Option<String>>,
 }
 
 // Aggregate symbol index for all files reachable from a single project root
@@ -308,6 +317,155 @@ fn resolve_include_path(
         return Some(candidate);
     }
     None
+}
+
+// Expand a glob `pattern` against `base`, returning every matching file path.
+// Supports `*` (any run of non-`/` chars), `?` (any single non-`/` char), and
+// `**` as a standalone path component (zero or more directory levels).
+// Character classes `[...]` are treated as literal bytes — callers who need
+// precise character-class semantics should fall back to literal paths for now.
+// Absolute patterns resolve from `/`; relative patterns resolve from `base`.
+//
+// The walk skips symlinks to guard against cycles, so a pathological
+// `extra_files = ["**/*.cfg"]` against a directory containing a self-
+// referential symlink can't trap the server in an infinite traversal.
+fn expand_glob(pattern: &str, base: &Path) -> Vec<PathBuf> {
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    let is_absolute = pattern.starts_with('/');
+    let components: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty()).collect();
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    let mut current: Vec<PathBuf> = if is_absolute {
+        vec![PathBuf::from("/")]
+    } else {
+        vec![base.to_path_buf()]
+    };
+
+    for (idx, comp) in components.iter().enumerate() {
+        let is_last = idx == components.len() - 1;
+        let mut next: Vec<PathBuf> = Vec::new();
+        for path in &current {
+            let meta = match std::fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() || !path.is_dir() {
+                continue;
+            }
+
+            if *comp == "**" {
+                // Recursive match: self plus every descendant directory, all
+                // eligible to satisfy either this component or subsequent
+                // ones. Iterative DFS with symlink skipping.
+                let mut stack = vec![path.clone()];
+                while let Some(p) = stack.pop() {
+                    next.push(p.clone());
+                    if let Ok(rd) = std::fs::read_dir(&p) {
+                        for entry in rd.flatten() {
+                            let ep = entry.path();
+                            if let Ok(ft) = entry.file_type() {
+                                if ft.is_symlink() {
+                                    continue;
+                                }
+                                if ft.is_dir() {
+                                    stack.push(ep);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if component_has_glob(comp) {
+                if let Ok(rd) = std::fs::read_dir(path) {
+                    for entry in rd.flatten() {
+                        let ep = entry.path();
+                        let name = match ep.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n.to_string(),
+                            None => continue,
+                        };
+                        if !simple_glob_match(comp, &name) {
+                            continue;
+                        }
+                        let ft = match entry.file_type() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        if ft.is_symlink() {
+                            continue;
+                        }
+                        if is_last {
+                            if ft.is_file() {
+                                next.push(ep);
+                            }
+                        } else if ft.is_dir() {
+                            next.push(ep);
+                        }
+                    }
+                }
+            } else {
+                let joined = path.join(comp);
+                let meta = match std::fs::symlink_metadata(&joined) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if is_last {
+                    if meta.is_file() {
+                        next.push(joined);
+                    }
+                } else if meta.is_dir() {
+                    next.push(joined);
+                }
+            }
+        }
+        current = next;
+        if current.is_empty() {
+            return Vec::new();
+        }
+    }
+
+    current
+}
+
+fn component_has_glob(s: &str) -> bool {
+    s.contains('*') || s.contains('?')
+}
+
+// Minimal glob matcher for a single path component. Supports `*` (zero or
+// more non-`/` chars) and `?` (exactly one non-`/` char). Everything else —
+// including `[...]` — matches literally. Backtracking implementation; the
+// typical extra_files pattern has at most one `*`, so worst-case work stays
+// bounded.
+fn simple_glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let mut pi = 0usize;
+    let mut ni = 0usize;
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((spi, sni)) = star {
+            pi = spi + 1;
+            ni = sni + 1;
+            star = Some((spi, ni));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn percent_decode(s: &str) -> String {
@@ -919,6 +1077,7 @@ fn undefined_reference_diagnostics(
     symbols: &[Symbol],
     extra_backends: &HashSet<String>,
     extra_servers_by_scope: &HashMap<String, HashSet<String>>,
+    extra_acls: &HashSet<String>,
 ) -> Vec<Diagnostic> {
     use std::collections::HashSet;
 
@@ -928,11 +1087,15 @@ fn undefined_reference_diagnostics(
         .map(|s| s.name.clone())
         .collect();
     backend_names.extend(extra_backends.iter().cloned());
-    let acl_names: HashSet<&str> = symbols
+    // Merge local ACL definitions with any ACLs defined in sibling include
+    // files so a reference in this file to an ACL defined across the
+    // include boundary is not flagged as `undefined-acl`.
+    let mut acl_names: HashSet<String> = symbols
         .iter()
         .filter(|s| s.kind == SymbolKind::Acl)
-        .map(|s| s.name.as_str())
+        .map(|s| s.name.clone())
         .collect();
+    acl_names.extend(extra_acls.iter().cloned());
     let builtin_acls: HashSet<&str> = BUILTIN_ACL_NAMES.iter().copied().collect();
     let mut servers_by_scope: HashMap<String, HashSet<String>> = HashMap::new();
     for s in symbols {
@@ -1020,7 +1183,7 @@ fn undefined_reference_diagnostics(
         // neither user-defined ACLs in this file nor HAProxy built-ins.
         for keyword in &["if", "unless"] {
             for (name, start, end) in collect_acl_ref_positions(raw_line, keyword) {
-                if acl_names.contains(name.as_str())
+                if acl_names.contains(&name)
                     || builtin_acls.contains(name.as_str())
                 {
                     continue;
@@ -1097,14 +1260,24 @@ fn collect_section_headers(content: &str) -> Vec<SectionHeaderInfo> {
     hdrs
 }
 
-/// Emit a `duplicate-section` error (severity `Error`) on every second-and-later
-/// occurrence of a `backend` / `frontend` / `listen` section with a name already
-/// declared earlier in the file under the same keyword. Cross-kind collisions
-/// (e.g. `backend foo` + `frontend foo`) are not flagged here; HAProxy permits
-/// distinct namespaces per keyword in practice.
-fn duplicate_section_diagnostics(headers: &[SectionHeaderInfo]) -> Vec<Diagnostic> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+/// Emit a `duplicate-section` error (severity `Error`) on every occurrence of
+/// a `backend` / `frontend` / `listen` section whose (keyword, name) already
+/// appears somewhere in the project under a lower (uri, line) tuple — the
+/// "canonical first" per pair. Cross-kind collisions (e.g. `backend foo` +
+/// `frontend foo`) are not flagged; HAProxy permits distinct namespaces per
+/// keyword in practice.
+///
+/// `canonical_first` carries the winning (uri, header_line) for every
+/// (keyword, name) pair present in the project. The canonical ordering is a
+/// stable tuple sort over (uri, line), which guarantees exactly one survivor
+/// per pair regardless of traversal order. Same-file duplicates still flag
+/// correctly because every second-and-later header in the same URI compares
+/// unequal to the canonical (uri, first_line).
+fn duplicate_section_diagnostics(
+    uri: &str,
+    headers: &[SectionHeaderInfo],
+    canonical_first: &HashMap<(String, String), (String, u32)>,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for h in headers {
         if !matches!(h.keyword.as_str(), "backend" | "frontend" | "listen") {
@@ -1114,68 +1287,141 @@ fn duplicate_section_diagnostics(headers: &[SectionHeaderInfo]) -> Vec<Diagnosti
             continue;
         }
         let key = (h.keyword.clone(), h.name.clone());
-        if !seen.insert(key) {
-            diags.push(Diagnostic {
-                range: Range {
-                    start: Position { line: h.header_line, character: h.name_start },
-                    end: Position { line: h.header_line, character: h.name_end },
-                },
-                severity: 1,
-                code: "duplicate-section",
-                source: "haproxy-lsp",
-                message: format!("Duplicate {} section: {}", h.keyword, h.name),
-            });
+        let (canon_uri, canon_line) = match canonical_first.get(&key) {
+            Some(c) => c,
+            None => continue,
+        };
+        if canon_uri.as_str() == uri && *canon_line == h.header_line {
+            continue;
         }
+        diags.push(Diagnostic {
+            range: Range {
+                start: Position { line: h.header_line, character: h.name_start },
+                end: Position { line: h.header_line, character: h.name_end },
+            },
+            severity: 1,
+            code: "duplicate-section",
+            source: "haproxy-lsp",
+            message: format!("Duplicate {} section: {}", h.keyword, h.name),
+        });
     }
     diags
 }
 
-/// Emit a `duplicate-acl` error on every second-and-later `acl NAME ...` within
-/// the same `frontend` / `listen` body. Restricted to frontend/listen per the
-/// Tier 3 plan — HAProxy technically permits repeated `acl` lines as an OR
-/// shorthand, but in frontends/listens the typical intent of a repeat is a
-/// copy-paste mistake that silently overrides condition semantics.
-fn duplicate_acl_diagnostics(
+/// Location of a single `acl NAME ...` definition within a file. Used by the
+/// project-aware duplicate-acl rule to group defs by (section, name) across
+/// files that share an effective section via `.include` transclusion.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct AclDefLocation {
+    uri: String,
+    line: u32,
+    start: u32,
+    end: u32,
+}
+
+/// Walk `content` and emit one entry per `acl NAME ...` definition tagged
+/// with the section name active at that line. Section tracking is seeded
+/// with `entry_scope` so ACLs defined in a header-less fragment (one pulled
+/// into a parent section via `.include`) attribute to the parent section.
+///
+/// Returned tuple: (effective_section_name, acl_name, location).
+/// `effective_section_name` is `None` only when the ACL appears outside any
+/// named section AND no `entry_scope` was supplied — syntactically invalid
+/// HAProxy, but we still emit so duplicate detection across syntactically
+/// dubious top-level fragments still catches obvious copy-paste collisions.
+fn collect_acl_defs_with_scope(
+    uri: &str,
     content: &str,
-    headers: &[SectionHeaderInfo],
-) -> Vec<Diagnostic> {
-    use std::collections::HashSet;
-    let lines: Vec<&str> = content.lines().collect();
-    let line_count = lines.len();
-    let mut diags = Vec::new();
-    for h in headers {
-        if !matches!(h.keyword.as_str(), "frontend" | "listen") {
-            continue;
-        }
-        let body_start = (h.header_line as usize) + 1;
-        let body_end = (h.body_end_line as usize).min(line_count.saturating_sub(1));
-        if body_start > body_end {
-            continue;
-        }
-        let mut seen: HashSet<String> = HashSet::new();
-        for ln_idx in body_start..=body_end {
-            let line = lines[ln_idx];
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            if !trimmed.starts_with("acl ") && trimmed != "acl" {
-                continue;
-            }
-            if let Some((name, start, end)) = find_leading_directive_arg(line, "acl") {
-                if !seen.insert(name.clone()) {
-                    diags.push(Diagnostic {
-                        range: Range {
-                            start: Position { line: ln_idx as u32, character: start },
-                            end: Position { line: ln_idx as u32, character: end },
-                        },
-                        severity: 1,
-                        code: "duplicate-acl",
-                        source: "haproxy-lsp",
-                        message: format!("Duplicate ACL in section: {}", name),
-                    });
+    entry_scope: Option<&str>,
+) -> Vec<(Option<String>, String, AclDefLocation)> {
+    let mut out = Vec::new();
+    let mut current_section: Option<String> = entry_scope.map(|s| s.to_string());
+    for (ln_idx, raw_line) in content.lines().enumerate() {
+        let is_section = is_section_header(raw_line);
+        let trimmed = raw_line.trim();
+        let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+        if is_section {
+            match first_tok {
+                "backend" | "frontend" | "listen" | "peers" => {
+                    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                    current_section = tokens.get(1).map(|s| s.to_string());
                 }
+                "global" | "defaults" | "resolvers" | "userlist"
+                | "mailers" | "cache" | "program" | "ring" => {
+                    current_section = None;
+                }
+                _ => {}
             }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !trimmed.starts_with("acl ") && trimmed != "acl" {
+            continue;
+        }
+        if let Some((name, start, end)) = find_leading_directive_arg(raw_line, "acl") {
+            out.push((
+                current_section.clone(),
+                name,
+                AclDefLocation {
+                    uri: uri.to_string(),
+                    line: ln_idx as u32,
+                    start,
+                    end,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Emit a `duplicate-acl` error on every second-and-later `acl NAME ...`
+/// whose (effective-section, name) pair already appears earlier in the
+/// project (by canonical (uri, line) sort). Effective section follows
+/// `.include` transclusion: an ACL in a header-less fragment inherits the
+/// parent section's name.
+///
+/// Restricted to sections whose header keyword is `frontend` or `listen`
+/// somewhere in the project — HAProxy technically permits repeated `acl`
+/// lines as an OR shorthand, but in frontends/listens a repeat is almost
+/// always a copy-paste mistake that silently overrides condition semantics.
+/// Backend-scoped ACL duplicates are not flagged (unchanged from the
+/// single-file rule).
+///
+/// `project_defs` groups every ACL definition in the project by
+/// (section_name, acl_name); `frontend_listen_names` carries the set of
+/// section names that match the frontend/listen restriction. Emits only
+/// diagnostics that belong to `uri`.
+fn duplicate_acl_diagnostics(
+    uri: &str,
+    project_defs: &HashMap<(String, String), Vec<AclDefLocation>>,
+    frontend_listen_names: &HashSet<String>,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for ((section, name), locs) in project_defs {
+        if !frontend_listen_names.contains(section) {
+            continue;
+        }
+        if locs.len() < 2 {
+            continue;
+        }
+        let mut sorted = locs.clone();
+        sorted.sort();
+        for loc in sorted.iter().skip(1) {
+            if loc.uri != uri {
+                continue;
+            }
+            diags.push(Diagnostic {
+                range: Range {
+                    start: Position { line: loc.line, character: loc.start },
+                    end: Position { line: loc.line, character: loc.end },
+                },
+                severity: 1,
+                code: "duplicate-acl",
+                source: "haproxy-lsp",
+                message: format!("Duplicate ACL in section: {}", name),
+            });
         }
     }
     diags
@@ -1302,6 +1548,7 @@ fn unused_backend_diagnostics(
 fn unused_acl_diagnostics(
     content: &str,
     headers: &[SectionHeaderInfo],
+    extra_acl_refs: &HashSet<String>,
 ) -> Vec<Diagnostic> {
     use std::collections::HashSet;
     let lines: Vec<&str> = content.lines().collect();
@@ -1340,7 +1587,14 @@ fn unused_acl_diagnostics(
             if !seen.insert(name.clone()) {
                 continue;
             }
-            if refs.contains(&name) {
+            // HAProxy resolves ACL references within the defining section's
+            // body, which may span files when a fragment is pulled in via
+            // `.include`. `extra_acl_refs` carries every ACL name referenced
+            // anywhere in the project so a cross-file reference suppresses
+            // the warning. This intentionally widens suppression beyond the
+            // section boundary — false positives are worse than occasionally
+            // missing a genuinely unused ACL.
+            if refs.contains(&name) || extra_acl_refs.contains(&name) {
                 continue;
             }
             diags.push(Diagnostic {
@@ -1856,6 +2110,7 @@ impl HaproxyLsp {
             explicitly_opened: HashSet::new(),
             project_indices: HashMap::new(),
             raw_references: HashMap::new(),
+            entry_scopes: HashMap::new(),
         })
     }
 
@@ -1893,7 +2148,8 @@ impl HaproxyLsp {
             let mut extra_backends: HashSet<String> = HashSet::new();
             let mut extra_servers_by_scope: HashMap<String, HashSet<String>> =
                 HashMap::new();
-            for u in self.project_uris_for(uri) {
+            let mut extra_acls: HashSet<String> = HashSet::new();
+            for u in self.strictly_related_uris(uri) {
                 if u == uri {
                     continue;
                 }
@@ -1911,6 +2167,9 @@ impl HaproxyLsp {
                                         .insert(s.name.clone());
                                 }
                             }
+                            SymbolKind::Acl => {
+                                extra_acls.insert(s.name.clone());
+                            }
                             _ => {}
                         }
                     }
@@ -1922,21 +2181,119 @@ impl HaproxyLsp {
                 &symbols,
                 &extra_backends,
                 &extra_servers_by_scope,
+                &extra_acls,
             ));
             let headers = collect_section_headers(&content);
-            diags.extend(duplicate_section_diagnostics(&headers));
-            diags.extend(duplicate_acl_diagnostics(&content, &headers));
+
+            // Build project-wide inputs for the structural rules. Walk every
+            // URI in the project graph once and aggregate:
+            //   - canonical-first (keyword, name) section locations so
+            //     `duplicate-section` flags cross-file collisions.
+            //   - ACL definitions tagged with their effective section (local
+            //     header OR inherited `entry_scope` for fragments) so
+            //     `duplicate-acl` catches copy-paste ACLs spread across
+            //     fragments that are pulled into the same parent section.
+            //   - the set of section names whose keyword is `frontend` /
+            //     `listen` in any project file — the filter for the
+            //     `duplicate-acl` rule (preserves the single-file
+            //     restriction that backend ACLs are not flagged).
+            //   - the set of ACL names referenced anywhere in the project so
+            //     `unused-acl` doesn't flag an ACL whose only references
+            //     live on the far side of an `.include`.
+            let project_uris = self.strictly_related_uris(uri);
+            let mut canonical_section_first: HashMap<(String, String), (String, u32)> =
+                HashMap::new();
+            let mut project_acl_defs: HashMap<(String, String), Vec<AclDefLocation>> =
+                HashMap::new();
+            let mut frontend_listen_names: HashSet<String> = HashSet::new();
+            let mut project_acl_refs: HashSet<String> = HashSet::new();
+            for u in &project_uris {
+                let u_content = match self.documents.get(u) {
+                    Some(c) => c.clone(),
+                    None => continue,
+                };
+                let u_headers = if u == uri {
+                    // Reuse the already-computed header list for the current
+                    // URI; every other URI's headers are cheap one-offs.
+                    headers.iter().map(|h| SectionHeaderInfo {
+                        keyword: h.keyword.clone(),
+                        name: h.name.clone(),
+                        name_start: h.name_start,
+                        name_end: h.name_end,
+                        header_line: h.header_line,
+                        body_end_line: h.body_end_line,
+                    }).collect::<Vec<_>>()
+                } else {
+                    collect_section_headers(&u_content)
+                };
+                for h in &u_headers {
+                    if matches!(h.keyword.as_str(), "backend" | "frontend" | "listen")
+                        && !h.name.is_empty()
+                    {
+                        let key = (h.keyword.clone(), h.name.clone());
+                        let entry = (u.clone(), h.header_line);
+                        canonical_section_first
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if entry < *existing {
+                                    *existing = entry.clone();
+                                }
+                            })
+                            .or_insert(entry);
+                    }
+                    if matches!(h.keyword.as_str(), "frontend" | "listen") && !h.name.is_empty() {
+                        frontend_listen_names.insert(h.name.clone());
+                    }
+                }
+                let entry_scope = self
+                    .entry_scopes
+                    .get(u)
+                    .and_then(|e| e.clone());
+                for (section, name, loc) in
+                    collect_acl_defs_with_scope(u, &u_content, entry_scope.as_deref())
+                {
+                    let section_name = match section {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    project_acl_defs
+                        .entry((section_name, name))
+                        .or_default()
+                        .push(loc);
+                }
+                if let Some(raws) = self.raw_references.get(u) {
+                    for r in raws {
+                        if matches!(
+                            r.context,
+                            ReferenceContext::AclCondition | ReferenceContext::AclUnlessCondition
+                        ) {
+                            project_acl_refs.insert(r.name.clone());
+                        }
+                    }
+                }
+            }
+
+            diags.extend(duplicate_section_diagnostics(
+                uri,
+                &headers,
+                &canonical_section_first,
+            ));
+            diags.extend(duplicate_acl_diagnostics(
+                uri,
+                &project_acl_defs,
+                &frontend_listen_names,
+            ));
             diags.extend(missing_default_backend_diagnostics(&content, &headers));
             // Gather cross-file references so an unused-backend warning
             // doesn't fire for a backend defined in this file but referenced
             // from a sibling include.
             let cross_file_refs: HashSet<(SymbolKind, String)> = {
                 let mut set: HashSet<(SymbolKind, String)> = HashSet::new();
-                for u in self.project_uris_for(uri) {
+                for u in &project_uris {
                     if u == uri {
                         continue;
                     }
-                    if let Some(raws) = self.raw_references.get(&u) {
+                    if let Some(raws) = self.raw_references.get(u) {
                         for r in raws {
                             set.insert((r.kind.clone(), r.name.clone()));
                         }
@@ -1945,7 +2302,7 @@ impl HaproxyLsp {
                 set
             };
             diags.extend(unused_backend_diagnostics(&content, &symbols, &cross_file_refs));
-            diags.extend(unused_acl_diagnostics(&content, &headers));
+            diags.extend(unused_acl_diagnostics(&content, &headers, &project_acl_refs));
         }
         let diags_json: Vec<Value> = diags.iter().map(diagnostic_to_json).collect();
         self.diagnostics.insert(uri.to_string(), diags);
@@ -1966,7 +2323,9 @@ impl HaproxyLsp {
     // committed for `uri`) while layering cross-file state on top.
     fn parse_document(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
         let mut visited: HashSet<String> = HashSet::new();
-        self.parse_graph_node(uri, Some(content), &mut visited)?;
+        // Top-level document is always parsed with no entry scope — it's the
+        // root of the include graph, not a fragment pulled into a section.
+        self.parse_graph_node(uri, Some(content), None, &mut visited)?;
         self.rebuild_project_index_for(uri);
         // Emit diagnostics for every file in the project graph now that the
         // project index is coherent. Cross-file undefined-reference rules
@@ -1986,10 +2345,26 @@ impl HaproxyLsp {
     // didOpen/didChange, or reads from disk when the sibling isn't an open
     // editor buffer. `visited` is shared across the whole walk to prevent
     // cycles.
+    //
+    // `entry_scope` is the enclosing HAProxy section name active in the
+    // parent file at the point of the `.include` / `-f` / `crt` directive
+    // that reached this node. For the top-level document it is always
+    // `None`. For a fragment pulled into the body of `backend foo`, it is
+    // `Some("foo")`. This seeds both passes of `parse_single_file` so
+    // header-less fragments (a file that starts with `server s1 ...` with no
+    // `backend` header of its own) attribute their symbols to the parent's
+    // section rather than dropping them or leaving `scope = None`.
+    //
+    // Limitation: `visited` dedups on URI only, so if the same fragment is
+    // included from two distinct sections the first edge's `entry_scope`
+    // wins. Multi-scope inclusion of the same fragment is rare in practice
+    // and would require duplicating symbols per (uri, scope) pair, which is
+    // out of scope for this pass.
     fn parse_graph_node(
         &mut self,
         uri: &str,
         content_override: Option<&str>,
+        entry_scope: Option<String>,
         visited: &mut HashSet<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if !visited.insert(uri.to_string()) {
@@ -2022,16 +2397,27 @@ impl HaproxyLsp {
             }
         }
 
-        self.parse_single_file(uri, &content)?;
+        // Record the entry scope under which this URI was parsed so
+        // cross-file duplicate-acl detection can attribute ACL definitions
+        // in a header-less fragment to the parent section that pulled it
+        // in. First-edge wins (matches the `visited` dedup policy).
+        self.entry_scopes
+            .entry(uri.to_string())
+            .or_insert_with(|| entry_scope.clone());
 
-        let includes = self.extract_include_uris(uri, &content);
-        self.included_files.insert(uri.to_string(), includes.clone());
+        self.parse_single_file(uri, &content, entry_scope.clone())?;
 
-        for inc_uri in includes {
+        let includes = self.extract_include_uris(uri, &content, entry_scope.as_deref());
+        self.included_files.insert(
+            uri.to_string(),
+            includes.iter().map(|(u, _)| u.clone()).collect(),
+        );
+
+        for (inc_uri, inc_scope) in includes {
             if visited.contains(&inc_uri) {
                 continue;
             }
-            let _ = self.parse_graph_node(&inc_uri, None, visited);
+            let _ = self.parse_graph_node(&inc_uri, None, inc_scope, visited);
         }
 
         Ok(())
@@ -2051,8 +2437,24 @@ impl HaproxyLsp {
     // `.if` / `.elif` / `.else` / `.endif` are parsed conservatively: every
     // branch is walked regardless of the condition, since the line-scanner
     // already treats conditional directives as ordinary content.
-    fn extract_include_uris(&self, uri: &str, content: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+    // Return the list of include-graph neighbours together with the
+    // HAProxy section name active at the line of the directive that reached
+    // each neighbour. `entry_scope` is the section active at the top of
+    // this file (non-`None` when the current file is itself a fragment
+    // included from a parent section); section tracking during the walk is
+    // seeded with it so nested `.include` inside a header-less fragment
+    // still carries the parent scope.
+    //
+    // `extra_files` edges from `.zed/haproxy.toml` are emitted with
+    // `entry_scope = None` since they are project-wide peers, not
+    // section-body fragments.
+    fn extract_include_uris(
+        &self,
+        uri: &str,
+        content: &str,
+        entry_scope: Option<&str>,
+    ) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
         // Honor `follow_includes = false` in .zed/haproxy.toml — users with
         // segmented projects can opt out of the graph walk entirely.
         if let Some(cfg) = self.project_configs.get(uri) {
@@ -2075,9 +2477,29 @@ impl HaproxyLsp {
             .unwrap_or_else(|| file_dir.clone());
 
         let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut current_section_name: Option<String> = entry_scope.map(|s| s.to_string());
 
         for raw_line in content.lines() {
+            // Track section headers the same way `parse_single_file` does so
+            // `.include` directives appearing inside a backend/frontend/
+            // listen/peers body attribute correctly to that section.
+            let is_section_line = is_section_header(raw_line);
             let trimmed = raw_line.trim();
+            let first_tok = trimmed.split_whitespace().next().unwrap_or("");
+            if is_section_line {
+                match first_tok {
+                    "backend" | "frontend" | "listen" | "peers" => {
+                        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                        current_section_name = tokens.get(1).map(|s| s.to_string());
+                    }
+                    "global" | "defaults" | "resolvers" | "userlist"
+                    | "mailers" | "cache" | "program" | "ring" => {
+                        current_section_name = None;
+                    }
+                    _ => {}
+                }
+            }
+
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
@@ -2094,7 +2516,7 @@ impl HaproxyLsp {
                 {
                     if resolved.is_file() && seen.insert(resolved.clone()) {
                         if let Some(u) = path_to_file_uri(&resolved) {
-                            out.push(u);
+                            out.push((u, current_section_name.clone()));
                         }
                     }
                 }
@@ -2110,7 +2532,7 @@ impl HaproxyLsp {
                         {
                             if resolved.is_file() && seen.insert(resolved.clone()) {
                                 if let Some(u) = path_to_file_uri(&resolved) {
-                                    out.push(u);
+                                    out.push((u, current_section_name.clone()));
                                 }
                             }
                         }
@@ -2123,9 +2545,39 @@ impl HaproxyLsp {
                         {
                             if resolved.is_file() && seen.insert(resolved.clone()) {
                                 if let Some(u) = path_to_file_uri(&resolved) {
-                                    out.push(u);
+                                    out.push((u, current_section_name.clone()));
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Seed `extra_files` from .zed/haproxy.toml into the include graph.
+        // Patterns with `*`, `?`, or `**` are expanded against `project_root`;
+        // literal paths resolve as before. Absolute patterns resolve from
+        // `/`. These are project-wide peers rather than fragments, so their
+        // entry scope is always `None`.
+        if let Some(cfg) = self.project_configs.get(uri) {
+            for pat in &cfg.extra_files {
+                if pat.is_empty() {
+                    continue;
+                }
+                if component_has_glob(pat) || pat.contains("**") {
+                    for resolved in expand_glob(pat, &project_root) {
+                        if resolved.is_file() && seen.insert(resolved.clone()) {
+                            if let Some(u) = path_to_file_uri(&resolved) {
+                                out.push((u, None));
+                            }
+                        }
+                    }
+                } else if let Some(resolved) =
+                    resolve_include_path(pat, &project_root, &project_root)
+                {
+                    if resolved.is_file() && seen.insert(resolved.clone()) {
+                        if let Some(u) = path_to_file_uri(&resolved) {
+                            out.push((u, None));
                         }
                     }
                 }
@@ -2190,6 +2642,134 @@ impl HaproxyLsp {
     // Return every URI reachable from `uri` via the include graph, including
     // `uri` itself. Falls back to `vec![uri]` when no project index has been
     // built yet (e.g. early in startup before any didOpen).
+    // Drop every URI from the caches whose presence is not justified by
+    // an open editor buffer. Called after `didClose` so auto-loaded
+    // siblings whose only reason to exist was the closed URI's include
+    // graph get freed, preventing unbounded cache growth in long-lived
+    // sessions and stopping `workspace/symbol` from advertising stale
+    // entries.
+    //
+    // "Live" = the include-graph forward closure of the remaining
+    // `explicitly_opened` URIs. Everything else in `project_configs` is
+    // an orphan and gets fully evicted (all per-URI caches + project
+    // index membership). Clients are told to clear any stale diagnostics
+    // on the evicted URIs via an empty-array `publishDiagnostics`.
+    //
+    // Returns the set of project roots that lost at least one member so
+    // the caller can refresh their indices.
+    fn evict_orphaned_siblings(&mut self) -> HashSet<PathBuf> {
+        let mut live: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = self.explicitly_opened.iter().cloned().collect();
+        while let Some(u) = stack.pop() {
+            if !live.insert(u.clone()) {
+                continue;
+            }
+            if let Some(neighbors) = self.included_files.get(&u) {
+                for n in neighbors {
+                    if !live.contains(n) {
+                        stack.push(n.clone());
+                    }
+                }
+            }
+        }
+
+        let known: Vec<String> = self.project_configs.keys().cloned().collect();
+        let mut touched_roots: HashSet<PathBuf> = HashSet::new();
+        for u in known {
+            if live.contains(&u) {
+                continue;
+            }
+            if let Some(cfg) = self.project_configs.get(&u) {
+                touched_roots.insert(cfg.project_root.clone());
+            }
+            self.symbols.remove(&u);
+            self.folds.remove(&u);
+            self.outline.remove(&u);
+            self.documents.remove(&u);
+            self.diagnostics.remove(&u);
+            self.raw_references.remove(&u);
+            self.project_configs.remove(&u);
+            self.included_files.remove(&u);
+            self.entry_scopes.remove(&u);
+            self.send_notification(
+                "textDocument/publishDiagnostics",
+                json!({ "uri": u, "diagnostics": [] }),
+            );
+        }
+
+        // Drop project_indices entries for roots that no longer have any
+        // members. A root with surviving members gets rebuilt by the
+        // caller; only fully-vacant roots are removed here.
+        let remaining_roots: HashSet<PathBuf> = self
+            .project_configs
+            .values()
+            .map(|c| c.project_root.clone())
+            .collect();
+        let vacant: Vec<String> = touched_roots
+            .iter()
+            .filter(|r| !remaining_roots.contains(*r))
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect();
+        for key in vacant {
+            self.project_indices.remove(&key);
+        }
+
+        touched_roots
+    }
+
+    // Return the URI set considered "strictly related" to `uri` for the
+    // purposes of cross-file diagnostic aggregation. Stricter than
+    // `project_uris_for`: without an explicit `.zed/haproxy.toml`, project
+    // root falls back to the opened file's directory, which would otherwise
+    // let two unrelated configs in the same directory trip each other's
+    // duplicate-section / duplicate-acl / undefined-reference rules.
+    //
+    // With an explicit project config, trust the declared membership.
+    // Without one, restrict to URIs reachable from `uri` through the
+    // include graph (forward and reverse edges walked together). Navigation
+    // handlers keep using `project_uris_for` — they benefit from looser
+    // membership when the user intentionally jumps across files.
+    fn strictly_related_uris(&self, uri: &str) -> Vec<String> {
+        if let Some(cfg) = self.project_configs.get(uri) {
+            if cfg.config_file.is_some() {
+                return self.project_uris_for(uri);
+            }
+        }
+        let candidates = self.project_uris_for(uri);
+        let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+        for u in &candidates {
+            if let Some(neighbors) = self.included_files.get(u) {
+                for n in neighbors {
+                    edges
+                        .entry(u.clone())
+                        .or_default()
+                        .insert(n.clone());
+                    edges
+                        .entry(n.clone())
+                        .or_default()
+                        .insert(u.clone());
+                }
+            }
+        }
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = vec![uri.to_string()];
+        while let Some(u) = stack.pop() {
+            if !visited.insert(u.clone()) {
+                continue;
+            }
+            if let Some(ns) = edges.get(&u) {
+                for n in ns {
+                    if !visited.contains(n) {
+                        stack.push(n.clone());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<String> = visited.into_iter().collect();
+        out.sort();
+        out
+    }
+
     fn project_uris_for(&self, uri: &str) -> Vec<String> {
         let project_root_key = match self.project_configs.get(uri) {
             Some(cfg) => cfg.project_root.to_string_lossy().into_owned(),
@@ -2308,14 +2888,23 @@ impl HaproxyLsp {
         out
     }
 
-    fn parse_single_file(&mut self, uri: &str, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn parse_single_file(
+        &mut self,
+        uri: &str,
+        content: &str,
+        entry_scope: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Line-scanning parser. Tree-sitter is loaded by Zed for highlighting
         // only; no AST is available to the LSP.
         let mut symbols = Vec::new();
         // Track the enclosing named section so `stick-table` directives can
         // be attributed to the correct backend/frontend/listen/peers name
         // (HAProxy binds one table per section, keyed by the section name).
-        let mut current_section_name: Option<String> = None;
+        // `entry_scope` seeds this for included fragments: when the file was
+        // pulled into the body of `backend foo` via `.include`, its server
+        // and stick-table directives must attribute to `foo` even though no
+        // `backend` header appears in the fragment itself.
+        let mut current_section_name: Option<String> = entry_scope.clone();
 
         for (line_num, raw_line) in content.lines().enumerate() {
             let line = raw_line.trim();
@@ -2466,7 +3055,10 @@ impl HaproxyLsp {
         // even when two backends share a server name.
         let mut updated_symbols = symbols;
         let mut raw_refs: Vec<RawReference> = Vec::new();
-        let mut ref_section_name: Option<String> = None;
+        // Same `entry_scope` rationale as the first pass: `use_server` and
+        // other scoped references inside a header-less included fragment
+        // must resolve against the parent section's server definitions.
+        let mut ref_section_name: Option<String> = entry_scope;
         for (line_num, raw_line) in content.lines().enumerate() {
             let is_section_line = is_section_header(raw_line);
             let trimmed = raw_line.trim();
@@ -4181,55 +4773,58 @@ impl HaproxyLsp {
                 None // No response needed for notifications
             }
             "textDocument/didClose" => {
-                // Evict all per-URI caches so long-lived sessions don't grow
-                // unbounded as files are opened and closed.
+                // Evict the closed URI AND any auto-loaded siblings that were
+                // only resident because of its include graph. Without the
+                // follow-up orphan sweep, long-lived sessions accumulate
+                // stale siblings in `symbols`/`project_configs`, the project
+                // index keeps resurrecting them on rebuild, and
+                // `workspace/symbol` keeps returning them.
                 let params = &request["params"];
                 if let Some(uri) = params["textDocument"]["uri"].as_str() {
-                    // Capture the project root before we drop the config so we
-                    // can rebuild any project index that referenced the closed
-                    // URI and refresh diagnostics for its siblings.
-                    let closed_root = self
-                        .project_configs
-                        .get(uri)
-                        .map(|c| c.project_root.clone());
-                    self.symbols.remove(uri);
-                    self.folds.remove(uri);
-                    self.outline.remove(uri);
-                    self.documents.remove(uri);
-                    self.diagnostics.remove(uri);
-                    self.raw_references.remove(uri);
-                    self.project_configs.remove(uri);
-                    self.included_files.remove(uri);
-                    self.explicitly_opened.remove(uri);
-                    // Clear any stale diagnostics the client may still show.
-                    let uri_owned = uri.to_string();
+                    let closed_uri = uri.to_string();
+                    self.symbols.remove(&closed_uri);
+                    self.folds.remove(&closed_uri);
+                    self.outline.remove(&closed_uri);
+                    self.documents.remove(&closed_uri);
+                    self.diagnostics.remove(&closed_uri);
+                    self.raw_references.remove(&closed_uri);
+                    self.project_configs.remove(&closed_uri);
+                    self.included_files.remove(&closed_uri);
+                    self.entry_scopes.remove(&closed_uri);
+                    self.explicitly_opened.remove(&closed_uri);
                     self.send_notification(
                         "textDocument/publishDiagnostics",
-                        json!({ "uri": uri_owned, "diagnostics": [] }),
+                        json!({ "uri": closed_uri, "diagnostics": [] }),
                     );
 
-                    // Rebuild the project index so it no longer advertises
-                    // symbols/references from the closed URI, and republish
-                    // diagnostics for surviving project members (an unused-
-                    // backend warning may now fire because a cross-file
-                    // reference just disappeared).
-                    if let Some(root) = closed_root {
-                        let key = root.to_string_lossy().into_owned();
-                        let surviving: Vec<String> = self
-                            .project_configs
-                            .iter()
-                            .filter(|(_, c)| c.project_root == root)
-                            .map(|(u, _)| u.clone())
-                            .collect();
-                        if let Some(seed) = surviving.first().cloned() {
-                            self.rebuild_project_index_for(&seed);
-                            for sibling in &surviving {
-                                self.collect_diagnostics(sibling);
+                    // Sweep orphaned siblings reachable only from the closed
+                    // root. Evicted URIs get an empty diagnostics push inside
+                    // the helper.
+                    self.evict_orphaned_siblings();
+
+                    // Rebuild the project index for each project root whose
+                    // membership still has at least one explicitly-opened
+                    // member, then republish diagnostics for the survivors so
+                    // cross-file rules (unused-backend / duplicate-section /
+                    // undefined-reference) reflect the new membership.
+                    let open_uris: Vec<String> =
+                        self.explicitly_opened.iter().cloned().collect();
+                    let mut rebuilt_roots: HashSet<String> = HashSet::new();
+                    for u in &open_uris {
+                        if let Some(cfg) = self.project_configs.get(u) {
+                            let key = cfg.project_root.to_string_lossy().into_owned();
+                            if rebuilt_roots.insert(key) {
+                                self.rebuild_project_index_for(u);
                             }
-                        } else {
-                            // No members remain — drop the stale index entry.
-                            self.project_indices.remove(&key);
                         }
+                    }
+                    let surviving: Vec<String> = self
+                        .project_configs
+                        .keys()
+                        .cloned()
+                        .collect();
+                    for u in surviving {
+                        self.collect_diagnostics(&u);
                     }
                 }
                 None
